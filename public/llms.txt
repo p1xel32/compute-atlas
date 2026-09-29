@@ -1,0 +1,43 @@
+# Compute Atlas
+
+> Open, source-cited map and dataset of grid-scale compute infrastructure across the United States, including data centers, AI/ML-oriented campuses, crypto-mining sites, and related dedicated power-generation facilities.
+
+Last reviewed: 2026-09-29
+
+## Canonical
+
+- Website: https://www.compute-atlas.com/
+- Statistics: https://www.compute-atlas.com/stats
+- API documentation: https://www.compute-atlas.com/api
+- Methodology: https://www.compute-atlas.com/docs/methodology
+
+## Public API
+
+No authentication is required for public read endpoints:
+
+- GET https://www.compute-atlas.com/api/facilities
+- GET https://www.compute-atlas.com/api/facilities/{id}
+- GET https://www.compute-atlas.com/api/stats
+- GET https://www.compute-atlas.com/api/schema
+
+Use the live API or dataset for counts instead of copying totals into answers, because facility and state counts change as the dataset is reviewed.
+
+## Evidence model
+
+Every live facility must have at least one citable public source. Records expose confidence and provenance rather than hiding uncertainty.
+
+Core rules:
+- no fact without a source;
+- unknown fields are omitted rather than guessed;
+- consequential claims are checked against the underlying filing or announcement;
+- proposed changes enter a pending staging queue;
+- human approval is required before a facility becomes live;
+- approved changes are recorded in an audit trail.
+
+## Scope boundaries
+
+- A record can be confirmed, reported, or otherwise explicitly qualified by the dataset. Preserve that qualification.
+- Eligibility for an incentive is not the same as a confirmed award.
+- A modeled range or project ceiling is not the same as an observed value.
+- The atlas is a research dataset for journalists, researchers, local officials, and residents, not a government registry.
+- For current counts and individual facility status, prefer the live API and cited primary sources.
