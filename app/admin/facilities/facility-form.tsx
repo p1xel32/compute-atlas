@@ -21,6 +21,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { confidenceEnum, type Facility } from "@/lib/schema";
+import { numOrUndefined } from "@/lib/form-payload";
 import { STATUS_ORDER, STATUS_META, type Status } from "@/lib/status";
 import { FACILITY_TYPE_ORDER, FACILITY_TYPE_META, type FacilityType } from "@/lib/facility-type";
 import {
@@ -66,13 +67,14 @@ export { emptyFacilityFormState, facilityToFormState, type FacilityFormState };
  * objects (never a partial/omitted-key patch) — required because
  * `updateFacility` does a shallow top-level merge; a partial nested object
  * would look "present" to the merge and silently blank sibling fields.
+ * `location` always carries lat, lon, state and precision, so
+ * `mergeFacilityPatch` replaces it rather than merging, and a blanked
+ * `city`/`county` (omitted here) is cleared instead of inherited.
  */
 export function buildFacilityPayload(state: FacilityFormState): Record<string, unknown> {
-  const num = (v: string): number | undefined => (v.trim() === "" ? undefined : Number(v));
-
   const location: Record<string, unknown> = {
-    lat: num(state.location.lat) ?? 0,
-    lon: num(state.location.lon) ?? 0,
+    lat: numOrUndefined(state.location.lat) ?? 0,
+    lon: numOrUndefined(state.location.lon) ?? 0,
     state: state.location.state.toUpperCase(),
     precision: state.location.precision,
   };
@@ -91,8 +93,8 @@ export function buildFacilityPayload(state: FacilityFormState): Record<string, u
   }
 
   const capacityMw: Record<string, unknown> = {};
-  const planned = num(state.capacityMw.planned);
-  const operational = num(state.capacityMw.operational);
+  const planned = numOrUndefined(state.capacityMw.planned);
+  const operational = numOrUndefined(state.capacityMw.operational);
   if (planned !== undefined) capacityMw.planned = planned;
   if (operational !== undefined) capacityMw.operational = operational;
 
@@ -117,9 +119,9 @@ export function buildFacilityPayload(state: FacilityFormState): Record<string, u
   if (state.poweredBy.trim()) payload.poweredBy = state.poweredBy.trim();
   if (state.announcedDate.trim()) payload.announcedDate = state.announcedDate.trim();
   if (state.notes.trim()) payload.notes = state.notes.trim();
-  const investmentUsd = num(state.investmentUsd);
+  const investmentUsd = numOrUndefined(state.investmentUsd);
   if (investmentUsd !== undefined) payload.investmentUsd = investmentUsd;
-  const landAcres = num(state.landAcres);
+  const landAcres = numOrUndefined(state.landAcres);
   if (landAcres !== undefined) payload.landAcres = landAcres;
 
   if (state.facilityType === "data_center") {
@@ -368,7 +370,7 @@ function CoreFieldsSection({
             value={state.notes}
             onChange={(e) => setState((prev) => ({ ...prev, notes: e.target.value }))}
             rows={3}
-            className="rounded-lg border border-input bg-transparent px-2.5 py-1.5 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
+            className="rounded-lg border border-input bg-transparent px-2.5 py-1.5 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 focus-visible:outline-2 focus-visible:outline-solid focus-visible:outline-transparent"
             aria-invalid={errors["notes"] ? true : undefined}
             aria-describedby={errors["notes"] ? "notes-error" : undefined}
           />
@@ -623,7 +625,19 @@ export function FacilityForm({
           : await updateFacilityAction(state.id, payload);
 
       if (result.ok) {
-        toast.success(`${mode === "create" ? "Created" : "Updated"} "${result.facility.name}".`);
+        const verb = mode === "create" ? "Created" : "Updated";
+        // historyRecorded is strictly false only when the facility write
+        // itself succeeded but its facility_history audit row failed to
+        // insert (lib/facility-write.ts) — surface that instead of letting
+        // it disappear into the server log. `undefined` (unknown) reads the
+        // same as a clean success.
+        if (result.historyRecorded === false) {
+          toast.warning(
+            `${verb} "${result.facility.name}" — but its audit log entry failed to record.`
+          );
+        } else {
+          toast.success(`${verb} "${result.facility.name}".`);
+        }
         router.push("/admin/facilities");
         return;
       }

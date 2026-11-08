@@ -1,10 +1,54 @@
+/**
+ * The data license deed. Three machine-readable surfaces declare it and must
+ * not drift apart: the `Dataset` JSON-LD `license` (`lib/seo.ts`), the JSON
+ * API's `Link: <…>; rel="license"` header (`lib/api-response.ts`), and the
+ * HTML `<link rel="license">` in `app/layout.tsx`. All three read this
+ * constant. The rendered prose on /about, /api and /data links the deed too,
+ * but those are anchors with visible text, not machine declarations, so they
+ * are left as-is.
+ *
+ * It lives here rather than inside `lib/seo.ts` because
+ * `lib/api-response.ts` is a dependency of every API route, and `lib/seo.ts`
+ * reaches `lucide-react` through `lib/status.ts` — importing it there would
+ * put React icon components in ~20 route bundles to read one string. This
+ * file has no imports at all.
+ */
+export const DATASET_LICENSE_URL = "https://creativecommons.org/licenses/by/4.0/";
+
 export const siteConfig = {
   name: "Compute Atlas",
-  tagline: "Tracking data centers across the United States",
+  tagline: "Mapping the U.S. compute buildout",
   description:
-    "Compute Atlas is an open, source-cited map of data centers across the United States — traditional and hyperscale compute, AI-specific facilities, and crypto-mining operations — from proposed and permitted to under construction and operational, with a public source behind every record.",
+    "Compute Atlas is a source-cited map of the U.S. compute buildout — traditional and hyperscale data centers, AI-specific facilities, crypto-mining operations, and the dedicated power generation built to supply them — from proposed and permitted to under construction and operational. It tracks what the buildout costs as well as what it adds: fuel mix, water stress, and documented community opposition, with a public source behind every record.",
+  /**
+   * The `<meta name="description">` / og / twitter string. Deliberately SHORT
+   * and separate from `description` above, which is 451 chars and feeds the
+   * Dataset + WebSite JSON-LD (`lib/seo.ts`), where length is an asset for
+   * dataset discovery rather than a liability. Google renders ~155 chars on
+   * desktop and ~120 on mobile, so the long one showed only its first third
+   * on the SERP — brand-and-jargon first, with no number and no mention of
+   * power, water, or opposition before the cut.
+   * Keep at or under 160 characters and front-load the terms people search.
+   * Guarded by `lib/site.test.ts`.
+   */
+  metaDescription:
+    "Interactive US data center map and database — AI, hyperscale, and crypto-mining sites plus the power built to supply them. Every record is source-cited.",
   url: "https://www.compute-atlas.com",
-  /** Private during development. */
   repoUrl: "https://github.com/ek33450505/compute-atlas",
-  sponsorUrl: "https://github.com/sponsors/ek33450505",
+  /**
+   * The one on-site funding destination. Ko-fi takes guest checkout (no
+   * account), card or PayPal, one-off or monthly: the right barrier for this
+   * site's audience (residents, local journalists, county officials). It is
+   * the only funding path anywhere: GitHub Sponsors was disabled on 2026-10-28.
+   */
+  kofiUrl: "https://ko-fi.com/L2T725R7FV",
+  /** Public Bluesky profile for the project. */
+  blueskyUrl: "https://bsky.app/profile/compute-atlas.com",
+  /**
+   * Newsletter subscribe page. A link only (no embedded form, so no
+   * CSP `form-action`/`frame-src` change). The list is held by Buttondown; the
+   * site's facility/state watch subscribers are NEVER imported into it (they
+   * opted into alerts only).
+   */
+  newsletterUrl: "https://buttondown.com/compute-atlas",
 } as const;

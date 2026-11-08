@@ -1,0 +1,133 @@
+import { and, eq, sql } from "drizzle-orm";
+
+import { getDb, hasDatabaseUrl } from "@/lib/db/client";
+import { apiAccessGrantsTable, apiDailyUsageTable } from "@/lib/db/schema";
+import { redactedErrorCode } from "@/lib/db-error";
+import { extractTrustedClientIp, hashIp, normaliseIpForBucketing } from "@/lib/rate-limit";
+import { hashToken, isHashedToken } from "@/lib/token-hash";
+
+export const API_DAILY_LIMIT_MAX = 1000;
+
+function utcDateString(now: Date = new Date()): string {
+  return now.toISOString().slice(0, 10);
+}
+
+function secondsUntilNextUtcMidnight(now: Date = new Date()): number {
+  const next = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1));
+  return Math.ceil((next.getTime() - now.getTime()) / 1000);
+}
+
+function extractBearerToken(request: Request): string | null {
+  const header = request.headers.get("authorization") ?? "";
+  const prefix = "Bearer ";
+  if (!header.startsWith(prefix)) return null;
+  const token = header.slice(prefix.length).trim();
+  return token || null;
+}
+
+/**
+ * Gate for the facilities-family read API's daily-volume ceiling.
+ * A valid, active, unexpired access-grant bearer token bypasses this
+ * entirely — token holders are bounded only by the existing in-memory burst
+ * limiter (`checkApiRateLimit`, unchanged, still runs first in every route),
+ * matching the plan: "no additional ceiling beyond the existing 60/min
+ * burst limiter" for token holders. An expired/revoked/unknown token is
+ * treated as anonymous (falls through to the IP-day counter) rather than
+ * rejected — an expired token holder is just an anonymous caller, not an
+ * attacker. Anonymous callers are capped at API_DAILY_LIMIT_MAX
+ * requests/IP-hash/UTC-day via a durable DB counter.
+ *
+ * Fail-open, matching this codebase's outage-resilience convention for new
+ * server DB reads (see e.g. `getRecentActivity` in lib/data.ts): returns
+ * `{ ok: true }` immediately when `DATABASE_URL` is unset (local dev without
+ * a DB, or a Vercel preview build), and again if the DB round trip itself
+ * throws (unreachable, over quota, etc.) — this gate backstops the existing
+ * in-memory burst limiter, which still runs first in every route; it must
+ * never be the reason a DB blip takes down the public read API.
+ */
+export async function checkDailyApiGate(
+  request: Request
+): Promise<{ ok: boolean; retryAfter?: number }> {
+  if (!hasDatabaseUrl()) {
+    return { ok: true };
+  }
+
+  try {
+    const db = getDb();
+    const token = extractBearerToken(request);
+
+    if (token) {
+      const hashedBearer = hashToken(token);
+      let rows = await db
+        .select({ id: apiAccessGrantsTable.id, expiresAt: apiAccessGrantsTable.expiresAt })
+        .from(apiAccessGrantsTable)
+        .where(and(eq(apiAccessGrantsTable.accessToken, hashedBearer), eq(apiAccessGrantsTable.status, "active")));
+      let isLegacyRawMatch = false;
+      if (rows.length === 0 && !isHashedToken(token)) {
+        // Legacy fallback: row predates hashing and still stores the raw
+        // bearer token. A hit here is best-effort upgraded to its hash below,
+        // alongside the existing usage-counter bump (see lib/token-hash.ts).
+        // Gated on `!isHashedToken(token)` to close a stolen-stored-hash
+        // bypass: without this guard, presenting the 64-hex hash itself (e.g.
+        // from a DB leak) would miss the hash-first lookup (hash-of-hash) but
+        // then match THIS raw-equality fallback directly against the stored
+        // value, authenticating with no raw token ever having existed. A
+        // genuine raw token is always 43-char base64url and can never be 64
+        // lowercase hex, so no real caller is affected.
+        rows = await db
+          .select({ id: apiAccessGrantsTable.id, expiresAt: apiAccessGrantsTable.expiresAt })
+          .from(apiAccessGrantsTable)
+          .where(and(eq(apiAccessGrantsTable.accessToken, token), eq(apiAccessGrantsTable.status, "active")));
+        isLegacyRawMatch = true;
+      }
+      const grant = rows[0];
+      if (grant && (!grant.expiresAt || grant.expiresAt > new Date())) {
+        await db
+          .update(apiAccessGrantsTable)
+          .set(
+            isLegacyRawMatch
+              ? {
+                  requestCount: sql`${apiAccessGrantsTable.requestCount} + 1`,
+                  lastUsedAt: new Date(),
+                  accessToken: hashedBearer,
+                }
+              : { requestCount: sql`${apiAccessGrantsTable.requestCount} + 1`, lastUsedAt: new Date() }
+          )
+          .where(eq(apiAccessGrantsTable.id, grant.id))
+          .catch(() => {
+            // Usage counter (and, on a legacy row, the hash upgrade) is
+            // best-effort — per apiAccessGrantsTable's doc comment, a failed
+            // bump must never block the request it authorizes.
+          });
+        return { ok: true };
+      }
+    }
+
+    const ipHash = hashIp(normaliseIpForBucketing(extractTrustedClientIp(request.headers)));
+    const day = utcDateString();
+    const rows = await db
+      .insert(apiDailyUsageTable)
+      .values({ ipHash, day, count: 1 })
+      .onConflictDoUpdate({
+        target: [apiDailyUsageTable.ipHash, apiDailyUsageTable.day],
+        set: { count: sql`${apiDailyUsageTable.count} + 1` },
+      })
+      .returning({ count: apiDailyUsageTable.count });
+
+    const count = rows[0]?.count ?? 1;
+    if (count <= API_DAILY_LIMIT_MAX) {
+      return { ok: true };
+    }
+    return { ok: false, retryAfter: secondsUntilNextUtcMidnight() };
+  } catch (err) {
+    // SQLSTATE only, never `err`: this one `try` wraps the whole function,
+    // including the legacy raw-token lookup above — so a DrizzleQueryError
+    // from that SELECT embeds a LIVE raw bearer token in its `.message`, and
+    // one from the counter upsert embeds the caller's `ipHash`. See
+    // lib/db-error.ts. Fail-open behaviour is unchanged.
+    console.warn(
+      `checkDailyApiGate: daily-volume gate unavailable, failing open (sqlstate: ${redactedErrorCode(err)})`
+    );
+    return { ok: true };
+  }
+}

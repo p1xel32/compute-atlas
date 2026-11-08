@@ -1,21 +1,26 @@
 "use client";
 
-import { useState, useSyncExternalStore } from "react";
+import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import Link from "next/link";
 import { FilterBar } from "@/components/explorer/filter-bar";
 import type { FilterValues, FilterSetters } from "@/components/explorer/filter-bar";
-import type { Facility } from "@/lib/schema";
+import { WIDE_AND_TALL_VIEWPORT_QUERY } from "@/lib/map";
+import type { FilterOptions } from "@/lib/filters";
 
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
 export interface MapFilterSubheaderProps {
-  facilities: Facility[];
+  options: FilterOptions;
   values: FilterValues;
   setters: FilterSetters;
   filteredCount: number;
   totalCount: number;
+  /** First operator/capacity lookup is in flight: no count yet. */
+  applying?: boolean;
+  /** The operator/capacity lookup failed; the count reflects only the other filters. */
+  lookupFailed?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -39,13 +44,13 @@ function countActiveFilters(values: FilterValues): number {
 const BODY_ID = "map-filter-subheader-body";
 
 function subscribeWideViewport(onChange: () => void) {
-  const mql = window.matchMedia("(min-width: 640px)");
+  const mql = window.matchMedia(WIDE_AND_TALL_VIEWPORT_QUERY);
   mql.addEventListener("change", onChange);
   return () => mql.removeEventListener("change", onChange);
 }
 
 function getWideViewportSnapshot() {
-  return window.matchMedia("(min-width: 640px)").matches;
+  return window.matchMedia(WIDE_AND_TALL_VIEWPORT_QUERY).matches;
 }
 
 function getWideViewportServerSnapshot() {
@@ -63,24 +68,33 @@ function getWideViewportServerSnapshot() {
  * - Summary row is always visible: ⌖ glyph, title, active-count badge, live
  *   result count, "View as table →" cross-link, and the collapse/expand toggle.
  * - FilterBar body appears below the summary row only when expanded.
- * - Default: expanded on ≥640 px (sm), collapsed on mobile. A `typeof window`
- *   guard makes the matchMedia initializer SSR-safe; server renders expanded.
+ * - Default: expanded only when the viewport is both wide AND tall
+ *   (WIDE_AND_TALL_VIEWPORT_QUERY in lib/map.ts, shared with FacilityMap's
+ *   Tools column default so the two thresholds can't drift apart again) —
+ *   collapsed otherwise, including on landscape phones, which are wide but
+ *   short and would wrongly default open under a width-only query.
+ *   useSyncExternalStore's getServerSnapshot argument reports expanded
+ *   unconditionally so server and first client render agree (avoids a
+ *   hydration mismatch); see the comment on `prefersExpanded` below.
  * - Toggle button is ≥44 px (h-11 w-11) to meet the project's touch-target rule.
  * - Chevron rotation transition respects prefers-reduced-motion via
  *   `motion-reduce:transition-none`.
  */
 export function MapFilterSubheader({
-  facilities,
+  options,
   values,
   setters,
   filteredCount,
   totalCount,
+  applying = false,
+  lookupFailed = false,
 }: MapFilterSubheaderProps) {
   // Stable SSR-safe default: server (and first client render) reports expanded
   // so server and first client render agree (avoids hydration mismatch).
   // useSyncExternalStore then reads the real viewport-appropriate state once
   // the client has access to matchMedia, and stays subscribed to further
-  // viewport changes (e.g. window resize across the 640px boundary).
+  // viewport changes (e.g. window resize across the WIDE_AND_TALL_VIEWPORT_QUERY
+  // width/height boundary).
   const prefersExpanded = useSyncExternalStore(
     subscribeWideViewport,
     getWideViewportSnapshot,
@@ -89,6 +103,28 @@ export function MapFilterSubheader({
   // Manual toggle overrides the viewport-derived default until unmount.
   const [override, setOverride] = useState<boolean | null>(null);
   const isOpen = override ?? prefersExpanded;
+  // Focus target for the Escape handler below (m8) — same "return focus to
+  // the trigger" contract as MapLayerControl's own Escape handler
+  // (components/map/map-layer-control.tsx), which this mirrors.
+  const toggleRef = useRef<HTMLButtonElement>(null);
+
+  // m8: Escape collapses the filter body and returns focus to the toggle.
+  // Only attached while actually open (matching the MapLayerControl
+  // precedent's `if (!expanded) return` guard). Sets `override` to the
+  // explicit `false` — not `null` — because `null` means "defer to the
+  // viewport-derived default," which would silently re-open this on a wide
+  // viewport where `prefersExpanded` is true; Escape must mean closed
+  // regardless of viewport.
+  useEffect(() => {
+    if (!isOpen) return;
+    function handleKeyDown(event: KeyboardEvent) {
+      if (event.key !== "Escape") return;
+      setOverride(false);
+      toggleRef.current?.focus();
+    }
+    document.addEventListener("keydown", handleKeyDown);
+    return () => document.removeEventListener("keydown", handleKeyDown);
+  }, [isOpen]);
 
   // Build the "View as table" href from the current filter values so filters
   // carry to /table via the URL. Derived from `values` (not useSearchParams)
@@ -109,7 +145,6 @@ export function MapFilterSubheader({
     <div className="border-b border-border bg-background">
       {/* ── Always-visible summary row ──────────────────────────────────── */}
       <div className="flex items-center gap-2 px-4 min-h-[44px]">
-        {/* Cartographic crosshair glyph */}
         <span
           className="font-mono text-sm text-muted-foreground shrink-0"
           aria-hidden="true"
@@ -117,12 +152,10 @@ export function MapFilterSubheader({
           ⌖
         </span>
 
-        {/* Section title */}
         <span className="font-mono text-xs font-semibold uppercase tracking-widest text-foreground shrink-0">
           Filters
         </span>
 
-        {/* Active-filter count badge */}
         {activeCount > 0 && (
           <span
             className="inline-flex h-4 min-w-4 items-center justify-center rounded-sm bg-primary px-1 font-mono text-[10px] font-semibold text-primary-foreground shrink-0"
@@ -140,24 +173,37 @@ export function MapFilterSubheader({
         <p
           role="status"
           aria-live="polite"
-          className="sr-only sm:not-sr-only sm:ml-1 shrink-0 font-mono text-xs text-muted-foreground"
+          className={[
+            "sm:ml-1 shrink-0 font-mono text-xs text-muted-foreground",
+            // A notice must be visible on mobile too, not only announced.
+            applying || lookupFailed ? "" : "sr-only sm:not-sr-only",
+          ].join(" ")}
         >
-          Showing {filteredCount} of {totalCount} facilities
+          {applying ? (
+            "Applying filters…"
+          ) : (
+            <>
+              Showing {filteredCount} of {totalCount} facilities
+              {lookupFailed && (
+                <span> · Operator and capacity filters couldn&apos;t be applied.</span>
+              )}
+            </>
+          )}
         </p>
 
-        {/* Spacer */}
         <div className="flex-1 min-w-0" />
 
         {/* "View as table →" cross-link — hidden on mobile to keep bar compact */}
         <Link
           href={tableHref}
-          className="hidden sm:block font-mono text-xs uppercase tracking-wider text-muted-foreground underline underline-offset-4 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 rounded-sm shrink-0"
+          className="hidden sm:block font-mono text-xs uppercase tracking-wider text-muted-foreground underline underline-offset-4 hover:text-foreground focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring rounded-sm shrink-0"
         >
           View as table →
         </Link>
 
         {/* Collapse / expand toggle — ≥44 px touch target */}
         <button
+          ref={toggleRef}
           type="button"
           onClick={() => setOverride((o) => !(o ?? prefersExpanded))}
           aria-expanded={isOpen}
@@ -168,7 +214,7 @@ export function MapFilterSubheader({
             "flex h-11 w-11 items-center justify-center rounded-sm shrink-0",
             "text-muted-foreground",
             "hover:bg-muted hover:text-foreground",
-            "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1",
+            "focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-ring",
             "transition-colors",
           ].join(" ")}
         >
@@ -202,7 +248,7 @@ export function MapFilterSubheader({
       {isOpen && (
         <div id={BODY_ID} className="border-t border-border px-4 py-3">
           <FilterBar
-            facilities={facilities}
+            options={options}
             values={values}
             setters={setters}
           />

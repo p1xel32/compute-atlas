@@ -22,10 +22,11 @@ import {
 import { Slider } from "@/components/ui/slider";
 import { AI_CLASSIFICATION_CONFIDENCE_LABELS } from "@/lib/format";
 import { aiClassificationEnum } from "@/lib/schema";
+import type { GenerationTechnology } from "@/lib/generation";
 import type { FacilityType } from "@/lib/facility-type";
 
 // ---------------------------------------------------------------------------
-// facilityType-conditional fieldsets (Phase 2b-4) — the 3 branches of
+// facilityType-conditional fieldsets — the 3 branches of
 // `facilitySchema`'s discriminated union, switched on the form's CURRENT
 // `facilityType`. Only the active branch is rendered; the other two
 // branches' state slices are untouched here (facility-form.tsx's
@@ -529,9 +530,10 @@ function CryptoMiningFields({
 // poweredFacilityIds/unitCount/notes}
 // ---------------------------------------------------------------------------
 
-const TECHNOLOGY_LABELS: Record<string, string> = {
+const TECHNOLOGY_LABELS: Record<GenerationTechnology, string> = {
   nuclear_smr: "Nuclear (SMR)",
   nuclear: "Nuclear",
+  fusion: "Fusion",
   natural_gas: "Natural gas",
   solar: "Solar",
   wind: "Wind",
@@ -709,7 +711,7 @@ function PoweredFacilitiesPicker({
                 <button
                   type="button"
                   onClick={() => removeFacility(f.id)}
-                  className="ml-1 rounded-full outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+                  className="ml-1 rounded-full outline-none focus-visible:ring-2 focus-visible:ring-ring/50 focus-visible:outline-2 focus-visible:outline-solid focus-visible:outline-transparent"
                   aria-label={`Remove ${f.name} from powered facilities`}
                 >
                   ×
@@ -758,7 +760,7 @@ function PoweredFacilitiesPicker({
                     role="option"
                     aria-selected={false}
                     onClick={() => addFacility(f.id)}
-                    className="w-full rounded-md px-2 py-1.5 text-left text-sm outline-none hover:bg-muted focus-visible:bg-muted"
+                    className="w-full rounded-md px-2 py-1.5 text-left text-sm outline-none hover:bg-muted focus-visible:bg-muted focus-visible:outline-2 focus-visible:outline-solid focus-visible:-outline-offset-2 focus-visible:outline-ring"
                   >
                     {f.name}
                   </button>

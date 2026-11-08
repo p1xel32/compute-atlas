@@ -1,4 +1,6 @@
 import type { z } from "zod";
+import { gzipSync, gunzipSync } from "node:zlib";
+import { cache as reactCache } from "react";
 import { unstable_cache } from "next/cache";
 import {
   facilitiesSchema,
@@ -7,18 +9,28 @@ import {
   type PowerGenerationFacility,
   aiClassificationEnum,
   confidenceEnum,
+  waterCoolingTypeEnum,
+  stakeholderKind,
 } from "@/lib/schema";
 import { STATUS_ORDER, type Status } from "@/lib/status";
 import { FACILITY_TYPE_ORDER, type FacilityType } from "@/lib/facility-type";
 import { COMMUNITY_RECEPTION_ORDER, type CommunityReception } from "@/lib/community";
 import { getFacilityMaxMw } from "@/lib/format";
-import { getMetroBySlug, metroCountyKey } from "@/lib/metros";
+import { getMetroBySlug, metroCountyKey, normalizeCounty } from "@/lib/metros";
+import { canonicalCountyName, countySlug } from "@/lib/counties";
 import facilitiesRaw from "@/data/facilities.json";
 import { and, desc, eq, gte, inArray, lt, sql } from "drizzle-orm";
-import { getDb, hasDatabaseUrl } from "@/lib/db/client";
+import { getDb, hasDatabaseUrl, readsUseDatabase } from "@/lib/db/client";
 import { facilitiesTable, facilityHistoryTable, submissionsTable } from "@/lib/db/schema";
 import { rowToFacility } from "@/lib/db/serialize";
+import { redactedErrorCode } from "@/lib/db-error";
 import type { DiffEntry } from "@/lib/doc-diff";
+import { operatorSlug, personSlug } from "@/lib/operator-slug";
+import { getAllOperatorOwnership, groupByOwner, type OperatorOwner, type OperatorOwnership } from "@/lib/operator-ownership";
+import { getGenerationFuelClass } from "@/lib/generation";
+import { containsDc } from "@/lib/us-states";
+import { getWaterStressById, type SitingContext } from "@/lib/siting-context";
+import { isCommunityDiscoveredBy } from "@/lib/community-provenance";
 
 /**
  * Validated view of the bundled JSON fallback, memoized for the process
@@ -45,59 +57,312 @@ function loadFromJson(): Facility[] {
 }
 
 /**
+ * Wraps a Neon-reading async function with a small retry-with-backoff, then
+ * falls back to the bundled JSON snapshot on final failure — instead of
+ * throwing. Neon's serverless-HTTP driver intermittently throws `fetch
+ * failed` under build-time prerender concurrency (hundreds of pages
+ * prerendering at once each issuing a DB read) even though the database is
+ * otherwise healthy; a short retry absorbs most of that transient burst, and
+ * the JSON fallback (already schema-validated, see `loadFromJson`) covers the
+ * rest so a Neon blip degrades a page's freshness instead of killing the
+ * build. Every fallback is logged (never silent) so a real Neon outage is
+ * still visible in build/runtime logs. Exported for direct unit testing
+ * (`lib/data.test.ts`) — the retry/fallback logic is intentionally a pure
+ * function of `fn`/`fallback` so a test can force a throw without needing to
+ * mock the module-scoped `getDb()` singleton.
+ */
+export async function withJsonFallback<T>(
+  fn: () => Promise<T>,
+  fallback: () => T,
+  maxAttempts = 3
+): Promise<T> {
+  let lastErr: unknown;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastErr = err;
+      if (attempt < maxAttempts) {
+        await new Promise((resolve) => setTimeout(resolve, attempt * 150));
+      }
+    }
+  }
+  // SQLSTATE only, never `lastErr`: this is the highest-volume of the DB
+  // catch paths — it fires on every Neon read failure during prerender, i.e.
+  // exactly when `lastErr` is a DrizzleQueryError whose `.message` embeds the
+  // query's bound params (see lib/db-error.ts). Note the log sits AFTER the
+  // retry loop rather than inside the `catch`, which is why it escaped the
+  // catch-block scans and needed scripts/lint-no-raw-error-logs.mjs to find.
+  // The fallback itself is unchanged: still always logged, never silent.
+  console.warn(
+    `[data] Neon read failed, falling back to bundled JSON snapshot (sqlstate: ${redactedErrorCode(lastErr)})`
+  );
+  return fallback();
+}
+
+/**
+ * Resilient full-table Neon read (retry + JSON fallback via
+ * `withJsonFallback`), shared by every reader below that needs the whole
+ * facility set from the DB branch (`loadFacilitiesUncached`). The state,
+ * power-generation and nav-facet readers filter/project in SQL instead (see
+ * their comments). Callers
+ * still gate on `readsUseDatabase()` themselves and call `loadFromJson()`
+ * directly (no retry) when it's false — this only wraps the DB branch.
+ */
+async function selectAllFacilitiesResilient(): Promise<Facility[]> {
+  return withJsonFallback(
+    async () =>
+      (await getDb().select({ doc: facilitiesTable.doc }).from(facilitiesTable)).map(
+        rowToFacility
+      ),
+    loadFromJson
+  );
+}
+
+/**
  * Loads the full facility set from Neon when `DATABASE_URL` is configured,
  * falling back to the bundled JSON otherwise. DB-sourced docs are trusted
  * as-is (validated at write time via `docToRow`/the Facility schema) — no
  * re-parse on read. Both paths sort by `id` so the DB and fallback produce
- * byte-identical ordering.
+ * byte-identical ordering. The DB branch retries transient Neon read
+ * failures before degrading to the JSON snapshot (see `withJsonFallback`).
  */
 async function loadFacilitiesUncached(): Promise<Facility[]> {
-  const list = hasDatabaseUrl()
-    ? (await getDb().select().from(facilitiesTable)).map(rowToFacility)
-    : loadFromJson();
+  const list = readsUseDatabase() ? await selectAllFacilitiesResilient() : loadFromJson();
   return [...list].sort((a, b) => a.id.localeCompare(b.id));
 }
 
 /**
+ * The facility set is cached as FACILITY_CACHE_SHARDS blobs, not one. The
+ * single gzip+base64 blob reached 2,097,064 bytes on 472cb36 (2026-10-13) —
+ * under the 2 MiB limit (2,097,152) on its own, but over it once wrapped in
+ * `unstable_cache`'s envelope (+~2.3KB). From then on every `set` failed
+ * (`items over 2MB can not be cached`), every prerendered page missed the
+ * cache and re-ran the full-table read + stringify + gzip, and the static
+ * generation workers ran out of heap. The blob had grown 2,073,532 -> 2,097,064
+ * in one data wave, so a bigger compressor only buys one more wave; sharding
+ * removes the ceiling. Shard by a hash of the id (not by array index) so a
+ * record's shard never depends on the other records: no record is dropped or
+ * duplicated when shards revalidate independently.
+ *
+ * Cost of that independence: shards share one revalidate timer but not one
+ * snapshot. A read inside the window (1h aggregate / 24h search) can merge
+ * shards fetched at two different moments, so per-record data is always
+ * whole, but aggregates (counts, totals) can reflect two moments in time.
+ */
+export const FACILITY_CACHE_SHARDS = 4;
+
+export function facilityShard(id: string): number {
+  let h = 2166136261; // FNV-1a
+  for (let i = 0; i < id.length; i++) {
+    h ^= id.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return (h >>> 0) % FACILITY_CACHE_SHARDS;
+}
+
+/** gzip+base64 of a JSON-serializable value: the form every compressed cache entry is stored in. */
+function encodeGzipJson(value: unknown): string {
+  return gzipSync(Buffer.from(JSON.stringify(value), "utf8")).toString("base64");
+}
+
+/** Inverse of `encodeGzipJson`. */
+function decodeGzipJson<T>(blob: string): T {
+  return JSON.parse(gunzipSync(Buffer.from(blob, "base64")).toString("utf8")) as T;
+}
+
+/** gzip+base64 of the records belonging to `shard`. */
+export function encodeFacilityShard(facilities: Facility[], shard: number): string {
+  return encodeGzipJson(facilities.filter((f) => facilityShard(f.id) === shard));
+}
+
+/** Inverse of `encodeFacilityShard` over every shard, in `loadFacilitiesUncached` order. */
+export function mergeFacilityShards(blobs: string[]): Facility[] {
+  return blobs
+    .flatMap((blob) => decodeGzipJson<Facility[]>(blob))
+    .sort((a, b) => a.id.localeCompare(b.id));
+}
+
+/**
+ * Single-slot memo for `mergeFacilityShards`, keyed on the shard blobs' CONTENT.
+ *
+ * `reactCache` only dedupes the inflate+parse within one request while its
+ * dispatcher is live; aggregate pages call `loadFacilities()` from dozens of
+ * getters after `await`s and measured ~70 full gunzip+JSON.parse+sort passes
+ * per page (~27ms and ~35MB of heap each; 490 passes took 13.5s of a 16.5s
+ * window on one build worker, 2026-10-13). Reusing the previous result while
+ * the blobs are unchanged cuts that to one pass per revalidation.
+ *
+ * Cannot serve stale data: the key is the blob contents themselves, so any
+ * revalidation or tag bust that yields different blobs yields a new array. The
+ * array is shared across requests, so callers must not mutate it — the same
+ * contract they already had within a request, and the one the identity-keyed
+ * WeakMap indexes (`buildOperatorIndex`, `buildCountyIndex`, ...) rely on; as a
+ * bonus those now rebuild once per revalidation instead of once per page.
+ */
+export function createFacilityMergeMemo(): (blobs: string[]) => Facility[] {
+  let last: { blobs: string[]; facilities: Facility[] } | undefined;
+  return (blobs) => {
+    if (last && last.blobs.length === blobs.length && last.blobs.every((b, i) => b === blobs[i])) {
+      return last.facilities;
+    }
+    const facilities = mergeFacilityShards(blobs);
+    last = { blobs, facilities };
+    return facilities;
+  };
+}
+
+// Concurrent cold shards (one per `unstable_cache` miss) share a single
+// full-table read. Module-level and cleared on settle rather than memoized, so
+// nothing outlives the burst or goes stale across revalidations; deliberately
+// not React `cache()`, which is request-scoped and unproven inside
+// `unstable_cache` callbacks during static generation.
+let inFlightFullLoad: Promise<Facility[]> | undefined;
+function loadFacilitiesShared(): Promise<Facility[]> {
+  inFlightFullLoad ??= loadFacilitiesUncached().finally(() => {
+    inFlightFullLoad = undefined;
+  });
+  return inFlightFullLoad;
+}
+
+/**
+ * `unstable_cache` refuses to store entries over 2MB, envelope included, and
+ * outside dev only `console.warn`s and skips the write (see
+ * `incremental-cache/index.js`), so an oversized entry fails silently and
+ * every read misses. The facility array serializes to ~5.7MB of plain JSON,
+ * so it is cached as gzip+base64 shards (see `FACILITY_CACHE_SHARDS` for why
+ * and how big they may get), inflated and merged on read.
+ * `createFacilityMergeMemo` reuses the merge while the blobs are unchanged;
+ * `reactCache` alone did not dedupe across getters called after an `await`.
+ * `loadFacilitiesUncached` already
+ * sorts deterministically and has `withJsonFallback`, so the cache stays
+ * outage-resilient (serves the last good blobs if Neon is down). Shared by
+ * `loadFacilities` below.
+ */
+function loadFacilitiesCompressed(
+  keyParts: string[],
+  opts: { tags?: string[]; revalidate: number }
+): () => Promise<Facility[]> {
+  const shards = Array.from({ length: FACILITY_CACHE_SHARDS }, (_, shard) =>
+    unstable_cache(
+      async () => encodeFacilityShard(await loadFacilitiesShared(), shard),
+      // ⚠️ The `shard-N` part is load-bearing. `unstable_cache` keys on the
+      // callback's `toString()` plus these parts, and all FACILITY_CACHE_SHARDS
+      // closures have identical source — without it every shard would share
+      // one key and return the same blob.
+      [...keyParts, `shard-${shard}`],
+      opts
+    )
+  );
+  const merge = createFacilityMergeMemo();
+  return reactCache(async () => merge(await Promise.all(shards.map((load) => load()))));
+}
+
+/**
  * Cached, deterministically-ordered facility loader tagged `"facilities"`,
- * refreshed at most hourly. This is the **aggregate-only** reader now — it
+ * refreshed at most daily (and on every `"facilities"` tag bust). This is
+ * the **aggregate-only** reader now — it
  * backs the ~15 aggregate pages (home, map, table, stats, explore lenses,
  * operators/states index, sitemap, OG image) that legitimately need the
  * whole dataset. Scoped pages (facility detail, one state, one operator)
  * must use the per-scope cached readers below instead, so they don't
  * re-acquire the `"facilities"` tag or this timer.
  *
- * `revalidate: 3600` bounds staleness to ~1h — approved tolerance for
- * aggregate rollups (Ed, 2026-07-22 ISR-write-blowout fix). Combined with
- * dropping the on-write `revalidateTag("facilities")` nuke (see
- * `lib/facility-write.ts`), aggregate pages now refresh on this cheap timer
- * instead of on every write.
+ * `revalidate: 86400` is the backstop only (ISR Writes are the top Vercel
+ * cost, so the timer is long). A route's revalidate is the MIN of its own
+ * export and every nested `unstable_cache`, so this value gates every hub,
+ * listing and aggregate page. Freshness comes from tag busts instead:
+ * `db:sync --apply` busts `"facilities"`, and `approveSubmission` /
+ * `rejectSubmission` bust it once each time the pending queue is left empty
+ * (`lib/submissions.ts`). A single write still busts only its scoped tags
+ * (see `lib/facility-write.ts`) — per-write `"facilities"` busts were the
+ * 2026-07-22 ISR-write-blowout.
  *
  * `unstable_cache` requires the Next.js request-scoped cache context, which
  * is absent under vitest — detect that environment and degrade to the
  * uncached loader directly so the 536-test suite (which runs with no
- * DATABASE_URL, exercising the JSON fallback) stays green.
+ * DATABASE_URL, exercising the JSON fallback) stays green. The underlying
+ * payload is stored as gzip-compressed shards (see `loadFacilitiesCompressed`
+ * above), each kept well under `unstable_cache`'s 2MB entry limit.
  */
 export const loadFacilities: () => Promise<Facility[]> = process.env.VITEST
   ? loadFacilitiesUncached
-  : unstable_cache(loadFacilitiesUncached, ["facilities"], {
+  : loadFacilitiesCompressed(["facilities"], {
       tags: ["facilities"],
-      revalidate: 3600,
+      revalidate: 86400,
     });
 
 /**
- * 24h-revalidate view of the facility list for the GLOBAL ⌘K search index ONLY.
- * <SiteHeader> renders it in the root layout on every route, so this read's
- * revalidate becomes the site-wide ISR floor — deliberately long (86400s) so it
- * does NOT pin every page to a 1h cycle. Aggregate pages read loadFacilities
- * (1h) directly and float above this floor; detail/state pages read scoped
- * tag-only caches and floor here at 24h. Same "facilities" tag (inert — nothing
- * calls revalidateTag("facilities") anymore).
+ * 24h-revalidate operator/state facets for the GLOBAL ⌘K nav index ONLY.
+ * Read by `GET /api/nav-index` (via `buildNavSearchIndex`), which the palette
+ * fetches lazily on first open. It is NO LONGER read in the root layout, so it
+ * sets no ISR floor on any route: the detail/state/embed pages that read
+ * scoped tag-only caches declare `export const revalidate = 86400` themselves.
+ *
+ * Deliberately NO cache tag here — do NOT add one back (not "facilities", not
+ * "search-index", not anything). While this ran in the root layout, a tag on it
+ * was stamped onto every prerendered route (~1,500 of them), so busting it
+ * hard-expired the whole site in one shot; the route handler no longer does
+ * that, but the endpoint's own edge cache is untagged too.
+ *
+ * This reader used to carry the "facilities" tag, reasoned at the time to be
+ * inert because nothing called revalidateTag("facilities").
+ * That premise held only until `scripts/sync-to-neon.ts` started adding
+ * "facilities" to every publish's tag set — at which point this read turned
+ * every `db:sync -- --apply` into a site-wide cache nuke. Measured 2026-08-21.
+ * The 86400s timer above is the intended refresh mechanism for this reader;
+ * it needs no tag to stay correct.
+ *
+ * Deliberately NOT the full facility list: this used to run in the root layout,
+ * i.e. once per prerendered page (~4,800 per build). Inflating and parsing the whole
+ * dataset for the two fields the nav index reads left live deep copies in a
+ * build worker's heap at the moment it ran out of memory: per the 2026-10-13
+ * Node 22 heap snapshot, ~35MB of heap per parse and ~120 live deep copies
+ * (4.2GB). The facets are ~120KB and cached as plain JSON, no compression
+ * needed.
  */
-export const loadFacilitiesForSearch: () => Promise<Facility[]> = process.env.VITEST
-  ? loadFacilitiesUncached
-  : unstable_cache(loadFacilitiesUncached, ["facilities-search"], {
-      tags: ["facilities"],
+export interface NavFacet {
+  operator: string;
+  state: string;
+}
+
+/**
+ * Projects only the `operator` and `state` columns in SQL (~55 KB) instead of
+ * pulling the full 5.9 MB doc set. Those columns are derived from the doc by
+ * `docToRow` (lib/db/serialize.ts) and matched the doc fields with 0
+ * mismatches on prod (measured 2026-10-14). The order is load-bearing:
+ * `buildNavSearchIndex` emits states in first-seen order. The DB branch sorts
+ * in JS (`localeCompare` on id), not with SQL `ORDER BY`, because Postgres
+ * ordering follows the DB collation; a collation change would silently
+ * reorder the palette's states. A JS sort on both branches makes them
+ * identical by construction.
+ */
+async function loadNavFacetsUncached(): Promise<NavFacet[]> {
+  const fromJson = (): NavFacet[] =>
+    [...loadFromJson()]
+      .sort((a, b) => a.id.localeCompare(b.id))
+      .map((f) => ({ operator: f.operator, state: f.location.state }));
+  if (!readsUseDatabase()) return fromJson();
+  return withJsonFallback(
+    async () =>
+      (
+        await getDb()
+          .select({
+            id: facilitiesTable.id,
+            operator: facilitiesTable.operator,
+            state: facilitiesTable.state,
+          })
+          .from(facilitiesTable)
+      )
+        .sort((a, b) => a.id.localeCompare(b.id))
+        .map((r) => ({ operator: r.operator, state: r.state })),
+    fromJson
+  );
+}
+
+export const loadNavFacets: () => Promise<NavFacet[]> = process.env.VITEST
+  ? loadNavFacetsUncached
+  : unstable_cache(loadNavFacetsUncached, ["facilities-nav-facets"], {
       revalidate: 86400,
     });
 
@@ -106,20 +371,37 @@ export const loadFacilitiesForSearch: () => Promise<Facility[]> = process.env.VI
 // ============================================================
 //
 // These back the pages that must NOT depend on the global `"facilities"`
-// tag or its 1h timer: facility detail, state landing, and (indirectly, via
-// loadPowerGenerationCached) the power-links cross-reference on detail
-// pages. Each is tag-only (no `revalidate` option) so the page stays fully
-// static and rewrites only when `lib/facility-write.ts` busts its specific
-// tag on write. Each reads the DB/JSON directly rather than routing through
-// `loadFacilities()`, so it never re-acquires the global tag. Every reader
-// mirrors the `process.env.VITEST` bypass so the test suite (no
-// DATABASE_URL) stays green.
+// tag or its 1h timer: facility detail, state landing, per-operator
+// (`getFacilitiesByOperatorCached`, for the related-facilities rail), and
+// (indirectly, via loadPowerGenerationCached) the power-links cross-reference
+// on detail pages. Each is tag-only (no `revalidate` option on the reader
+// itself) and rewrites only when `lib/facility-write.ts` busts its specific
+// tag on write — but "tag-only" describes the READER, not the page's actual
+// worst-case staleness: the facility, state and embed-state pages declare
+// `export const revalidate = 86400` themselves (the root layout no longer
+// reads `loadNavFacets`, so nothing else supplies a floor), which is that
+// 24h ceiling. Each reads the DB/JSON directly
+// rather than routing through `loadFacilities()`, so it never re-acquires
+// the global tag. Every reader mirrors the `process.env.VITEST` bypass so
+// the test suite (no DATABASE_URL) stays green.
 
-/** Uncached direct-row fetch backing `getFacilityByIdCached`. */
+/**
+ * Uncached direct-row fetch backing `getFacilityByIdCached`. The DB branch
+ * retries transient Neon read failures before degrading to the matching
+ * record in the JSON snapshot (see `withJsonFallback`).
+ */
 async function fetchFacilityByIdUncached(id: string): Promise<Facility | undefined> {
-  if (hasDatabaseUrl()) {
-    const rows = await getDb().select().from(facilitiesTable).where(eq(facilitiesTable.id, id));
-    return rows[0] ? rowToFacility(rows[0]) : undefined;
+  if (readsUseDatabase()) {
+    return withJsonFallback(
+      async () => {
+        const rows = await getDb()
+          .select({ doc: facilitiesTable.doc })
+          .from(facilitiesTable)
+          .where(eq(facilitiesTable.id, id));
+        return rows[0] ? rowToFacility(rows[0]) : undefined;
+      },
+      () => loadFromJson().find((f) => f.id === id)
+    );
   }
   return loadFromJson().find((f) => f.id === id);
 }
@@ -137,14 +419,29 @@ export const getFacilityByIdCached = (id: string): Promise<Facility | undefined>
         tags: [`facility:${id}`],
       })(id);
 
-/** Uncached direct-filtered fetch backing `getFacilitiesByStateCached`. */
+/**
+ * Uncached direct-filtered fetch backing `getFacilitiesByStateCached`. The DB
+ * branch filters on the indexed `state` column in SQL (a state slice averages
+ * ~107 KB vs 5.9 MB for the full set) and retries transient Neon read failures
+ * before degrading to the filtered JSON snapshot (see `withJsonFallback`).
+ * The `state` column is derived from `doc.location.state` by `docToRow`
+ * (lib/db/serialize.ts); parity measured 0-mismatch on prod 2026-10-14.
+ */
 async function fetchFacilitiesByStateUncached(code: string): Promise<Facility[]> {
   const upper = code.toUpperCase();
-  const list = hasDatabaseUrl()
-    ? (await getDb().select().from(facilitiesTable)).map(rowToFacility)
-    : loadFromJson();
-  return list
-    .filter((f) => f.location.state === upper)
+  const list = readsUseDatabase()
+    ? await withJsonFallback(
+        async () =>
+          (
+            await getDb()
+              .select({ doc: facilitiesTable.doc })
+              .from(facilitiesTable)
+              .where(eq(facilitiesTable.state, upper))
+          ).map(rowToFacility),
+        () => loadFromJson().filter((f) => f.location.state === upper)
+      )
+    : loadFromJson().filter((f) => f.location.state === upper);
+  return [...list]
     .sort(
       (a, b) =>
         (getFacilityMaxMw(b) ?? -1) - (getFacilityMaxMw(a) ?? -1) ||
@@ -154,8 +451,14 @@ async function fetchFacilitiesByStateUncached(code: string): Promise<Facility[]>
 
 /**
  * Per-state scoped reader for the state landing page. Tagged
- * `state:${CODE}` (uppercase) — busted only by a write touching that state,
- * never by the global tag or timer. Same filter/sort as `getFacilitiesByState`.
+ * `state:${CODE}` (uppercase) — this READER is busted only by a write
+ * touching that state, never by the global tag or timer. That is a claim
+ * about the reader's own cache entry, not the state page's measured
+ * behavior: `/states/*` was measured at `initialRevalidateSeconds: 3600`
+ * (2026-08-21); with `loadFacilities` at 86400 it now
+ * sits on the 24h floor and, per the ground truth measured
+ * 2026-08-21, does carry the bare `facilities` tag via other reads in its
+ * render tree. Same filter/sort as `getFacilitiesByState`.
  */
 export const getFacilitiesByStateCached = (code: string): Promise<Facility[]> => {
   const upper = code.toUpperCase();
@@ -187,14 +490,60 @@ export const getStateSummaryCached = (code: string): Promise<StateSummary | null
       })(upper);
 };
 
-/** Uncached full power_generation-facility load backing `loadPowerGenerationCached`. */
+/**
+ * Uncached power_generation-facility load backing
+ * `loadPowerGenerationCached`. The DB branch filters on the indexed
+ * `facility_type` column in SQL (~0.90 MB vs 5.9 MB) and retries transient
+ * Neon read failures before degrading to the JSON snapshot (see
+ * `withJsonFallback`). The column is derived from `doc.facilityType` by
+ * `docToRow`; parity measured 0-mismatch on prod 2026-10-14. The type-guard
+ * filter below stays to narrow the TS type.
+ */
 async function loadPowerGenerationUncached(): Promise<PowerGenerationFacility[]> {
-  const list = hasDatabaseUrl()
-    ? (await getDb().select().from(facilitiesTable)).map(rowToFacility)
+  const list = readsUseDatabase()
+    ? await withJsonFallback(
+        async () =>
+          (
+            await getDb()
+              .select({ doc: facilitiesTable.doc })
+              .from(facilitiesTable)
+              .where(eq(facilitiesTable.facilityType, "power_generation"))
+          ).map(rowToFacility),
+        loadFromJson
+      )
     : loadFromJson();
   return list.filter(
     (f): f is PowerGenerationFacility => f.facilityType === "power_generation"
   );
+}
+
+/**
+ * gzip+base64 of the power_generation list. The plain-JSON entry reached
+ * 1,051,986 chars (UTF-16 units, not bytes) on 2026-10-28, past the 50% guard on Next's 2 MiB entry limit
+ * (see `FACILITY_CACHE_SHARDS`). Order is preserved; no sort.
+ */
+export function encodePowerGeneration(list: PowerGenerationFacility[]): string {
+  return encodeGzipJson(list);
+}
+
+/** Inverse of `encodePowerGeneration`. */
+export function decodePowerGeneration(blob: string): PowerGenerationFacility[] {
+  return decodeGzipJson<PowerGenerationFacility[]>(blob);
+}
+
+/**
+ * Single-slot memo for `decodePowerGeneration`, keyed on the blob's content
+ * (same reasoning as `createFacilityMergeMemo`: it cannot serve stale data, and
+ * callers must not mutate the shared array).
+ */
+export function createPowerGenerationDecodeMemo(): (blob: string) => PowerGenerationFacility[] {
+  let last: { blob: string; list: PowerGenerationFacility[] } | undefined;
+  return (blob) => {
+    if (last && last.blob === blob) return last.list;
+    const list = decodePowerGeneration(blob);
+    last = { blob, list };
+    return list;
+  };
 }
 
 /**
@@ -208,17 +557,74 @@ async function loadPowerGenerationUncached(): Promise<PowerGenerationFacility[]>
 export const loadPowerGenerationCached: () => Promise<PowerGenerationFacility[]> =
   process.env.VITEST
     ? loadPowerGenerationUncached
-    : unstable_cache(loadPowerGenerationUncached, ["power-generation"], {
-        tags: ["power-generation"],
-      });
+    : (() => {
+        const cached = unstable_cache(
+          async () => encodePowerGeneration(await loadPowerGenerationUncached()),
+          // "-gz" is deliberate: the entry used to be plain JSON under
+          // ["power-generation"], and a stale plain-JSON entry surviving a deploy
+          // must never be gunzipped. A new key part means old entries are simply
+          // never read.
+          ["power-generation-gz"],
+          { tags: ["power-generation"] }
+        );
+        const decode = createPowerGenerationDecodeMemo();
+        return async () => decode(await cached());
+      })();
 
 export async function getAllFacilities(): Promise<Facility[]> {
   return loadFacilities();
 }
 
+/**
+ * Uncached, direct id-only fetch backing `getAllFacilityIds`. Selects just
+ * the `id` column — enumerating every facility route for
+ * `generateStaticParams` doesn't need the full ~1,064-row document set. Not
+ * `unstable_cache`d: this only runs at build time (route enumeration), never
+ * per-request, so there's no cache entry — and therefore no tag — to add.
+ */
+async function fetchFacilityIdsUncached(): Promise<string[]> {
+  const ids = readsUseDatabase()
+    ? await withJsonFallback(
+        async () =>
+          (await getDb().select({ id: facilitiesTable.id }).from(facilitiesTable)).map(
+            (row) => row.id
+          ),
+        () => loadFromJson().map((f) => f.id)
+      )
+    : loadFromJson().map((f) => f.id);
+  // Sort by id so the DB and JSON-fallback paths enumerate routes in
+  // byte-identical order — the same invariant `loadFacilitiesUncached` holds
+  // above, and what keeps `generateStaticParams` reproducible across builds.
+  // Neither branch is ordered on its own: Postgres returns rows in physical
+  // order (which a reseed changes) and the JSON path returns file order.
+  // Safe to sort in place — every branch above produces a fresh array.
+  return ids.sort((a, b) => a.localeCompare(b));
+}
+
+/**
+ * Facility ids only — backs `generateStaticParams` on the facility detail
+ * page (`app/facilities/[slug]/page.tsx`), which needs `{ slug: f.id }` for
+ * every route and nothing else from the full document.
+ */
+export async function getAllFacilityIds(): Promise<string[]> {
+  return fetchFacilityIdsUncached();
+}
+
 export async function getFacilityById(id: string): Promise<Facility | undefined> {
   const facilities = await loadFacilities();
   return facilities.find((f) => f.id === id);
+}
+
+/**
+ * Returns the facilities matching `ids`, in the order given. Unknown ids are
+ * omitted. Backs the /learn explainer's exemplar lookups — a single
+ * `loadFacilities()` read (already cached, already called by this page's
+ * stat helpers) plus a Map lookup, never N calls to `getFacilityById`.
+ */
+export async function getFacilitiesByIds(ids: string[]): Promise<Facility[]> {
+  const facilities = await loadFacilities();
+  const byId = new Map(facilities.map((f) => [f.id, f]));
+  return ids.map((id) => byId.get(id)).filter((f): f is Facility => f !== undefined);
 }
 
 /** Returns unique 2-letter state codes, sorted A→Z. */
@@ -250,7 +656,7 @@ export async function getStatusCounts(): Promise<Record<Status, number>> {
  * (operational or planned) desc, then name A→Z (deterministic tie-break).
  * Backs the /status/[status] landing pages. Reads the shared
  * `loadFacilities()` cache — no new uncached per-request DB read (see that
- * function's doc comment on the s51 ISR-write-blowout lesson).
+ * function's doc comment on the ISR-write-blowout lesson).
  */
 export async function getFacilitiesByStatus(status: Status): Promise<Facility[]> {
   const facilities = await loadFacilities();
@@ -264,6 +670,18 @@ export async function getFacilitiesByStatus(status: Status): Promise<Facility[]>
 }
 
 /**
+ * Rounds a summed capacity figure to 1 decimal place. These are megawatts
+ * aggregated across hundreds of facilities via floating-point addition, so
+ * the raw sum carries accumulation artifacts (e.g. `27350.639999999996`)
+ * well past any precision the underlying per-facility disclosures actually
+ * support — sub-0.1 MW resolution is noise, not signal, and is exactly what
+ * an academic citation would otherwise quote verbatim.
+ */
+function roundMw(sum: number): number {
+  return Math.round(sum * 10) / 10;
+}
+
+/**
  * Returns aggregate stats for the whole dataset.
  *
  * `operationalMw` — sum of `capacityMw.operational` across non-cancelled facilities.
@@ -271,30 +689,76 @@ export async function getFacilitiesByStatus(status: Status): Promise<Facility[]>
  * Both lenses exclude cancelled projects so the displayed figures are not
  * inflated by withdrawn announcements. They are intentionally independent
  * (running vs announced) rather than a combined max/total.
+ *
+ * Each MW sum covers only the rows that disclose that capacity, not every row
+ * in its population. The `*ReportingCount` fields (with `activeCount` and
+ * `underConstructionCount`) are the denominators: read a sum together with its
+ * count, never as a total for the whole dataset.
+ *
+ * All three summed fields are rounded to 1 decimal place — see `roundMw`.
  */
 export async function getStats(): Promise<{
   count: number;
   states: number;
+  /** True when `states` includes DC — the count is not "states" alone. */
+  includesDc: boolean;
+  /**
+   * Sorted, de-duplicated jurisdiction codes underlying `states`/`includesDc`.
+   * A count plus a DC boolean can't express a set that also contains
+   * territories (PR, GU, VI, MP, ...) — the codes are the only
+   * representation that stays correct as jurisdictions are added.
+   */
+  stateCodes: string[];
+  /** Sum over `operationalMwReportingCount` of the `activeCount` non-cancelled rows. */
   operationalMw: number;
+  /** Sum over `plannedMwReportingCount` of the `activeCount` non-cancelled rows. */
   plannedMw: number;
+  /** Sum over `underConstructionMwReportingCount` of the `underConstructionCount` rows. */
   underConstructionMw: number;
+  /** Non-cancelled facilities: the population `operationalMw` and `plannedMw` are drawn from. */
+  activeCount: number;
+  /** Non-cancelled rows that disclose `capacityMw.operational` (a disclosed 0 counts). */
+  operationalMwReportingCount: number;
+  /** Non-cancelled rows that disclose `capacityMw.planned` (a disclosed 0 counts). */
+  plannedMwReportingCount: number;
+  /** Facilities with status `under_construction`: the population `underConstructionMw` is drawn from. */
+  underConstructionCount: number;
+  /** `under_construction` rows that disclose `capacityMw.planned` (a disclosed 0 counts). */
+  underConstructionMwReportingCount: number;
 }> {
   const facilities = await loadFacilities();
   const count = facilities.length;
-  const states = new Set(facilities.map((f) => f.location.state)).size;
+  const stateSet = new Set(facilities.map((f) => f.location.state));
+  const states = stateSet.size;
+  const includesDc = containsDc(stateSet);
+  const stateCodes = Array.from(stateSet).sort();
   const active = facilities.filter((f) => f.status !== "cancelled");
-  const operationalMw = active.reduce(
-    (sum, f) => sum + (f.capacityMw?.operational ?? 0),
-    0
+  const operationalMw = roundMw(
+    active.reduce((sum, f) => sum + (f.capacityMw?.operational ?? 0), 0)
   );
-  const plannedMw = active.reduce(
-    (sum, f) => sum + (f.capacityMw?.planned ?? 0),
-    0
+  const plannedMw = roundMw(
+    active.reduce((sum, f) => sum + (f.capacityMw?.planned ?? 0), 0)
   );
-  const underConstructionMw = facilities
-    .filter((f) => f.status === "under_construction")
-    .reduce((sum, f) => sum + (f.capacityMw?.planned ?? 0), 0);
-  return { count, states, operationalMw, plannedMw, underConstructionMw };
+  const underConstruction = facilities.filter((f) => f.status === "under_construction");
+  const underConstructionMw = roundMw(
+    underConstruction.reduce((sum, f) => sum + (f.capacityMw?.planned ?? 0), 0)
+  );
+  return {
+    count,
+    states,
+    includesDc,
+    stateCodes,
+    operationalMw,
+    plannedMw,
+    underConstructionMw,
+    activeCount: active.length,
+    operationalMwReportingCount: active.filter((f) => f.capacityMw?.operational != null).length,
+    plannedMwReportingCount: active.filter((f) => f.capacityMw?.planned != null).length,
+    underConstructionCount: underConstruction.length,
+    underConstructionMwReportingCount: underConstruction.filter(
+      (f) => f.capacityMw?.planned != null
+    ).length,
+  };
 }
 
 // ============================================================
@@ -492,6 +956,17 @@ export async function getCommunityReceptionCounts(): Promise<Record<CommunityRec
   return counts;
 }
 
+/**
+ * Sums the three "friction" tiers — contested, opposed, litigation — out of
+ * a `getCommunityReceptionCounts()` result. Extracted so /'s and /about's
+ * identical hand-computed sums (previously kept in sync only by a code
+ * comment) can't drift apart. Guards each tier with `?? 0` so a caller
+ * passing a partial/mocked counts object doesn't throw.
+ */
+export function getFrictionTotal(counts: Record<CommunityReception, number>): number {
+  return (counts.contested ?? 0) + (counts.opposed ?? 0) + (counts.litigation ?? 0);
+}
+
 /** Returns the top-N facilities sorted by highest capacity (operational or planned). */
 export async function getNotableFacilities(n = 6): Promise<Facility[]> {
   const facilities = await loadFacilities();
@@ -502,6 +977,116 @@ export async function getNotableFacilities(n = 6): Promise<Facility[]> {
         Math.max(a.capacityMw?.operational ?? 0, a.capacityMw?.planned ?? 0)
     )
     .slice(0, n);
+}
+
+/** Minimum cited sources a homepage record specimen must carry. */
+const SPECIMEN_MIN_SOURCES = 3;
+/** Minimum `statusHistory` events, so the rendered timeline isn't a single dot. */
+const SPECIMEN_MIN_HISTORY = 2;
+
+/**
+ * The homepage specimen is PINNED to this record (Ed, 2026-09-16) rather than
+ * left to the ranking below: the Pike County, Ohio megasite on the former
+ * Portsmouth Gaseous Diffusion Plant. It is the record the maintainer is
+ * closest to — 60 miles from where he lives — and it is the clearest single
+ * illustration of what this site tracks: 10 GW of gross load with 9.2 GW of
+ * NEW natural-gas generation built to feed it, on a federal site, in a county
+ * of roughly thirty thousand people.
+ *
+ * ⚠️ It does NOT meet `SPECIMEN_MIN_HISTORY`, and that is the point of pinning
+ * rather than re-tuning the rule. Read the docblock below: the history floor
+ * exists because "highest capacity with >= 3 sources" TIES at 10,000 MW and the
+ * source tie-break lands on a one-event timeline. This record IS that tie —
+ * 12 sources against the automatic winner's 5, one status event against its
+ * two. Lowering the floor to let it through would re-admit every accidental
+ * one-event record along with it; pinning admits exactly this one, on purpose,
+ * and leaves the automatic rule intact underneath as the fallback.
+ *
+ * The pin still has to clear `SPECIMEN_MIN_SOURCES`, a disclosed capacity, and
+ * at least ONE status event — a specimen whose whole job is demonstrating
+ * citations cannot be thinner than the bar it demonstrates. If the record is
+ * ever retired, renamed, or falls below that bar, selection falls through to
+ * the ranking and the homepage keeps working. That fallback is silent by
+ * design; `lib/data.specimen-pin.test.ts` is what makes it loud, asserting the
+ * pinned id is present and still qualifies so a data wave that drops it turns
+ * CI red instead of quietly re-picking a different facility.
+ */
+const PINNED_SPECIMEN_ID = "new-day-ports-technology-campus-piketon-oh";
+
+/** Minimum `statusHistory` events for the PINNED record — one real, cited event. */
+const PINNED_SPECIMEN_MIN_HISTORY = 1;
+
+/**
+ * True when the pinned record is fit to render as the specimen. Exported for
+ * the pin test, which asserts the live dataset still satisfies it.
+ */
+export function qualifiesAsPinnedSpecimen(f: Facility): boolean {
+  return (
+    f.sources.length >= SPECIMEN_MIN_SOURCES &&
+    f.statusHistory.length >= PINNED_SPECIMEN_MIN_HISTORY &&
+    (getFacilityMaxMw(f) ?? 0) > 0
+  );
+}
+
+/** The pinned specimen's id, for tests and for callers that need to exclude it. */
+export const PINNED_RECORD_SPECIMEN_ID: string = PINNED_SPECIMEN_ID;
+
+/**
+ * Picks the ONE facility the homepage renders at near-full fidelity (name,
+ * operator, status, coordinates, capacity, citations, timeline) — the record
+ * that demonstrates what "source-cited" means.
+ *
+ * `PINNED_SPECIMEN_ID` wins whenever it is present and clears
+ * `qualifiesAsPinnedSpecimen` — an editorial choice, documented as one at that
+ * constant. Everything below describes the FALLBACK that runs when the pin is
+ * absent or no longer qualifies, and is unchanged.
+ *
+ * Pure function of the list, taking no `loadFacilities()` of its own, so
+ * `app/page.tsx` can reuse the `getAllFacilities()` result it already has and
+ * the rule can be tested against fixtures rather than live data.
+ *
+ * The rule is a FILTER then a total ordering:
+ *   - filter: >= 3 sources, >= 2 status events, and a disclosed capacity > 0.
+ *     The history floor matters as much as the source floor — "highest capacity
+ *     with >= 3 sources" alone TIES at 10,000 MW in the current dataset, and the
+ *     source-count tie-break lands on a facility with one history entry, which
+ *     renders a degenerate one-event timeline.
+ *   - sort: capacity desc, then source count desc, then `id` ascending. The id
+ *     term is what makes it total: ids are unique, so the winner cannot change
+ *     between renders even if a future wave ties at every earlier level.
+ *
+ * Capacity is `getFacilityMaxMw` — the larger of operational/planned, the same
+ * expression `getNotableFacilities` and `sortByMaxMwDesc` rank on, rather than
+ * `operational ?? planned`. The two differ only for a facility disclosing both
+ * with a larger planned figure, and there "highest capacity" plainly means the
+ * larger disclosed number; reusing the shared helper also keeps the specimen
+ * ranked on the same axis as the cards it sits above.
+ *
+ * Returns `null` when nothing qualifies (empty dataset, or a local render with
+ * no `DATABASE_URL`) — callers degrade to their plain rendering. It never
+ * throws and never returns a facility that fails the filter.
+ */
+export function selectRecordSpecimen(facilities: Facility[]): Facility | null {
+  const pinned = facilities.find((f) => f.id === PINNED_SPECIMEN_ID);
+  if (pinned && qualifiesAsPinnedSpecimen(pinned)) return pinned;
+
+  const candidates = facilities.filter(
+    (f) =>
+      f.sources.length >= SPECIMEN_MIN_SOURCES &&
+      f.statusHistory.length >= SPECIMEN_MIN_HISTORY &&
+      (getFacilityMaxMw(f) ?? 0) > 0
+  );
+  if (candidates.length === 0) return null;
+
+  // `filter` already returned a fresh array, so this sort never mutates the
+  // caller's list (loadFacilities' memoized JSON fallback is shared).
+  candidates.sort(
+    (a, b) =>
+      (getFacilityMaxMw(b) ?? 0) - (getFacilityMaxMw(a) ?? 0) ||
+      b.sources.length - a.sources.length ||
+      a.id.localeCompare(b.id)
+  );
+  return candidates[0];
 }
 
 // ============================================================
@@ -528,7 +1113,7 @@ function isUnverifiedMegaproject(f: Facility): boolean {
  * (`capacityMw.planned`) descending, tie-broken by name A→Z. Excludes
  * cancelled facilities and `isUnverifiedMegaproject` outliers before
  * ranking. Mirrors `getFacilitiesByWaterUsage`'s filter→sort→slice shape
- * (Session 7, Task 7.1) applied to `capacityMw.planned` instead.
+ * applied to `capacityMw.planned` instead.
  */
 export async function getFacilitiesRankedByPlannedMw(n = 20): Promise<Facility[]> {
   const facilities = await loadFacilities();
@@ -556,6 +1141,14 @@ export interface OperatorCapacityRanking {
   plannedMw: number;
   /** Count of the operator's non-outlier facilities (any status) — mirrors getTopOperators' unfiltered count. */
   count: number;
+  /**
+   * Count of the operator's non-cancelled, non-outlier facilities with a
+   * disclosed operational or planned capacityMw figure — i.e. exactly the
+   * population `operationalMw`/`plannedMw` sum over. Lets a page distinguish
+   * "49 facilities tracked, 4 disclose capacity" from a ranking that implies
+   * every tracked site contributed to the MW total.
+   */
+  disclosedCount: number;
 }
 
 /**
@@ -570,15 +1163,20 @@ export async function getTopOperatorsByCapacity(n = 10): Promise<OperatorCapacit
   const facilities = await loadFacilities();
   const byOperator = new Map<
     string,
-    { operationalMw: number; plannedMw: number; count: number }
+    { operationalMw: number; plannedMw: number; count: number; disclosedCount: number }
   >();
   for (const f of facilities) {
     if (isUnverifiedMegaproject(f)) continue;
-    const entry = byOperator.get(f.operator) ?? { operationalMw: 0, plannedMw: 0, count: 0 };
+    const entry =
+      byOperator.get(f.operator) ??
+      { operationalMw: 0, plannedMw: 0, count: 0, disclosedCount: 0 };
     entry.count++;
     if (f.status !== "cancelled") {
       entry.operationalMw += f.capacityMw?.operational ?? 0;
       entry.plannedMw += f.capacityMw?.planned ?? 0;
+      if (getFacilityMaxMw(f) !== undefined) {
+        entry.disclosedCount++;
+      }
     }
     byOperator.set(f.operator, entry);
   }
@@ -601,6 +1199,13 @@ export interface StateCapacityRanking {
   plannedMw: number;
   /** Count of the state's non-outlier facilities (any status) — mirrors getTopOperators' unfiltered count. */
   count: number;
+  /**
+   * Count of the state's non-cancelled, non-outlier facilities with a
+   * disclosed operational or planned capacityMw figure — i.e. exactly the
+   * population `operationalMw`/`plannedMw` sum over. Mirrors
+   * `OperatorCapacityRanking.disclosedCount`.
+   */
+  disclosedCount: number;
 }
 
 /**
@@ -613,16 +1218,20 @@ export async function getTopStatesByCapacity(n = 10): Promise<StateCapacityRanki
   const facilities = await loadFacilities();
   const byState = new Map<
     string,
-    { operationalMw: number; plannedMw: number; count: number }
+    { operationalMw: number; plannedMw: number; count: number; disclosedCount: number }
   >();
   for (const f of facilities) {
     if (isUnverifiedMegaproject(f)) continue;
     const state = f.location.state;
-    const entry = byState.get(state) ?? { operationalMw: 0, plannedMw: 0, count: 0 };
+    const entry =
+      byState.get(state) ?? { operationalMw: 0, plannedMw: 0, count: 0, disclosedCount: 0 };
     entry.count++;
     if (f.status !== "cancelled") {
       entry.operationalMw += f.capacityMw?.operational ?? 0;
       entry.plannedMw += f.capacityMw?.planned ?? 0;
+      if (getFacilityMaxMw(f) !== undefined) {
+        entry.disclosedCount++;
+      }
     }
     byState.set(state, entry);
   }
@@ -668,14 +1277,14 @@ export async function getWaterUsage(): Promise<WaterUsage> {
   return { reportingCount: reporting.length, totalMgd };
 }
 
-/** All 5 cooling type keys (stable, exhaustive set). */
-const COOLING_TYPE_KEYS = [
-  "evaporative",
-  "air",
-  "closed_loop",
-  "hybrid",
-  "unknown",
-] as const;
+/**
+ * All 5 cooling type keys (stable, exhaustive set) — derived from
+ * `waterCoolingTypeEnum` (lib/schema.ts) so this can never drift from the
+ * canonical enum. Order is byte-identical to the previous hand-retyped
+ * literal (["evaporative","air","closed_loop","hybrid","unknown"]),
+ * verified before switching this over.
+ */
+const COOLING_TYPE_KEYS = waterCoolingTypeEnum.options;
 
 export type CoolingType = (typeof COOLING_TYPE_KEYS)[number];
 
@@ -707,6 +1316,81 @@ export async function getFacilitiesByWaterUsage(n = 10): Promise<Facility[]> {
     .filter(hasReportedWater)
     .sort((a, b) => b.water!.reportedMgd! - a.water!.reportedMgd! || a.name.localeCompare(b.name))
     .slice(0, n);
+}
+
+/**
+ * `waterStress.cat` band boundaries, per WRI Aqueduct 4.0. `-1` ("Arid and
+ * Low Water Use") and `0`-`2` are real, low-stress classifications — not
+ * missing data — so they simply fall below `HIGH`. Confirmed against the
+ * live artifact:
+ * `node -e 'const s=require("./data/siting-context.json");const m={};for(const v of Object.values(s)){if(v.waterStress)m[v.waterStress.cat]=v.waterStress.label}console.log(m)'`
+ * → `{ '-1': 'Arid and Low Water Use', '0': 'Low (<10%)', '1': 'Low - Medium (10-20%)',
+ *      '2': 'Medium - High (20-40%)', '3': 'High (40-80%)', '4': 'Extremely High (>80%)' }`
+ */
+const WATER_STRESS_CAT_HIGH = 3;
+const WATER_STRESS_CAT_EXTREME = 4;
+
+export interface WaterStressExposure {
+  /** Non-cancelled facilities that have a basin water-stress rating on file. */
+  rated: number;
+  /** Of those, the count in basins rated "High (40-80%)" or "Extremely High (>80%)". */
+  highOrExtreme: number;
+  /** Of those, the count in "Extremely High (>80%)" alone. */
+  extreme: number;
+}
+
+/**
+ * Pure reducer over facility + siting-context lookups — no data fetch, no
+ * I/O. Split out from `getWaterStressExposure`, mirroring
+ * `computeGenerationBuildoutStats`'s reasoning: every real facility already
+ * has a `data/siting-context.json` entry (enforced by
+ * `lib/siting-context.test.ts`), so a test against the real dataset alone
+ * could never exercise the "no entry at all" exclusion — it would pass
+ * whether or not that exclusion existed at all (a false proxy).
+ * `lookupSitingContext` is injected so tests can supply a fixture instead of
+ * the real artifact.
+ *
+ * A facility with no siting-context entry, or an entry with no
+ * `waterStress`, is excluded from `rated` — unknown, not zero-stress (this
+ * repo's honest-zero convention; see `getWaterUsage`/`getCoolingTypeCounts`).
+ * Classifies on the numeric `waterStress.cat`, never the `label` string —
+ * labels are human-readable text, and matching on them would be exactly the
+ * kind of brittle proxy this repo has been burned by before.
+ */
+export function computeWaterStressExposure(
+  facilities: Facility[],
+  lookupSitingContext: (id: string) => SitingContext | undefined
+): WaterStressExposure {
+  let rated = 0;
+  let highOrExtreme = 0;
+  let extreme = 0;
+  for (const f of facilities) {
+    if (f.status === "cancelled") continue;
+    const waterStress = lookupSitingContext(f.id)?.waterStress;
+    if (!waterStress) continue;
+    rated++;
+    if (waterStress.cat >= WATER_STRESS_CAT_HIGH) {
+      highOrExtreme++;
+      if (waterStress.cat === WATER_STRESS_CAT_EXTREME) extreme++;
+    }
+  }
+  return { rated, highOrExtreme, extreme };
+}
+
+/**
+ * Returns how many tracked, non-cancelled facilities sit in hydrological
+ * basins WRI Aqueduct 4.0 already rates High or Extremely High for baseline
+ * water stress. This describes the surrounding basin, not any facility's own
+ * measured water use — the same caveat
+ * `components/facility/siting-context.tsx` states on every facility page.
+ * Thin async wrapper: fetches the live data and delegates to
+ * {@link computeWaterStressExposure}.
+ */
+export async function getWaterStressExposure(): Promise<WaterStressExposure> {
+  const [facilities, waterStress] = await Promise.all([loadFacilities(), getWaterStressById()]);
+  return computeWaterStressExposure(facilities, (id) =>
+    waterStress[id] ? { waterStress: waterStress[id] } : undefined
+  );
 }
 
 // ============================================================
@@ -742,6 +1426,182 @@ export async function getEnergySourceCounts(): Promise<Record<EnergySource, numb
     }
   }
   return counts;
+}
+
+// ============================================================
+// Dataset-gap helpers (used by /gaps)
+// ============================================================
+
+/**
+ * The six dimensions /gaps tracks, in a stable canonical order. Page-level
+ * display order (ranked by how findable each gap actually is, not by raw
+ * count) is an editorial decision that lives in app/gaps/page.tsx, not here
+ * — this array only fixes an iteration order so `getDatasetGaps`' output is
+ * deterministic.
+ */
+export const GAP_DIMENSIONS = [
+  "capacity",
+  "energy",
+  "subsidies",
+  "jobs",
+  "water",
+  "singleSource",
+] as const;
+
+export type GapDimension = (typeof GAP_DIMENSIONS)[number];
+
+/**
+ * Per-dimension gap counts, scoped two ways:
+ *  - `fillableMissing`/`fillableTotal` — operational + under_construction
+ *    facilities only (see `isFillable`). This is the population /gaps leads
+ *    with: a live or building site's missing field is something a permit,
+ *    utility filing, or interconnection queue can genuinely resolve.
+ *  - `allMissing`/`allTotal` — the whole dataset, for context. Includes
+ *    `proposed` (and `cancelled`) sites, where most of these fields are
+ *    structural zeros — the underlying fact hasn't happened yet, not merely
+ *    unresearched — so this figure is shown alongside the fillable one,
+ *    never in its place.
+ */
+export interface GapCount {
+  fillableMissing: number;
+  fillableTotal: number;
+  allMissing: number;
+  allTotal: number;
+}
+
+/** True when a facility discloses no capacity figure at all (operational or planned). */
+function hasNoCapacity(f: Facility): boolean {
+  return getFacilityMaxMw(f) === undefined;
+}
+
+/** True when a facility's `jobs` block carries no figure. Mirrors getCivicCoverage's jobs predicate, inverted. */
+function hasNoJobs(f: Facility): boolean {
+  return !(f.jobs && (f.jobs.construction != null || f.jobs.permanent != null));
+}
+
+/** True when a facility discloses no subsidies. Mirrors getCivicCoverage's subsidies predicate, inverted. */
+function hasNoSubsidies(f: Facility): boolean {
+  return !(Array.isArray(f.subsidies) && f.subsidies.length > 0);
+}
+
+/** True when a facility's `water` block carries no figure. Mirrors getCivicCoverage's water predicate, inverted. */
+function hasNoWater(f: Facility): boolean {
+  return !(f.water && (f.water.coolingType || f.water.reportedMgd != null || f.water.notes));
+}
+
+/** True when a facility's `energy` block carries no figure. Mirrors getCivicCoverage's energy predicate, inverted. */
+function hasNoEnergy(f: Facility): boolean {
+  return !(
+    f.energy &&
+    (f.energy.source || f.energy.utility || f.energy.onSiteGenerationMw != null || f.energy.notes)
+  );
+}
+
+/**
+ * True when a facility cites exactly one source. Every facility has at
+ * least one (`sources` requires `.min(1)` at the schema level — see
+ * lib/schema.ts) so this is a corroboration gap, not a missing-field gap: a
+ * single citation is a different kind of ask (find a second source) than
+ * the other five dimensions (find the missing fact).
+ */
+function hasSingleSource(f: Facility): boolean {
+  return f.sources.length === 1;
+}
+
+const GAP_PREDICATES: Record<GapDimension, (f: Facility) => boolean> = {
+  capacity: hasNoCapacity,
+  energy: hasNoEnergy,
+  subsidies: hasNoSubsidies,
+  jobs: hasNoJobs,
+  water: hasNoWater,
+  singleSource: hasSingleSource,
+};
+
+/**
+ * True for facilities where a missing field is genuinely findable in the
+ * public record right now. `proposed` sites are deliberately excluded — for
+ * most of these dimensions the underlying fact doesn't exist yet (no jobs
+ * figure to find for a project that hasn't broken ground), so sending a
+ * contributor after one wastes their goodwill. `cancelled` sites are
+ * excluded for the same reason as elsewhere in this file (see `getStats`):
+ * a withdrawn project isn't worth researching further. `permitted` sites
+ * are excluded too — a permit alone doesn't yet fix jobs/subsidy figures
+ * the way a signed construction or interconnection filing does.
+ */
+function isFillable(f: Facility): boolean {
+  return f.status === "operational" || f.status === "under_construction";
+}
+
+/**
+ * Pure reducer over an already-loaded facility list — no data fetch, no I/O.
+ * Split out from `getDatasetGaps` so the fillable-population scoping (only
+ * operational + under_construction facilities count toward `fillable*`) can
+ * be exercised against a synthetic fixture — mirrors
+ * `computeGenerationBuildoutStats`'s reasoning: a test that only ever reads
+ * the real dataset can't prove a status filter exists, only that the
+ * current data happens to be consistent with one existing or not (a false
+ * proxy).
+ */
+export function computeDatasetGaps(facilities: Facility[]): Record<GapDimension, GapCount> {
+  const fillable = facilities.filter(isFillable);
+  return Object.fromEntries(
+    GAP_DIMENSIONS.map((dim) => {
+      const predicate = GAP_PREDICATES[dim];
+      const gapCount: GapCount = {
+        fillableMissing: fillable.filter(predicate).length,
+        fillableTotal: fillable.length,
+        allMissing: facilities.filter(predicate).length,
+        allTotal: facilities.length,
+      };
+      return [dim, gapCount];
+    })
+  ) as Record<GapDimension, GapCount>;
+}
+
+/**
+ * Returns per-dimension gap counts for /gaps. Thin async wrapper: fetches
+ * the live data and delegates the math to {@link computeDatasetGaps}.
+ */
+export async function getDatasetGaps(): Promise<Record<GapDimension, GapCount>> {
+  return computeDatasetGaps(await loadFacilities());
+}
+
+/**
+ * Pure reducer over an already-loaded facility list — no data fetch, no I/O.
+ * Split out from `getGapExamples` for the same reason as
+ * {@link computeDatasetGaps}: the fillable-population filter needs a
+ * synthetic fixture to prove it excludes `proposed`/`cancelled`/`permitted`
+ * facilities, since the real dataset can't demonstrate a filter's absence.
+ * Sorted by max capacity (operational or planned) desc, then name A→Z, so
+ * the largest / most recognizable sites surface first as recruitment
+ * examples.
+ */
+export function computeGapExamples(
+  facilities: Facility[],
+  dimension: GapDimension,
+  n = 6
+): Facility[] {
+  const predicate = GAP_PREDICATES[dimension];
+  return facilities
+    .filter((f) => isFillable(f) && predicate(f))
+    .sort(
+      (a, b) =>
+        (getFacilityMaxMw(b) ?? -1) - (getFacilityMaxMw(a) ?? -1) ||
+        a.name.localeCompare(b.name)
+    )
+    .slice(0, n);
+}
+
+/**
+ * Returns up to `n` example facilities missing the given dimension, scoped
+ * to the fillable population (operational + under_construction) — the same
+ * population `getDatasetGaps` counts against. Deliberately NOT scoped to
+ * the whole dataset — a `proposed` example would be exactly the kind of
+ * unfillable gap this page tries not to send anyone after. Thin async
+ * wrapper: fetches the live data and delegates to {@link computeGapExamples}.
+ */
+export async function getGapExamples(dimension: GapDimension, n = 6): Promise<Facility[]> {
+  return computeGapExamples(await loadFacilities(), dimension, n);
 }
 
 // ============================================================
@@ -782,6 +1642,14 @@ export interface StateSummary {
   communityFriction: number;
   /** Count with any community.status set (sourced, including "unknown"). */
   communityReporting: number;
+  /**
+   * Count of non-cancelled facilities with a disclosed operational or
+   * planned capacityMw figure. Restricted to non-cancelled so this matches
+   * the population `operationalMw`/`plannedMw` sum over — otherwise the
+   * rendered "disclosed for N of M" sentence would be false whenever a
+   * cancelled facility happens to disclose a figure.
+   */
+  capacityReporting: number;
   /** In-state operators, count desc then operator A→Z (deterministic tie-break). */
   topOperators: { operator: string; count: number }[];
 }
@@ -792,26 +1660,30 @@ export interface StateSummary {
  * `loadFacilities()` global or the scoped direct DB/JSON read
  * respectively) and just need the same rollup math applied. Mirrors
  * `getStats`' capacity math (excludes cancelled for operational/planned)
- * and `getTopOperators`' tie-break for `topOperators`.
+ * and `getTopOperators`' tie-break for `topOperators`. Exported so tests can
+ * feed it the same facilities in different orders.
  */
-function computeStateSummary(upper: string, stateFacilities: Facility[]): StateSummary | null {
+export function computeStateSummary(upper: string, stateFacilities: Facility[]): StateSummary | null {
   const count = stateFacilities.length;
   if (count === 0) {
     return null;
   }
 
-  const active = stateFacilities.filter((f) => f.status !== "cancelled");
-  const operationalMw = active.reduce(
-    (sum, f) => sum + (f.capacityMw?.operational ?? 0),
-    0
+  // Float addition is order-dependent and the two callers read the state's
+  // facilities in different orders, so sum over an id-sorted copy.
+  const sorted = [...stateFacilities].sort((a, b) => a.id.localeCompare(b.id));
+  const active = sorted.filter((f) => f.status !== "cancelled");
+  const operationalMw = roundMw(
+    active.reduce((sum, f) => sum + (f.capacityMw?.operational ?? 0), 0)
   );
-  const plannedMw = active.reduce(
-    (sum, f) => sum + (f.capacityMw?.planned ?? 0),
-    0
+  const plannedMw = roundMw(
+    active.reduce((sum, f) => sum + (f.capacityMw?.planned ?? 0), 0)
   );
-  const underConstructionMw = stateFacilities
-    .filter((f) => f.status === "under_construction")
-    .reduce((sum, f) => sum + (f.capacityMw?.planned ?? 0), 0);
+  const underConstructionMw = roundMw(
+    sorted
+      .filter((f) => f.status === "under_construction")
+      .reduce((sum, f) => sum + (f.capacityMw?.planned ?? 0), 0)
+  );
 
   const byType = Object.fromEntries(
     FACILITY_TYPE_ORDER.map((k) => [k, 0])
@@ -821,6 +1693,7 @@ function computeStateSummary(upper: string, stateFacilities: Facility[]): StateS
   ) as Record<Status, number>;
   let communityFriction = 0;
   let communityReporting = 0;
+  let capacityReporting = 0;
   const opCounts = new Map<string, number>();
 
   for (const f of stateFacilities) {
@@ -835,6 +1708,9 @@ function computeStateSummary(upper: string, stateFacilities: Facility[]): StateS
       ) {
         communityFriction++;
       }
+    }
+    if (f.status !== "cancelled" && getFacilityMaxMw(f) !== undefined) {
+      capacityReporting++;
     }
     opCounts.set(f.operator, (opCounts.get(f.operator) ?? 0) + 1);
   }
@@ -853,6 +1729,7 @@ function computeStateSummary(upper: string, stateFacilities: Facility[]): StateS
     byStatus,
     communityFriction,
     communityReporting,
+    capacityReporting,
     topOperators,
   };
 }
@@ -875,7 +1752,11 @@ export async function getStateSummary(code: string): Promise<StateSummary | null
 // Power-generation helpers (used by /power)
 // ============================================================
 
-/** All power_generation facilities (type-guarded so `.generation` narrows). */
+/**
+ * All power_generation facilities (type-guarded so `.generation` narrows).
+ * Reads `loadFacilities`, so a `power-generation` tag bust does NOT refresh
+ * /power; only `"facilities"` or the 24h timer does.
+ */
 export async function getPowerGenerationFacilities(): Promise<PowerGenerationFacility[]> {
   const facilities = await loadFacilities();
   return facilities.filter(
@@ -887,6 +1768,8 @@ export async function getPowerGenerationFacilities(): Promise<PowerGenerationFac
  * Normalizes an offtaker string for grouping: strips a trailing
  * parenthetical, e.g. "Amazon (AWS)" -> "Amazon". Facilities recording the
  * same buyer under different spellings collapse into one group.
+ * Must stay in sync with OFFTAKER_LABEL_PATTERN (lib/schema.ts), which
+ * guarantees at most one parenthetical, at the end.
  */
 export function normalizeOfftaker(offtaker: string): string {
   return offtaker.replace(/\s*\([^)]*\)\s*$/, "").trim();
@@ -980,6 +1863,95 @@ export async function getGenerationStats(): Promise<GenerationStats> {
 }
 
 /**
+ * Aggregate stats for the fossil-vs-non-fossil buildout comparison on
+ * /power's "What's being built" section.
+ *
+ * Deliberately **planned-MW only** — a forward-looking pipeline comparison,
+ * not a snapshot of what already runs — and must never be cross-quoted with
+ * the operational figures in {@link GenerationStats} above. Technologies that
+ * can't be classified either way (`battery`, storage rather than generation;
+ * `other`, an unknown mix — see `getGenerationFuelClass` in lib/generation.ts)
+ * contribute to neither bucket.
+ */
+export interface GenerationBuildoutStats {
+  /** Sum of capacityMw.planned across non-cancelled natural_gas projects. */
+  fossilPlannedMw: number;
+  /** Sum of capacityMw.planned across non-cancelled non-fossil projects. */
+  nonFossilPlannedMw: number;
+  /** Count of non-cancelled natural_gas projects. */
+  fossilPlants: number;
+  /** Count of non-cancelled non-fossil projects. */
+  nonFossilPlants: number;
+  /** Status split for non-cancelled natural_gas projects. */
+  gas: {
+    total: number;
+    operational: number;
+    proposed: number;
+    permitted: number;
+    underConstruction: number;
+  };
+}
+
+/**
+ * Pure reducer over generation facilities — no data fetch, no I/O. Split out
+ * from `getGenerationBuildoutStats` so the cancelled-exclusion behavior can be
+ * exercised against a synthetic fixture: `data/facilities.json` currently has
+ * zero cancelled power_generation records, so a test that only ever reads the
+ * real dataset cannot prove this function excludes them — it would pass
+ * whether or not the exclusion filter existed at all (a false proxy).
+ *
+ * Mirrors getGenerationStats' non-cancelled filter; see
+ * {@link GenerationBuildoutStats} for why this is planned-MW only.
+ */
+export function computeGenerationBuildoutStats(
+  facilities: PowerGenerationFacility[]
+): GenerationBuildoutStats {
+  const active = facilities.filter((f) => f.status !== "cancelled");
+
+  let fossilPlannedMw = 0;
+  let nonFossilPlannedMw = 0;
+  let fossilPlants = 0;
+  let nonFossilPlants = 0;
+  for (const f of active) {
+    const fuelClass = getGenerationFuelClass(f.generation?.technology);
+    const plannedMw = f.capacityMw?.planned ?? 0;
+    if (fuelClass === "fossil") {
+      fossilPlannedMw += plannedMw;
+      fossilPlants += 1;
+    } else if (fuelClass === "non_fossil") {
+      nonFossilPlannedMw += plannedMw;
+      nonFossilPlants += 1;
+    }
+  }
+
+  const gasPlants = active.filter((f) => f.generation?.technology === "natural_gas");
+  const gas = {
+    total: gasPlants.length,
+    operational: gasPlants.filter((f) => f.status === "operational").length,
+    proposed: gasPlants.filter((f) => f.status === "proposed").length,
+    permitted: gasPlants.filter((f) => f.status === "permitted").length,
+    underConstruction: gasPlants.filter((f) => f.status === "under_construction").length,
+  };
+
+  return {
+    fossilPlannedMw,
+    nonFossilPlannedMw,
+    fossilPlants,
+    nonFossilPlants,
+    gas,
+  };
+}
+
+/**
+ * Returns the fossil-vs-non-fossil buildout comparison for /power. Thin async
+ * wrapper: fetches the live data and delegates the math to
+ * {@link computeGenerationBuildoutStats}.
+ */
+export async function getGenerationBuildoutStats(): Promise<GenerationBuildoutStats> {
+  return computeGenerationBuildoutStats(await getPowerGenerationFacilities());
+}
+
+/**
  * Compute campuses a power_generation facility explicitly powers, resolved from
  * its sourced `generation.poweredFacilityIds`. Returns [] for non-power_generation
  * facilities. Dangling ids (no matching facility) are skipped so render code never
@@ -1013,7 +1985,10 @@ export async function getPoweredCampuses(facility: Facility): Promise<Facility[]
  * Reads `loadPowerGenerationCached()` (tag `power-generation`), not
  * `getPowerGenerationFacilities()`/`loadFacilities()` — same reasoning as
  * `getPoweredCampuses` above: this backs the facility detail page's
- * cross-reference and must stay decoupled from the global tag/timer.
+ * cross-reference and must stay decoupled from the global tag — though only
+ * from the tag, not from the 86400s `revalidate` the detail pages declare.
+ * Decoupling from the tag is
+ * still what keeps a single-facility write from re-triggering this reader.
  */
 export async function getPoweredByGenerators(facility: Facility): Promise<PowerGenerationFacility[]> {
   const generation = await loadPowerGenerationCached();
@@ -1048,6 +2023,15 @@ export interface CryptoMiningStats {
   plannedMw: number;
   /** Distinct states among all crypto_mining facilities. */
   stateCount: number;
+  /** True when `stateCount` includes DC — the count is not "states" alone. */
+  includesDc: boolean;
+  /**
+   * Sorted, de-duplicated jurisdiction codes underlying `stateCount`/`includesDc`.
+   * A count plus a DC boolean can't express a set that also contains
+   * territories (PR, GU, VI, MP, ...) — the codes are the only
+   * representation that stays correct as jurisdictions are added.
+   */
+  stateCodes: string[];
 }
 
 /**
@@ -1071,6 +2055,8 @@ export async function getCryptoMiningStats(): Promise<CryptoMiningStats> {
     operationalMw,
     plannedMw,
     stateCount: states.size,
+    includesDc: containsDc(states),
+    stateCodes: Array.from(states).sort(),
   };
 }
 
@@ -1108,6 +2094,29 @@ export async function getNotableOppositionCases(n = 6): Promise<Facility[]> {
     .slice(0, n);
 }
 
+/**
+ * Facilities that were CANCELLED after facing documented local opposition —
+ * top-level status "cancelled" AND a friction community.status
+ * (contested | opposed | litigation). This is the *outcome* dimension of the
+ * /opposition hub: projects that did not proceed and had sourced pushback on
+ * record. NOTE: this is a correlation (cancelled + opposed), NOT a causal
+ * claim that opposition stopped the project — a cancellation may have other
+ * causes. Excludes cancellations whose community.status is "supported"/"mixed"
+ * (not opposition-related). Sorted by max capacity desc then name A→Z.
+ */
+export async function getDefeatedProjects(): Promise<Facility[]> {
+  const facilities = await loadFacilities();
+  const frictionStatuses: CommunityReception[] = ["contested", "opposed", "litigation"];
+  return facilities
+    .filter(
+      (f) =>
+        f.status === "cancelled" &&
+        !!f.community?.status &&
+        frictionStatuses.includes(f.community.status)
+    )
+    .sort((a, b) => (getFacilityMaxMw(b) ?? -1) - (getFacilityMaxMw(a) ?? -1) || a.name.localeCompare(b.name));
+}
+
 // ============================================================
 // Per-metro helpers (used by /metros pages)
 // ============================================================
@@ -1120,7 +2129,7 @@ export async function getNotableOppositionCases(n = 6): Promise<Facility[]> {
  * normalizes away the live data's mixed `"X County"` / bare `"X"` county
  * strings (see `lib/metros.ts` doc comment). Facilities with no county on
  * record never match. Reads the shared `loadFacilities()` cache — no new
- * uncached per-request DB read (see that function's doc comment on the s51
+ * uncached per-request DB read (see that function's doc comment on the
  * ISR-write-blowout lesson). Unknown slug returns `[]`.
  */
 export async function getFacilitiesByMetro(slug: string): Promise<Facility[]> {
@@ -1139,10 +2148,15 @@ export async function getFacilitiesByMetro(slug: string): Promise<Facility[]> {
 // Per-operator helpers (used by operator landing pages)
 // ============================================================
 
-/** URL slug for an operator name, e.g. "Amazon Web Services" -> "amazon-web-services". */
-export function operatorSlug(name: string): string {
-  return name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
-}
+// `operatorSlug` now lives in the dependency-free `lib/operator-slug.ts` leaf
+// module — `lib/cache-tags.ts` needs it too and must stay free of
+// `next/cache` (see that file's header comment). Re-exported here so
+// existing importers of `@/lib/data` (app/facilities/[slug]/page.tsx,
+// components/facility/related-facilities.tsx) keep working unchanged.
+// `personSlug` is re-exported alongside it for the same reason: route files
+// import both from this one module rather than reaching into the leaf
+// directly (see app/stakeholders/**).
+export { operatorSlug, personSlug };
 
 interface OperatorIndex {
   /** Operator name -> that operator's facilities, pre-sorted by max MW desc, then name A→Z. */
@@ -1205,17 +2219,57 @@ export async function getOperatorBySlug(slug: string): Promise<string | undefine
 }
 
 /**
+ * Uncached direct-filtered fetch backing `getFacilitiesByOperatorCached`.
+ * The DB branch filters on the indexed `operator` column
+ * (`facilities_operator_idx`) directly rather than pulling the whole table,
+ * and retries transient Neon read failures before degrading to the JSON
+ * snapshot (see `withJsonFallback`).
+ */
+async function fetchFacilitiesByOperatorUncached(name: string): Promise<Facility[]> {
+  const list = readsUseDatabase()
+    ? await withJsonFallback(
+        async () =>
+          (
+            await getDb()
+              .select({ doc: facilitiesTable.doc })
+              .from(facilitiesTable)
+              .where(eq(facilitiesTable.operator, name))
+          ).map(rowToFacility),
+        () => loadFromJson().filter((f) => f.operator === name)
+      )
+    : loadFromJson().filter((f) => f.operator === name);
+  return list.sort(
+    (a, b) =>
+      (getFacilityMaxMw(b) ?? -1) - (getFacilityMaxMw(a) ?? -1) || a.name.localeCompare(b.name)
+  );
+}
+
+/**
+ * Per-operator scoped reader for the related-facilities rail on the facility
+ * detail page. Tagged `operator:${operatorSlug(name)}` — busted only by a
+ * write touching that operator (see `tagsForFacility` in
+ * `lib/cache-tags.ts`), never by the global `"facilities"` tag or a timer.
+ * No `revalidate` option — tag-only, same contract as
+ * `getFacilitiesByStateCached`.
+ */
+export const getFacilitiesByOperatorCached = (name: string): Promise<Facility[]> =>
+  process.env.VITEST
+    ? fetchFacilitiesByOperatorUncached(name)
+    : unstable_cache(fetchFacilitiesByOperatorUncached, ["facilities-by-operator", name], {
+        tags: [`operator:${operatorSlug(name)}`],
+      })(name);
+
+/**
  * Returns all facilities operated by `name` (exact match), sorted by max
  * capacity (operational or planned) desc, then name A→Z (deterministic
- * tie-break). Backed by the memoized operator index — an O(1) map lookup
- * rather than a full-list filter+sort on every call.
+ * tie-break). Backed by the scoped, tag-only `getFacilitiesByOperatorCached`
+ * reader — an indexed DB query rather than the full-dataset operator index —
+ * so callers (the facility detail page's related-facilities rail) don't
+ * re-acquire the global `"facilities"` tag or its 1h timer. Returns a fresh
+ * array the caller may mutate.
  */
 export async function getFacilitiesByOperator(name: string): Promise<Facility[]> {
-  const { byOperator } = await getOperatorIndex();
-  const bucket = byOperator.get(name);
-  // Shallow copy so callers can't mutate the cached, pre-sorted bucket —
-  // preserves the previous .filter().sort() contract of returning a fresh array.
-  return bucket ? [...bucket] : [];
+  return getFacilitiesByOperatorCached(name);
 }
 
 /** Aggregate summary of one operator's facilities. */
@@ -1230,6 +2284,23 @@ export interface OperatorSummary {
   byStatus: Record<Status, number>;
   /** Distinct location.state values across the operator's facilities. */
   stateCount: number;
+  /** True when `stateCount` includes DC — the count is not "states" alone. */
+  includesDc: boolean;
+  /**
+   * Sorted, de-duplicated jurisdiction codes underlying `stateCount`/`includesDc`.
+   * A count plus a DC boolean can't express a set that also contains
+   * territories (PR, GU, VI, MP, ...) — the codes are the only
+   * representation that stays correct as jurisdictions are added.
+   */
+  stateCodes: string[];
+  /**
+   * Count of non-cancelled facilities with a disclosed operational or
+   * planned capacityMw figure. Restricted to non-cancelled so this matches
+   * the population `operationalMw`/`plannedMw` sum over — otherwise the
+   * rendered "disclosed for N of M" sentence would be false whenever a
+   * cancelled facility happens to disclose a figure.
+   */
+  capacityReporting: number;
 }
 
 /**
@@ -1262,11 +2333,15 @@ export async function getOperatorSummary(name: string): Promise<OperatorSummary 
     STATUS_ORDER.map((k) => [k, 0])
   ) as Record<Status, number>;
   const states = new Set<string>();
+  let capacityReporting = 0;
 
   for (const f of operatorFacilities) {
     byType[f.facilityType]++;
     byStatus[f.status]++;
     states.add(f.location.state);
+    if (f.status !== "cancelled" && getFacilityMaxMw(f) !== undefined) {
+      capacityReporting++;
+    }
   }
 
   return {
@@ -1277,7 +2352,443 @@ export async function getOperatorSummary(name: string): Promise<OperatorSummary 
     byType,
     byStatus,
     stateCount: states.size,
+    includesDc: containsDc(states),
+    stateCodes: Array.from(states).sort(),
+    capacityReporting,
   };
+}
+
+// ============================================================
+// Per-county helpers (used by /counties pages)
+// ============================================================
+
+// `countySlug` lives in the dependency-free `lib/counties.ts` leaf module so
+// the sitemap, bare `tsx` CLIs and unit tests can build a county URL without
+// pulling in this module's caching/DB machinery. Re-exported here for the
+// same reason `operatorSlug`/`personSlug` are (see the comment above): route
+// files import it from this one module rather than reaching into the leaf.
+export { countySlug };
+
+/** Aggregate summary of one tracked county. */
+export interface CountySummary {
+  slug: string;
+  /** Canonical bare county name, no civil-division word, e.g. "Loudoun", "St. Louis city". */
+  name: string;
+  /** Uppercase 2-letter state code. */
+  state: string;
+  count: number;
+}
+
+interface CountyIndex {
+  /** countySlug(...) -> that county's summary, for case-insensitive reverse slug lookup. */
+  bySlug: Map<string, CountySummary>;
+  /** countySlug(...) -> that county's facilities, pre-sorted by max MW desc, then name A→Z. */
+  facilitiesBySlug: Map<string, Facility[]>;
+  /** Every summary, pre-sorted count desc, then state A→Z, then name A→Z. */
+  ordered: CountySummary[];
+}
+
+/**
+ * County index memoized per `loadFacilities()` result (keyed by array identity
+ * in a WeakMap) so the per-county helpers do O(1) map lookups instead of
+ * re-scanning the whole list. Same pattern, and same reason, as
+ * `buildOperatorIndex` above: 636 county hubs each re-filtering 1,571
+ * facilities is an O(counties × facilities) blowup on the counties index page,
+ * in the sitemap, and in the exhaustive county tests. When the same array
+ * reference is reused (e.g. within one request via the loadFacilities cache)
+ * the index is built once; otherwise it rebuilds cheaply in a single
+ * O(facilities) grouping pass.
+ *
+ * Grouping key is `countySlug(county, state)`, so the live data's mixed
+ * `"X County"` / bare `"X"` spellings — and the two spellings of MO's
+ * "St. Louis city" — collapse into one bucket with one URL. The display name
+ * is then picked deterministically by `canonicalCountyName`, never by array
+ * order. Facilities with no county on record (10 today) join no bucket: they
+ * are skipped rather than grouped under an empty name.
+ *
+ * Exported (like `buildStakeholderIndex` below) so it can be unit-tested
+ * directly against synthetic fixtures — the degenerate county spellings its
+ * guard exists for have zero records in the live dataset, so there is no way
+ * to drive them through the async readers.
+ */
+const countyIndexCache = new WeakMap<Facility[], CountyIndex>();
+
+export function buildCountyIndex(facilities: Facility[]): CountyIndex {
+  const cached = countyIndexCache.get(facilities);
+  if (cached) return cached;
+
+  const facilitiesBySlug = new Map<string, Facility[]>();
+  // Every bare spelling seen per slug, in encounter order — fed to
+  // `canonicalCountyName` so the rendered label is permutation-independent.
+  const spellingsBySlug = new Map<string, string[]>();
+  const stateBySlug = new Map<string, string>();
+
+  for (const f of facilities) {
+    const raw = f.location.county;
+    if (raw == null) continue;
+    // Guard on the NORMALIZED value, not the raw one: `normalizeCounty`
+    // strips a trailing civil-division word, so a county of " County" (or
+    // " Parish"/" Borough") is non-blank on the way in and empty on the way
+    // out. That slips a raw-value check and would mint a nameless county with
+    // a bare "-va" slug. Zero live records today — this is the guard for the
+    // data wave that introduces one.
+    const bare = normalizeCounty(raw);
+    if (bare === "") continue;
+    const state = f.location.state.toUpperCase();
+    const slug = countySlug(bare, state);
+
+    const bucket = facilitiesBySlug.get(slug);
+    if (bucket) bucket.push(f);
+    else facilitiesBySlug.set(slug, [f]);
+
+    const spellings = spellingsBySlug.get(slug);
+    if (spellings) spellings.push(bare);
+    else spellingsBySlug.set(slug, [bare]);
+
+    stateBySlug.set(slug, state);
+  }
+
+  const bySlug = new Map<string, CountySummary>();
+  for (const [slug, bucket] of facilitiesBySlug) {
+    bucket.sort(
+      (a, b) =>
+        (getFacilityMaxMw(b) ?? -1) - (getFacilityMaxMw(a) ?? -1) ||
+        a.name.localeCompare(b.name)
+    );
+    bySlug.set(slug, {
+      slug,
+      name: canonicalCountyName(spellingsBySlug.get(slug) ?? []),
+      state: stateBySlug.get(slug) ?? "",
+      count: bucket.length,
+    });
+  }
+
+  const ordered = [...bySlug.values()].sort(
+    (a, b) =>
+      b.count - a.count || a.state.localeCompare(b.state) || a.name.localeCompare(b.name)
+  );
+
+  const index: CountyIndex = { bySlug, facilitiesBySlug, ordered };
+  countyIndexCache.set(facilities, index);
+  return index;
+}
+
+/** Loads the facility list and returns its memoized county index. */
+async function getCountyIndex(): Promise<CountyIndex> {
+  return buildCountyIndex(await loadFacilities());
+}
+
+/**
+ * All tracked counties, sorted by facility count desc, then state A→Z, then
+ * name A→Z (deterministic tie-break). Reads the shared `loadFacilities()`
+ * cache — no new uncached per-request DB read (see that function's doc comment
+ * on the ISR-write-blowout lesson). Counties with no facility on record do not
+ * exist here: the list is derived from the data, not from a fixed roster.
+ *
+ * Returns fresh summary objects, not the memoized ones — a caller writing
+ * `county.count = 0` would otherwise poison every later read for the lifetime
+ * of the `loadFacilities()` cache. Same contract as `getOperatorSummary` and
+ * `getStakeholders`, which build their summaries per call.
+ */
+export async function getCounties(): Promise<CountySummary[]> {
+  const { ordered } = await getCountyIndex();
+  return ordered.map((county) => ({ ...county }));
+}
+
+/**
+ * The county for a URL slug (case-insensitive), or undefined if unknown.
+ * Backed by the memoized county index — an O(1) map lookup, never a rebuild.
+ * Slugs are resolved through this reverse index rather than parsed apart, the
+ * way operator slugs are (see `lib/counties.ts`). Returns a fresh object for
+ * the same reason `getCounties` does: the cached summary is shared by every
+ * caller and must not be mutable through any of them.
+ */
+export async function getCountyBySlug(slug: string): Promise<CountySummary | undefined> {
+  const { bySlug } = await getCountyIndex();
+  const county = bySlug.get(slug.toLowerCase());
+  return county ? { ...county } : undefined;
+}
+
+/**
+ * One county's facilities, sorted by max capacity (operational or planned)
+ * desc, then name A→Z — the same order every other hub uses. Unknown slug
+ * returns `[]`. Returns a copy so a caller sorting in place cannot poison the
+ * memoized index.
+ */
+export async function getFacilitiesByCounty(slug: string): Promise<Facility[]> {
+  const { facilitiesBySlug } = await getCountyIndex();
+  return [...(facilitiesBySlug.get(slug.toLowerCase()) ?? [])];
+}
+
+// ============================================================
+// Per-stakeholder helpers (used by /stakeholders pages)
+// ============================================================
+//
+// Unlike operators, stakeholders live inside each facility's jsonb `doc`
+// with no indexed DB column — there is no equivalent of
+// `fetchFacilitiesByOperatorUncached`'s indexed query, and no new cache tag
+// (the `lib/cache-tags.ts` allowlist stays closed to a `stakeholder:` tag;
+// `db:sync` exits 1 on any tag outside it). The index below is built
+// entirely in memory on top of the shared `loadFacilities()` read (tag
+// `"facilities"`, `revalidate: 86400`) rather than a new `unstable_cache`
+// reader.
+
+/** One operator an owner holds a stake in, with the owner's own row (and its source). */
+export interface ViaOperator {
+  operator: string;
+  slug: string;
+  /** Tracked facilities operated by `operator`. */
+  facilityCount: number;
+  owner: OperatorOwner;
+}
+
+interface StakeholderIndex {
+  /** Person name -> that person's SITE-LEVEL facilities, pre-sorted by max MW desc, then name A→Z. */
+  byPerson: Map<string, Facility[]>;
+  /** Owner name -> the operators it owns a stake in (operator-level layer), sorted by facility count desc, then name. */
+  viaByOwner: Map<string, ViaOperator[]>;
+  /** Owner name -> distinct facilities reached through its operators. */
+  operatorFacilitiesByOwner: Map<string, Facility[]>;
+  /** personSlug(name) -> person name, for case-insensitive reverse slug lookup. Covers site-level stakeholders AND operator owners. */
+  slugToPerson: Map<string, string>;
+  /**
+   * Distinct names that slugify alike. `kept` is the name `slugToPerson` maps
+   * the slug to; `dropped` is left out of `summarizeStakeholders` so one URL
+   * never gets two cards or duplicate static params. Empty in healthy data;
+   * a CI test asserts that for the real dataset.
+   */
+  collisions: StakeholderSlugCollision[];
+}
+
+export interface StakeholderSlugCollision {
+  slug: string;
+  kept: string;
+  dropped: string;
+}
+
+/**
+ * Builds the stakeholder index from a facility list. A pure function of its
+ * arguments — exported (like `withJsonFallback` above) so it can be
+ * unit-tested directly against synthetic fixtures, since the real dataset's
+ * `stakeholders` field is still mostly unpopulated (see lib/schema.ts) and
+ * has no multi-facility person to exercise the grouping logic against yet.
+ *
+ * A person can appear more than once in the same facility's `stakeholders`
+ * array (e.g. both "founder" and "executive") — deduped here so their
+ * facility list never lists the same site twice. A person can also hold
+ * different roles at different facilities; this index groups by name only,
+ * `getStakeholders()` derives the de-duplicated role union.
+ *
+ * `ownership` is the operator-level layer (the `operator_ownership` table). Its
+ * owners become stakeholders too, but only through `viaByOwner` /
+ * `operatorFacilitiesByOwner`: they never enter `byPerson`, so an owner's
+ * site-level facility list stays site-level. Not memoized here: Neon-loaded
+ * ownership is a fresh array per read, so an identity memo never hits; the
+ * per-render dedupe is `getStakeholderIndex`'s `reactCache`.
+ */
+export function buildStakeholderIndex(
+  facilities: Facility[],
+  ownership: OperatorOwnership[]
+): StakeholderIndex {
+  const byPerson = new Map<string, Facility[]>();
+  const seenFacilityIdsByPerson = new Map<string, Set<string>>();
+  for (const f of facilities) {
+    for (const s of f.stakeholders ?? []) {
+      let seenIds = seenFacilityIdsByPerson.get(s.name);
+      if (!seenIds) {
+        seenIds = new Set<string>();
+        seenFacilityIdsByPerson.set(s.name, seenIds);
+      }
+      if (seenIds.has(f.id)) continue;
+      seenIds.add(f.id);
+
+      const bucket = byPerson.get(s.name);
+      if (bucket) bucket.push(f);
+      else byPerson.set(s.name, [f]);
+    }
+  }
+
+  const slugToPerson = new Map<string, string>();
+  for (const [name, bucket] of byPerson) {
+    bucket.sort(
+      (a, b) =>
+        (getFacilityMaxMw(b) ?? -1) - (getFacilityMaxMw(a) ?? -1) ||
+        a.name.localeCompare(b.name)
+    );
+    slugToPerson.set(personSlug(name), name);
+  }
+
+  const facilitiesByOperator = new Map<string, Facility[]>();
+  for (const f of facilities) {
+    const bucket = facilitiesByOperator.get(f.operator);
+    if (bucket) bucket.push(f);
+    else facilitiesByOperator.set(f.operator, [f]);
+  }
+
+  const viaByOwner = new Map<string, ViaOperator[]>();
+  const operatorFacilitiesByOwner = new Map<string, Facility[]>();
+  for (const [name, owned] of groupByOwner(ownership)) {
+    const via: ViaOperator[] = owned.map(({ operator, owner }) => ({
+      operator,
+      slug: operatorSlug(operator),
+      facilityCount: facilitiesByOperator.get(operator)?.length ?? 0,
+      owner,
+    }));
+    via.sort((a, b) => b.facilityCount - a.facilityCount || a.operator.localeCompare(b.operator));
+    viaByOwner.set(name, via);
+
+    const reached = new Map<string, Facility>();
+    for (const { operator } of owned) {
+      for (const f of facilitiesByOperator.get(operator) ?? []) reached.set(f.id, f);
+    }
+    operatorFacilitiesByOwner.set(name, [...reached.values()]);
+    if (!slugToPerson.has(personSlug(name))) slugToPerson.set(personSlug(name), name);
+  }
+
+  // Computed (and logged) once per index build, not per summarize call. This
+  // runs on the render path and live data comes from Neon, so log, don't throw.
+  const namesBySlug = new Map<string, string[]>();
+  for (const name of new Set([...byPerson.keys(), ...viaByOwner.keys()])) {
+    const slug = personSlug(name);
+    const bucket = namesBySlug.get(slug);
+    if (bucket) bucket.push(name);
+    else namesBySlug.set(slug, [name]);
+  }
+  const collisions: StakeholderSlugCollision[] = [];
+  for (const [slug, names] of namesBySlug) {
+    if (names.length < 2) continue;
+    const kept = slugToPerson.get(slug) ?? names[0];
+    for (const dropped of names) {
+      if (dropped === kept) continue;
+      collisions.push({ slug, kept, dropped });
+      console.error(`stakeholder slug collision: "${dropped}" dropped, "${kept}" keeps slug "${slug}"`);
+    }
+  }
+
+  const index: StakeholderIndex = {
+    byPerson,
+    viaByOwner,
+    operatorFacilitiesByOwner,
+    slugToPerson,
+    collisions,
+  };
+  return index;
+}
+
+/** Loads the facility list and the ownership table and returns the stakeholder index, deduped per render. */
+const getStakeholderIndex = reactCache(async (): Promise<StakeholderIndex> => {
+  // Both readers carry the "facilities" tag, so this stays inside the pages that already do.
+  const [facilities, ownership] = await Promise.all([loadFacilities(), getAllOperatorOwnership()]);
+  return buildStakeholderIndex(facilities, ownership);
+});
+
+/** Aggregate summary of one named stakeholder, across every facility they're linked to. */
+export interface StakeholderSummary {
+  name: string;
+  slug: string;
+  /** "organization" if any entry under this name is an organization, else "person". */
+  kind: "person" | "organization";
+  /** De-duplicated union of every role recorded for this person, across their facilities and any operator-level stakes. */
+  roles: string[];
+  /** SITE-LEVEL facilities only. Operator-level ownership is never counted here. */
+  facilityCount: number;
+  /** Distinct facilities reached through owned operators (0 when the person owns no operator stake). */
+  operatorFacilityCount: number;
+  /** Operators this person holds a stake in at the operator level, largest first. */
+  viaOperators: ViaOperator[];
+  /** Distinct location.state codes across SITE-LEVEL facilities only, sorted A→Z. Empty for an owner with no site-level stake. */
+  states: string[];
+}
+
+/**
+ * Returns one summary entry per named stakeholder — site-level stakeholders
+ * and operator-level owners alike — sorted by site-level facility count desc,
+ * then operator-reach count desc, then name A→Z. Backs the /stakeholders
+ * index page and the per-person hub's role/state display. A person's `roles`
+ * is the de-duplicated union of every role recorded for them across their
+ * facilities and operator stakes — the same person can be a "founder" at one
+ * site and an "investor" at another.
+ */
+export async function getStakeholders(): Promise<StakeholderSummary[]> {
+  return summarizeStakeholders(await getStakeholderIndex());
+}
+
+/**
+ * Pure half of `getStakeholders()`, exported so kind/role derivation is unit-testable on fixtures.
+ * Names listed as `dropped` in `index.collisions` are left out, so each slug has one summary.
+ */
+export function summarizeStakeholders({
+  byPerson,
+  viaByOwner,
+  operatorFacilitiesByOwner,
+  collisions,
+}: StakeholderIndex): StakeholderSummary[] {
+  const summaries: StakeholderSummary[] = [];
+  const names = new Set<string>([...byPerson.keys(), ...viaByOwner.keys()]);
+
+  for (const name of names) {
+    const facilities = byPerson.get(name) ?? [];
+    const viaOperators = viaByOwner.get(name) ?? [];
+    const operatorFacilities = operatorFacilitiesByOwner.get(name) ?? [];
+    const roles = new Set<string>();
+    const states = new Set<string>();
+    let kind: StakeholderSummary["kind"] = "person";
+    for (const f of facilities) {
+      states.add(f.location.state);
+      for (const s of f.stakeholders ?? []) {
+        if (s.name !== name) continue;
+        roles.add(s.role);
+        if (stakeholderKind(s) === "organization") kind = "organization";
+      }
+    }
+    for (const { owner } of viaOperators) {
+      roles.add(owner.role);
+      if (owner.kind === "organization") kind = "organization";
+    }
+    summaries.push({
+      name,
+      slug: personSlug(name),
+      kind,
+      roles: [...roles].sort(),
+      facilityCount: facilities.length,
+      operatorFacilityCount: operatorFacilities.length,
+      viaOperators,
+      states: [...states].sort(),
+    });
+  }
+
+  const dropped = new Set(collisions.map((c) => c.dropped));
+
+  return summaries.filter((s) => !dropped.has(s.name)).sort(
+    (a, b) =>
+      b.facilityCount - a.facilityCount ||
+      b.operatorFacilityCount - a.operatorFacilityCount ||
+      a.name.localeCompare(b.name)
+  );
+}
+
+/**
+ * Returns the stakeholder name for a URL slug (case-insensitive), or
+ * undefined if unknown. Backed by the memoized stakeholder index — an O(1)
+ * map lookup, same shape as `getOperatorBySlug`.
+ */
+export async function getStakeholderBySlug(slug: string): Promise<string | undefined> {
+  const { slugToPerson } = await getStakeholderIndex();
+  return slugToPerson.get(slug.toLowerCase());
+}
+
+/**
+ * Returns all facilities where `name` appears in `stakeholders` (site-level
+ * only — operator-level ownership is on `StakeholderSummary.viaOperators`), sorted by
+ * max capacity (operational or planned) desc, then name A→Z. Unlike
+ * `getFacilitiesByOperator`, there is no indexed DB query behind this — it
+ * reads the memoized stakeholder index (itself built on the shared,
+ * already-cached `loadFacilities()` list) and returns a fresh array copy so
+ * callers may not mutate the cached bucket.
+ */
+export async function getFacilitiesByStakeholder(name: string): Promise<Facility[]> {
+  const { byPerson } = await getStakeholderIndex();
+  return [...(byPerson.get(name) ?? [])];
 }
 
 // ============================================================
@@ -1294,21 +2805,29 @@ export interface ActivityEntry {
   timestamp: Date;
   /** Optional public contributor handle, when the change came from an attributed public submission. */
   attribution?: string;
+  /** True when the change came from an approved community submission: public form, public correction, or a public URL tip. */
+  community?: boolean;
 }
 
 /**
  * Returns a reverse-chronological feed of facility creates/updates, driven
  * entirely off `facility_history` — the single source of truth for change
- * events. Every create/update/delete, whether an admin-direct write or a
- * submission approval, goes through `lib/facility-write.ts` and writes
- * exactly one history row (see `createFacility`/`updateFacility` and
- * `approveSubmission` in lib/submissions.ts). Reading from history instead of
- * merging `facilitiesTable` (by `updatedAt`) with `submissionsTable` (by
- * `reviewedAt`) eliminates a double-entry bug: both of those sources could
- * capture the *same* create, showing it once as "new facility added" and
- * again as "facility updated" — and a direct admin create was mislabeled
- * "facility updated" entirely since `facilitiesTable.updatedAt` is set on
- * insert too.
+ * events. History rows come from three paths: `lib/facility-write.ts` writes
+ * exactly one row per admin-direct write or submission approval (see
+ * `createFacility`/`updateFacility` and `approveSubmission` in
+ * lib/submissions.ts, source `"admin-direct"` or a submission id);
+ * `scripts/sync-to-neon.ts` (the `db:sync` CLI) writes one row per record a
+ * maintainer publishes in a data wave, create OR update (source
+ * `"maintainer-sync"`); and `scripts/seed.ts` (the bootstrap `db:seed` CLI)
+ * writes a `create` row for each genuinely-new facility it inserts (source
+ * `"db-seed"`) — so bulk-published facilities show up in the feed too.
+ * Reading from history
+ * instead of merging `facilitiesTable` (by `updatedAt`) with
+ * `submissionsTable` (by `reviewedAt`) eliminates a double-entry bug: both of
+ * those sources could capture the *same* create, showing it once as "new
+ * facility added" and again as "facility updated" — and a direct admin
+ * create was mislabeled "facility updated" entirely since
+ * `facilitiesTable.updatedAt` is set on insert too.
  *
  * DB-only: the JSON fallback bundle has no history to sort on, so this
  * returns `[]` when `DATABASE_URL` is unset rather than throwing — the
@@ -1336,6 +2855,7 @@ export async function getRecentActivity(limit = 50): Promise<ActivityEntry[]> {
         changeType: facilityHistoryTable.changeType,
         changedAt: facilityHistoryTable.changedAt,
         attribution: sql<string | null>`${submissionsTable.provenance} ->> 'attribution'`,
+        discoveredBy: sql<string | null>`${submissionsTable.provenance} ->> 'discoveredBy'`,
       })
       .from(facilityHistoryTable)
       .innerJoin(facilitiesTable, eq(facilityHistoryTable.facilityId, facilitiesTable.id))
@@ -1355,12 +2875,129 @@ export async function getRecentActivity(limit = 50): Promise<ActivityEntry[]> {
       label: row.changeType === "create" ? "new facility added" : "facility updated",
       timestamp: row.changedAt,
       ...(row.attribution ? { attribution: row.attribution } : {}),
+      ...(isCommunityDiscoveredBy(row.discoveredBy) ? { community: true } : {}),
     }));
   } catch (err) {
     // A live query failure (DB unreachable or over-quota) degrades to an empty
     // feed rather than throwing into the homepage teaser / /activity page —
     // both render their existing empty state instead of the error boundary.
-    console.warn("getRecentActivity: activity feed unavailable, degrading to empty", err);
+    // SQLSTATE only, never `err`: a DrizzleQueryError embeds this query's
+    // bound params in its `.message` (see lib/db-error.ts).
+    console.warn(
+      `getRecentActivity: activity feed unavailable, degrading to empty (sqlstate: ${redactedErrorCode(err)})`
+    );
+    return [];
+  }
+}
+
+// ============================================================
+// Public contributor credits (used by /contributors)
+// ============================================================
+
+/** One opted-in contributor handle and how many approved contributions it is credited on. */
+export interface ContributorCredit {
+  attribution: string;
+  count: number;
+}
+
+/**
+ * Returns opted-in public contributor credits, aggregated by attribution
+ * handle, sorted by contribution count desc then handle A→Z (case-insensitive).
+ *
+ * A handle is opt-in evidence only for the specific submission it was
+ * attached to (`submissionsTable.provenance ->> 'attribution'`) — this reuses
+ * the same join `getRecentActivity` uses above (facility_history INNER JOIN
+ * facilities, JOIN submissions on `submissions.id::text = facility_history.source`),
+ * which by construction only ever contains submissions that were actually
+ * approved: `approveSubmission` (lib/submissions.ts) writes the
+ * facility_history row via the create/update write primitives BEFORE it flips
+ * `submissions.status` to `"approved"`, so a still-pending or rejected
+ * submission never produces a history row to join against. The explicit
+ * `submissions.status = 'approved'` filter below is kept anyway as
+ * defense-in-depth, not because the join needs it.
+ *
+ * Count grain: `count(*)` here counts `facility_history` rows, which is safe
+ * only because that's 1:1 with approved submissions — `createFacility`,
+ * `updateFacility`/`writeStatusUpdate`/`writeEnrichmentUpdate` (all reached
+ * from `approveSubmission`) each call `recordFacilityHistory` exactly once
+ * per write (see lib/facility-write.ts), so one approval can never inflate a
+ * contributor's count with more than one row. A history-insert failure
+ * (`recordFacilityHistory` logs and returns `false` rather than throwing —
+ * see `insertFacilityHistoryRow` in lib/facility-history.ts) can only
+ * *under*-count a contribution, never double-count one.
+ *
+ * This also naturally credits leads promoted through the discovery
+ * leads-lane, with no separate `leadsTable` join: `scripts/discovery/leads-lane.ts`
+ * copies a promoted lead's own `attribution` field into the created
+ * submission's `provenance.attribution` at promotion time, so once that
+ * submission is approved its credit flows through this exact same path. A
+ * lead that is merely `promoted` (staged as a submission) but not yet
+ * approved has no facility_history row and is correctly excluded — leads
+ * have no "approved" status of their own to filter on (LEAD_STATUSES is
+ * `new | researching | deferred | promoted | dismissed`; see
+ * lib/lead-fields.ts). The
+ * `leads` table itself is never queried here.
+ *
+ * Case-insensitive dedupe: a handle is free text (only charset-restricted,
+ * `/^[A-Za-z0-9 _.-]+$/` — see lib/submissions.ts), so "Jane Doe" and
+ * "jane doe" must be one contributor, not two. Grouping happens on
+ * `lower(trim(attribution))` — trimmed too, so stray leading/trailing
+ * whitespace can't split one person into two rows either. Because the GROUP
+ * BY key is normalized, it can no longer be what's displayed (it would
+ * render everyone's handle lowercased), so the selected/displayed
+ * `attribution` is `min(attribution)` — an arbitrary-but-stable pick among
+ * that group's raw-cased variants (arbitrary in *which* casing wins when
+ * variants genuinely differ, stable in that repeat runs return the same
+ * one). This does mean a contributor whose casing varies across submissions
+ * could see a variant that isn't their most-recent or most-common casing —
+ * an acceptable, extremely rare cost for a public credit line, versus
+ * picking no deterministic winner at all.
+ *
+ * DB-only, same degrade-to-empty contract as `getRecentActivity`.
+ */
+export async function getContributorCredits(): Promise<ContributorCredit[]> {
+  if (!hasDatabaseUrl()) {
+    return [];
+  }
+
+  const db = getDb();
+
+  try {
+    const attribution = sql<string>`${submissionsTable.provenance} ->> 'attribution'`;
+    const normalizedAttribution = sql`lower(trim(${attribution}))`;
+
+    const rows = await db
+      .select({
+        attribution: sql<string>`min(${attribution})`,
+        count: sql<number>`count(*)::int`,
+      })
+      .from(facilityHistoryTable)
+      .innerJoin(facilitiesTable, eq(facilityHistoryTable.facilityId, facilitiesTable.id))
+      // Cast submissions.id (uuid) to text rather than casting source::uuid —
+      // "admin-direct" rows aren't valid uuids and must simply not match.
+      // Mirrors getRecentActivity's join above.
+      .innerJoin(submissionsTable, sql`${submissionsTable.id}::text = ${facilityHistoryTable.source}`)
+      .where(
+        and(
+          inArray(facilityHistoryTable.changeType, ["create", "update"]),
+          eq(submissionsTable.status, "approved"),
+          sql`${attribution} IS NOT NULL`
+        )
+      )
+      .groupBy(normalizedAttribution)
+      .orderBy(desc(sql`count(*)`), normalizedAttribution);
+
+    return rows.map((row) => ({ attribution: row.attribution, count: Number(row.count) }));
+  } catch (err) {
+    // A live query failure (DB unreachable or over-quota) degrades to an
+    // empty credit list rather than throwing into the /contributors page —
+    // it renders its existing empty state instead of the error boundary.
+    // SQLSTATE only, never `err`: a DrizzleQueryError embeds this query's
+    // bound params — here contributor identifiers — in its `.message` (see
+    // lib/db-error.ts).
+    console.warn(
+      `getContributorCredits: contributor credits unavailable, degrading to empty (sqlstate: ${redactedErrorCode(err)})`
+    );
     return [];
   }
 }
@@ -1396,9 +3033,12 @@ function getCurrentQuarterRange(now: Date = new Date()): { start: Date; end: Dat
  * write-staging invariant docs; a submission's approval is what produces the
  * history row this reads).
  *
- * `facility_history.change_type` is only `create | update | delete` (see
- * lib/db/schema.ts) — there is no distinct "cancelled" or "status-change"
- * change type, so those two counts can't be read off `change_type` alone.
+ * `facility_history.change_type` is `create | update | delete | editorial`
+ * (see lib/db/schema.ts; `editorial` is a notes-only update written by
+ * db:sync). This function's `update` filter excludes `editorial` rows, which
+ * is correct: an editorial row carries no status change. There is no
+ * distinct "cancelled" or "status-change" change type, so those two counts
+ * can't be read off `change_type` alone.
  * Instead this inspects each `update` row's stored `diff` (`DiffEntry[]`,
  * computed once at write time by `lib/facility-write.ts` via
  * `computeDocDiff`, which diffs the full Facility doc at its top level):
@@ -1476,9 +3116,10 @@ export async function getQuarterlyPipelineSummary(): Promise<QuarterlyPipelineSu
   } catch (err) {
     // A live query failure (DB unreachable or over-quota) degrades to the
     // all-zero summary rather than throwing into the pipeline lens page.
+    // SQLSTATE only, never `err`: a DrizzleQueryError embeds this query's
+    // bound params in its `.message` (see lib/db-error.ts).
     console.warn(
-      "getQuarterlyPipelineSummary: pipeline summary unavailable, degrading to zero",
-      err
+      `getQuarterlyPipelineSummary: pipeline summary unavailable, degrading to zero (sqlstate: ${redactedErrorCode(err)})`
     );
     return empty;
   }

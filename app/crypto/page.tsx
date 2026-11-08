@@ -1,22 +1,16 @@
-import Link from "next/link";
 import type { Metadata } from "next";
 
 import { getCryptoMiningFacilities, getCryptoMiningStats } from "@/lib/data";
-import { formatCapacity, formatLocation, getFacilityMaxMw } from "@/lib/format";
-import { StatusBadge } from "@/components/status-badge";
+import { formatLocation, formatPower, sortByMaxMwDesc, countDisclosedCapacity } from "@/lib/format";
+import { statesStat, statesPhrase } from "@/lib/us-states";
 import { Breadcrumb } from "@/components/breadcrumb";
-import { breadcrumbJsonLdString, itemListJsonLdString } from "@/lib/seo";
-import { siteConfig } from "@/lib/site";
+import { CollectionJsonLd } from "@/components/collection/collection-json-ld";
+import { FacilityListRow } from "@/components/facility-list-row";
+import { PageMasthead } from "@/components/page-masthead";
+import { SurveyStatRow } from "@/components/survey-stat-row";
+import { SectionHeading } from "@/components/section-heading";
 
-export const revalidate = 3600;
-
-/** Formats a MW figure as GW (1 decimal) above 1000, else whole MW. Avoids "0.0 GW" for small totals. */
-function formatPower(mw: number): string {
-  if (mw >= 1000) {
-    return `${(mw / 1000).toFixed(1)} GW`;
-  }
-  return `${Math.round(mw)} MW`;
-}
+export const revalidate = 86400;
 
 const CRUMBS = [{ label: "Explore", href: "/explore" }, { label: "Crypto" }];
 
@@ -41,54 +35,24 @@ export default async function CryptoPage() {
     getCryptoMiningStats(),
     getCryptoMiningFacilities(),
   ]);
-  const allFacilities = [...facilities].sort(
-    (a, b) =>
-      (getFacilityMaxMw(b) ?? -1) - (getFacilityMaxMw(a) ?? -1) ||
-      a.name.localeCompare(b.name)
-  );
+  const allFacilities = [...facilities].sort(sortByMaxMwDesc);
+  const disclosedCapacityCount = countDisclosedCapacity(allFacilities);
+  const statesTile = statesStat(stats.stateCodes);
 
   return (
     <div
       data-content-width="4xl"
       className="mx-auto max-w-4xl px-4 py-8 sm:px-6 sm:py-12 space-y-10"
     >
-      <script
-        type="application/ld+json"
-        dangerouslySetInnerHTML={{
-          __html: breadcrumbJsonLdString(
-            CRUMBS.map((c) => ({ name: c.label, url: c.href }))
-          ),
-        }}
-      />
-      <script
-        type="application/ld+json"
-        dangerouslySetInnerHTML={{
-          __html: itemListJsonLdString(
-            allFacilities.map((f) => ({
-              name: f.name,
-              url: `${siteConfig.url}/facilities/${f.id}`,
-            }))
-          ),
-        }}
-      />
+      <CollectionJsonLd crumbs={CRUMBS} facilities={allFacilities} />
 
       <Breadcrumb items={CRUMBS} />
 
-      {/* ------------------------------------------------------------------ */}
-      {/* Masthead                                                            */}
-      {/* ------------------------------------------------------------------ */}
-      <header className="space-y-4 pb-2">
-        <p className="font-mono text-xs uppercase tracking-widest text-primary">
-          Crypto mining
-        </p>
-        <h1 className="font-display text-4xl leading-[1.05] text-foreground sm:text-5xl">
-          Crypto mining facilities in the United States
-        </h1>
-        <p className="max-w-2xl text-base text-muted-foreground">
-          Bitcoin and altcoin mining capacity, tracked site by site.
-        </p>
-        <div className="border-t border-border" />
-      </header>
+      <PageMasthead
+        eyebrow="Crypto mining"
+        title="Crypto mining facilities in the United States"
+        dek="Bitcoin and altcoin mining capacity, tracked site by site."
+      />
 
       {stats.count === 0 ? (
         <p className="text-base text-muted-foreground">
@@ -96,9 +60,6 @@ export default async function CryptoPage() {
         </p>
       ) : (
         <>
-          {/* ------------------------------------------------------------------ */}
-          {/* Overview prose                                                      */}
-          {/* ------------------------------------------------------------------ */}
           <div className="max-w-2xl space-y-4">
             <p className="text-base leading-relaxed text-muted-foreground">
               Compute Atlas tracks {stats.count} crypto-mining
@@ -108,92 +69,45 @@ export default async function CryptoPage() {
               distinct from the AI/cloud data centers tracked elsewhere on
               this site. {formatPower(stats.operationalMw)} of that capacity
               is already operational, with {formatPower(stats.plannedMw)}{" "}
-              more in the pipeline, across {stats.stateCount}{" "}
-              {stats.stateCount === 1 ? "state" : "states"}.
+              more in the pipeline, across{" "}
+              {statesPhrase(stats.stateCodes)}.
             </p>
             <p className="text-base leading-relaxed text-muted-foreground">
-              Coverage of crypto mining varies across public trackers:
-              datacentermap.com, for instance, lists select crypto miners
-              alongside its data-center entries rather than tracking mining
-              as its own layer. The facilities below are the crypto-mining
-              sites in Compute Atlas&apos;s own sourced dataset — each entry
-              links through to its full record and cited sources.
+              The facilities below are the crypto-mining sites in Compute
+              Atlas&apos;s own sourced dataset — each entry links through to
+              its full record and cited sources.
             </p>
           </div>
 
-          {/* ------------------------------------------------------------------ */}
-          {/* Survey stats row                                                    */}
-          {/* ------------------------------------------------------------------ */}
-          <div className="flex flex-wrap gap-8 border-b border-border pb-10">
-            <div className="flex flex-col items-center gap-1 text-center">
-              <span className="font-mono tabular-nums text-4xl font-semibold text-foreground">
-                {stats.count}
-              </span>
-              <span className="font-mono text-xs uppercase tracking-widest text-muted-foreground">
-                Facilities
-              </span>
-            </div>
-            <div className="flex flex-col items-center gap-1 text-center">
-              <span className="font-mono tabular-nums text-4xl font-semibold text-foreground">
-                {formatPower(stats.operationalMw)}
-              </span>
-              <span className="font-mono text-xs uppercase tracking-widest text-muted-foreground">
-                Operational
-              </span>
-            </div>
-            <div className="flex flex-col items-center gap-1 text-center">
-              <span className="font-mono tabular-nums text-4xl font-semibold text-foreground">
-                {formatPower(stats.plannedMw)}
-              </span>
-              <span className="font-mono text-xs uppercase tracking-widest text-muted-foreground">
-                Pipeline
-              </span>
-            </div>
-            <div className="flex flex-col items-center gap-1 text-center">
-              <span className="font-mono tabular-nums text-4xl font-semibold text-foreground">
-                {stats.stateCount}
-              </span>
-              <span className="font-mono text-xs uppercase tracking-widest text-muted-foreground">
-                States
-              </span>
-            </div>
-          </div>
+          <SurveyStatRow
+            stats={[
+              { value: stats.count, label: "Facilities" },
+              { value: formatPower(stats.operationalMw), label: "Operational" },
+              { value: formatPower(stats.plannedMw), label: "Pipeline" },
+              { ...statesTile },
+            ]}
+          />
 
-          {/* ------------------------------------------------------------------ */}
-          {/* § Facilities                                                        */}
-          {/* ------------------------------------------------------------------ */}
+          <p className="text-sm leading-relaxed text-muted-foreground">
+            Capacity is disclosed for {disclosedCapacityCount.toLocaleString("en-US")}{" "}
+            of the {stats.count.toLocaleString("en-US")} tracked crypto-mining
+            sites. The operational and pipeline figures above sum those
+            records only — read them as a floor, not a total across every
+            tracked site.
+          </p>
+
           <section
             aria-labelledby="facilities-heading"
             className="space-y-4 border-t border-border pt-10"
           >
-            <p className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
-              § Facilities
-            </p>
-            <h2 id="facilities-heading" className="font-display text-2xl text-foreground">
-              All crypto-mining facilities
-            </h2>
+            <SectionHeading kicker="Facilities" id="facilities-heading" title="All crypto-mining facilities" />
             <ul className="divide-y divide-border">
               {allFacilities.map((f) => (
                 <li key={f.id}>
-                  <Link
-                    href={`/facilities/${f.id}`}
-                    className="flex min-h-11 flex-col gap-1 py-3 sm:flex-row sm:items-center sm:justify-between sm:gap-4 transition-colors hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 rounded-sm"
-                  >
-                    <span className="flex flex-col gap-0.5 min-w-0">
-                      <span className="text-sm text-foreground truncate">
-                        {f.name}
-                      </span>
-                      <span className="text-xs text-muted-foreground truncate">
-                        {f.operator} &middot; {formatLocation(f)}
-                      </span>
-                    </span>
-                    <span className="flex shrink-0 items-center gap-3">
-                      <StatusBadge status={f.status} />
-                      <span className="font-mono tabular-nums text-xs text-muted-foreground">
-                        {formatCapacity(f)}
-                      </span>
-                    </span>
-                  </Link>
+                  <FacilityListRow
+                    facility={f}
+                    secondary={<>{f.operator} &middot; {formatLocation(f)}</>}
+                  />
                 </li>
               ))}
             </ul>

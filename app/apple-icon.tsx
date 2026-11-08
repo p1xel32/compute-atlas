@@ -1,9 +1,5 @@
 import { ImageResponse } from "next/og";
-
-// Atlas palette — CSS vars are not available in ImageResponse; hardcoded from app/globals.css :root
-const PARCHMENT = "#F5F1E6";
-const PRIMARY_GREEN = "#3F5B43";
-const HAIRLINE = "#CDBFA0";
+import { AtlasMark, HAIRLINE, PARCHMENT } from "@/lib/og-theme";
 
 export const size = { width: 180, height: 180 };
 export const contentType = "image/png";
@@ -33,13 +29,8 @@ export default function AppleIcon() {
           }}
         />
 
-        {/* Centered graticule mark — inline SVG; ~55% of 180px canvas = ~99px */}
-        <svg width="99" height="99" viewBox="0 0 32 32" style={{ display: "flex" }}>
-          <rect x="6" y="6" width="20" height="20" rx="2.5" fill="none" stroke={PRIMARY_GREEN} strokeWidth="2.4" />
-          <line x1="16" y1="6" x2="16" y2="26" stroke={PRIMARY_GREEN} strokeWidth="2.4" />
-          <line x1="6" y1="16" x2="26" y2="16" stroke={PRIMARY_GREEN} strokeWidth="2.4" />
-          <circle cx="16" cy="16" r="3.2" fill={PRIMARY_GREEN} />
-        </svg>
+        {/* Centered plate-stack mark — ~55% of 180px canvas = ~99px */}
+        <AtlasMark dim={99} />
       </div>
     ),
     {

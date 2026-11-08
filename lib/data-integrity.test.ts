@@ -2,6 +2,7 @@ import { describe, it, expect, beforeAll } from "vitest";
 import { getAllFacilities, getFacilityById } from "@/lib/data";
 import { facilitySchema } from "@/lib/schema";
 import type { Facility } from "@/lib/schema";
+import { stateCodeFromSlug, stateNameFromCode, stateSlugFromCode } from "@/lib/us-states";
 
 describe("data integrity — facilities.json", () => {
   let facilities: Facility[];
@@ -22,6 +23,23 @@ describe("data integrity — facilities.json", () => {
     expect(
       failing,
       `Schema violations:\n${failing.join("\n")}`
+    ).toHaveLength(0);
+  });
+
+  it("every location.state and multiSite.states code has a name and round-trips through its slug", () => {
+    const failing: string[] = [];
+    for (const f of facilities) {
+      const codes = [f.location.state, ...(f.location.multiSite?.states ?? [])];
+      for (const code of codes) {
+        const slug = stateSlugFromCode(code);
+        if (!stateNameFromCode(code) || !slug || stateCodeFromSlug(slug) !== code) {
+          failing.push(`${f.id}: ${code}`);
+        }
+      }
+    }
+    expect(
+      failing,
+      `Jurisdiction codes without a name or a slug round-trip:\n${failing.join("\n")}`
     ).toHaveLength(0);
   });
 
@@ -97,15 +115,38 @@ describe("data integrity — facilities.json", () => {
     expect(failing, failing.join(", ")).toHaveLength(0);
   });
 
-  it("coordinates are within plausible US bounds (lat 15–72, lon −180 to −65)", () => {
+  it("coordinates are within known US jurisdictions (contiguous, Alaska, Hawaii, territories)", () => {
+    // US jurisdictions occupy multiple non-contiguous regions.
+    // A single bounding box would either exclude real territories (Guam, American Samoa, etc.)
+    // or accept most of the planet, defeating the purpose of this guard.
+    // Guam and Northern Mariana Islands sit at POSITIVE longitude (144–147°E);
+    // American Samoa is in the SOUTHERN hemisphere (−16 to −9°S).
+    // This test catches transposed signs, swapped lat/lon, or geocoder errors in the wrong hemisphere.
+    const regions = [
+      {
+        name: "Contiguous US + Alaska + Hawaii + PR + USVI",
+        lat: [15, 72],
+        lon: [-180, -64],
+      },
+      {
+        name: "Guam + Northern Mariana Islands",
+        lat: [13, 21],
+        lon: [144, 147],
+      },
+      {
+        name: "American Samoa",
+        lat: [-16, -9],
+        lon: [-173, -166],
+      },
+    ];
+
+    const isInAnyRegion = (lat: number, lon: number): boolean =>
+      regions.some(
+        (r) => lat >= r.lat[0] && lat <= r.lat[1] && lon >= r.lon[0] && lon <= r.lon[1]
+      );
+
     const failing = facilities
-      .filter(
-        (f) =>
-          f.location.lat < 15 ||
-          f.location.lat > 72 ||
-          f.location.lon < -180 ||
-          f.location.lon > -65
-      )
+      .filter((f) => !isInAnyRegion(f.location.lat, f.location.lon))
       .map((f) => `${f.id}: lat=${f.location.lat}, lon=${f.location.lon}`);
     expect(failing, failing.join("\n")).toHaveLength(0);
   });

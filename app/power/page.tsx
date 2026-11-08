@@ -5,15 +5,19 @@ import {
   getPowerGenerationFacilities,
   getGenerationByOfftaker,
   getGenerationStats,
+  getGenerationBuildoutStats,
   getEnergySourceCounts,
   getFacilitiesByWaterUsage,
   getCoolingTypeCounts,
-  type EnergySource,
-  type CoolingType,
 } from "@/lib/data";
-import { formatCapacity, formatLocation, getFacilityMaxMw } from "@/lib/format";
-import { StatusBadge } from "@/components/status-badge";
+import { formatLocation, formatMgd, formatPower, formatRatio, sortByMaxMwDesc, countDisclosedCapacity } from "@/lib/format";
+import { ENERGY_SOURCE_ENTRIES, COOLING_TYPE_ENTRIES } from "@/lib/energy";
 import { Breadcrumb } from "@/components/breadcrumb";
+import { FacilityListRow } from "@/components/facility-list-row";
+import { PageMasthead } from "@/components/page-masthead";
+import { SurveyStatRow } from "@/components/survey-stat-row";
+import { PercentageBar } from "@/components/percentage-bar";
+import { SectionHeading } from "@/components/section-heading";
 import type { PowerGenerationFacility } from "@/lib/schema";
 import {
   GENERATION_TECHNOLOGY_ORDER,
@@ -22,57 +26,24 @@ import {
   type GenerationTechnology,
 } from "@/lib/generation";
 
-export const revalidate = 3600;
-
-/** Formats a MW figure as GW (1 decimal) above 1000, else whole MW. Avoids "0.0 GW" for small totals. */
-function formatPower(mw: number): string {
-  if (mw >= 1000) {
-    return `${(mw / 1000).toFixed(1)} GW`;
-  }
-  return `${Math.round(mw)} MW`;
-}
+export const revalidate = 86400;
 
 /** Returns a label + facility-count row for the technology in the same tech + location line used elsewhere. */
 function technologyLabel(f: PowerGenerationFacility): string {
   return getGenerationTechnologyLabel(f.generation?.technology);
 }
 
-/** Formats a reported daily water figure as MGD (1 decimal), e.g. "12.5 MGD". */
-function formatMgd(mgd: number): string {
-  return `${mgd.toFixed(1)} MGD`;
-}
-
-/** Display order + labels for `energy.source` — mirrors the § Energy section on /stats. */
-const ENERGY_SOURCE_ENTRIES: { key: EnergySource; label: string }[] = [
-  { key: "grid", label: "Grid" },
-  { key: "mixed", label: "Mixed" },
-  { key: "on_site_gas", label: "On-site gas" },
-  { key: "nuclear", label: "Nuclear" },
-  { key: "solar", label: "Solar" },
-  { key: "hydro", label: "Hydro" },
-  { key: "wind", label: "Wind" },
-  { key: "other", label: "Other" },
-];
-
-/** Display order + labels for `water.coolingType` — ordered by water intensity (high -> minimal), mirrors /stats § Water use. */
-const COOLING_TYPE_ENTRIES: { key: CoolingType; label: string }[] = [
-  { key: "evaporative", label: "Evaporative (high water)" },
-  { key: "hybrid", label: "Hybrid" },
-  { key: "closed_loop", label: "Closed-loop (low water)" },
-  { key: "air", label: "Air-cooled (minimal)" },
-];
-
 export const metadata: Metadata = {
   title: "Data center power generation",
   description:
-    "Dedicated power generation feeding the U.S. compute buildout — the nuclear and SMR projects hyperscalers are financing or contracting, grouped by offtaker and technology. Source-cited.",
+    "Dedicated power generation feeding the U.S. compute buildout — the gas, nuclear, and renewable projects hyperscalers are financing or contracting, grouped by offtaker and technology. Source-cited.",
   alternates: { canonical: "/power" },
 };
 
 /**
  * /power — index of the power_generation facility layer. Static server component.
  *
- * Surfaces dedicated generation (largely nuclear and advanced SMRs) that
+ * Surfaces dedicated generation (most often natural gas, plus nuclear and SMRs) that
  * hyperscalers are financing or contracting to power AI/compute, grouped by
  * offtaker (the buyer) and by technology. Mirrors the /states and /stats
  * visual language (masthead, survey-stat row, § progress-bar sections).
@@ -80,6 +51,7 @@ export const metadata: Metadata = {
 export default async function PowerPage() {
   const [
     stats,
+    buildout,
     offtakerGroups,
     projects,
     energySourceCounts,
@@ -87,17 +59,15 @@ export default async function PowerPage() {
     coolingTypeCounts,
   ] = await Promise.all([
     getGenerationStats(),
+    getGenerationBuildoutStats(),
     getGenerationByOfftaker(),
     getPowerGenerationFacilities(),
     getEnergySourceCounts(),
     getFacilitiesByWaterUsage(),
     getCoolingTypeCounts(),
   ]);
-  const allProjects = [...projects].sort(
-    (a, b) =>
-      (getFacilityMaxMw(b) ?? -1) - (getFacilityMaxMw(a) ?? -1) ||
-      a.name.localeCompare(b.name)
-  );
+  const allProjects = [...projects].sort(sortByMaxMwDesc);
+  const capacityDisclosedCount = countDisclosedCapacity(allProjects);
 
   const technologyCounts = new Map<GenerationTechnology, number>();
   for (const f of allProjects) {
@@ -126,6 +96,24 @@ export default async function PowerPage() {
     0
   );
 
+  // getGenerationByOfftaker() silently drops projects with no
+  // generation.offtaker — name that gap here rather than let the § By
+  // offtaker breakdown read as if it covers every tracked project.
+  const offtakerReporting = offtakerGroups.reduce(
+    (sum, group) => sum + group.facilities.length,
+    0
+  );
+  const offtakerTotal = allProjects.length;
+
+  // Shared with the homepage/about-page ratio math via formatRatio — guards
+  // a zero denominator so a data state with no non-fossil capacity yet
+  // renders an em-dash instead of Infinity/NaN.
+  const buildoutRatioLabel = formatRatio(buildout.fossilPlannedMw, buildout.nonFossilPlannedMw);
+  const nonFossilBarPct =
+    buildout.fossilPlannedMw > 0
+      ? (buildout.nonFossilPlannedMw / buildout.fossilPlannedMw) * 100
+      : 0;
+
   if (stats.count === 0) {
     return (
       <div
@@ -133,21 +121,11 @@ export default async function PowerPage() {
         className="mx-auto max-w-4xl px-4 py-8 sm:px-6 sm:py-12 space-y-10"
       >
         <Breadcrumb items={[{ label: "Explore", href: "/explore" }, { label: "Power" }]} />
-        <header className="space-y-4 pb-2">
-          <p className="font-mono text-xs uppercase tracking-widest text-primary">
-            Dedicated generation
-          </p>
-          <h1 className="font-display text-4xl leading-[1.05] text-foreground sm:text-5xl">
-            Behind-the-meter power generation for AI data centers
-          </h1>
-          <p className="max-w-2xl text-base text-muted-foreground">
-            Powering the buildout.
-          </p>
-          <p className="text-base text-muted-foreground">
-            No dedicated-generation projects are tracked yet.
-          </p>
-          <div className="border-t border-border" />
-        </header>
+        <PageMasthead
+          eyebrow="Dedicated generation"
+          title="Behind-the-meter power generation for AI data centers"
+          dek="No dedicated-generation projects are tracked yet."
+        />
       </div>
     );
   }
@@ -159,78 +137,33 @@ export default async function PowerPage() {
     >
       <Breadcrumb items={[{ label: "Explore", href: "/explore" }, { label: "Power" }]} />
 
-      {/* ------------------------------------------------------------------ */}
-      {/* Masthead                                                            */}
-      {/* ------------------------------------------------------------------ */}
-      <header className="space-y-4 pb-2">
-        <p className="font-mono text-xs uppercase tracking-widest text-primary">
-          Dedicated generation
-        </p>
-        <h1 className="font-display text-4xl leading-[1.05] text-foreground sm:text-5xl">
-          Behind-the-meter power generation for AI data centers
-        </h1>
-        <p className="max-w-2xl text-base text-muted-foreground">
-          Powering the buildout.
-        </p>
-        <p className="max-w-2xl text-base text-muted-foreground">
-          Purpose-built generation — mostly nuclear and advanced SMRs — that
-          hyperscalers are financing or contracting to feed AI and compute
-          demand directly, tracked here as its own facility layer. In plain
-          terms: these are data centers with their own power plant, generating
-          on-site rather than drawing solely from the grid.
-        </p>
-        <div className="border-t border-border" />
-      </header>
+      <PageMasthead
+        eyebrow="Dedicated generation"
+        title="Behind-the-meter power generation for AI data centers"
+        dek="Purpose-built generation — most often natural gas, with a growing nuclear and small-modular-reactor cohort — that hyperscalers are financing or contracting to feed AI and compute demand directly. Tracked here as its own facility layer, distinct from the compute campuses it supplies: a dedicated plant built or contracted for a specific offtaker, rather than a data center drawing solely from the grid."
+      />
 
-      {/* ------------------------------------------------------------------ */}
-      {/* Survey stats row                                                    */}
-      {/* ------------------------------------------------------------------ */}
-      <div className="flex flex-wrap gap-8 border-b border-border pb-10">
-        <div className="flex flex-col items-center gap-1 text-center">
-          <span className="font-mono tabular-nums text-4xl font-semibold text-foreground">
-            {stats.count}
-          </span>
-          <span className="font-mono text-xs uppercase tracking-widest text-muted-foreground">
-            Projects
-          </span>
-        </div>
-        <div className="flex flex-col items-center gap-1 text-center">
-          <span className="font-mono tabular-nums text-4xl font-semibold text-foreground">
-            {formatPower(stats.operationalMw)}
-          </span>
-          <span className="font-mono text-xs uppercase tracking-widest text-muted-foreground">
-            Operational
-          </span>
-        </div>
-        <div className="flex flex-col items-center gap-1 text-center">
-          <span className="font-mono tabular-nums text-4xl font-semibold text-foreground">
-            {formatPower(stats.plannedMw)}
-          </span>
-          <span className="font-mono text-xs uppercase tracking-widest text-muted-foreground">
-            Pipeline
-          </span>
-        </div>
-        <div className="flex flex-col items-center gap-1 text-center">
-          <span className="font-mono tabular-nums text-4xl font-semibold text-foreground">
-            {stats.offtakerCount}
-          </span>
-          <span className="font-mono text-xs uppercase tracking-widest text-muted-foreground">
-            Offtakers
-          </span>
-        </div>
-      </div>
+      <SurveyStatRow
+        spacing="wide"
+        stats={[
+          { value: stats.count, label: "Projects" },
+          { value: formatPower(stats.operationalMw), label: "Operational" },
+          { value: formatPower(stats.plannedMw), label: "Pipeline" },
+          { value: stats.offtakerCount, label: "Offtakers" },
+        ]}
+      />
 
-      {/* ------------------------------------------------------------------ */}
-      {/* Overview prose                                                      */}
-      {/* ------------------------------------------------------------------ */}
       <div className="max-w-2xl space-y-4">
         <p className="text-base leading-relaxed text-muted-foreground">
-          Compute Atlas tracks {stats.count} dedicated-generation projects —
+          Compute Atlas tracks {stats.count}{" "}
+          dedicated-generation projects —
           plants and reactors financed or contracted specifically to power a
           data center&apos;s compute load, rather than drawn from the general
           grid. {formatPower(stats.operationalMw)} of that capacity is
           already operational, with {formatPower(stats.plannedMw)} more in
-          the pipeline.
+          the pipeline. Capacity is disclosed for {capacityDisclosedCount} of
+          the {stats.count} tracked projects; both figures sum those records
+          only — a floor, not a dataset total.
         </p>
         <p className="text-base leading-relaxed text-muted-foreground">
           {stats.offtakerCount} distinct offtakers — the hyperscalers and
@@ -244,21 +177,82 @@ export default async function PowerPage() {
         </p>
       </div>
 
-      {/* ------------------------------------------------------------------ */}
-      {/* § By offtaker                                                       */}
-      {/* ------------------------------------------------------------------ */}
+      <section
+        aria-labelledby="buildout-heading"
+        className="space-y-6 border-t border-border pt-10"
+      >
+        <div className="space-y-2">
+          <SectionHeading kicker="The buildout" id="buildout-heading" title="What's being built" />
+        </div>
+        <SurveyStatRow
+          spacing="wide"
+          stats={[
+            { value: formatPower(buildout.fossilPlannedMw), label: "Gas · planned" },
+            {
+              value: formatPower(buildout.nonFossilPlannedMw),
+              label: "Non-fossil · planned",
+            },
+            { value: buildoutRatioLabel, label: "Ratio" },
+            {
+              value: `${buildout.gas.operational} of ${buildout.gas.total}`,
+              label: "Gas plants running",
+            },
+          ]}
+        />
+        <div className="space-y-4">
+          <PercentageBar
+            label="Gas · planned"
+            valueLabel={formatPower(buildout.fossilPlannedMw)}
+            pct={100}
+          />
+          <PercentageBar
+            label="Non-fossil · planned"
+            valueLabel={formatPower(buildout.nonFossilPlannedMw)}
+            pct={nonFossilBarPct}
+            opacity={0.35}
+          />
+        </div>
+        <div className="max-w-2xl space-y-4">
+          <p className="text-base leading-relaxed text-muted-foreground">
+            On planned capacity alone, tracked natural-gas projects total{" "}
+            {formatPower(buildout.fossilPlannedMw)} against{" "}
+            {formatPower(buildout.nonFossilPlannedMw)} for every non-fossil
+            technology combined — nuclear, small modular reactors, solar,
+            wind, geothermal and fusion. Measured on planned capacity, the
+            dedicated-generation pipeline is predominantly fossil-fired — a{" "}
+            {buildoutRatioLabel} ratio of gas to non-fossil technology.
+          </p>
+          <p className="text-base leading-relaxed text-muted-foreground">
+            Only {buildout.gas.operational} of the {buildout.gas.total}{" "}
+            tracked gas plants are operational. {buildout.gas.proposed} are
+            proposed and {buildout.gas.permitted} are permitted but not yet
+            under way; {buildout.gas.underConstruction} are under
+            construction. Most of this fleet is not yet built: permits still
+            to be granted, plants still to be sited — the fuel mix is a
+            decision still being made, not a settled outcome.
+          </p>
+          <p className="text-base leading-relaxed text-muted-foreground">
+            These figures compare planned capacity only, and planned capacity
+            is not interchangeable with the operational figures in the survey
+            row above. Projects with no disclosed technology, and battery
+            storage, are counted in neither total.
+          </p>
+        </div>
+      </section>
+
       <section
         aria-labelledby="offtaker-heading"
         className="space-y-8 border-t border-border pt-10"
       >
         <div className="space-y-2">
-          <p className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
-            § By offtaker
-          </p>
-          <h2 id="offtaker-heading" className="font-display text-2xl text-foreground">
-            Who&apos;s buying the power
-          </h2>
+          <SectionHeading kicker="By offtaker" id="offtaker-heading" title="Who's buying the power" />
         </div>
+        <p className="max-w-2xl text-base leading-relaxed text-muted-foreground">
+          {offtakerReporting} of the {offtakerTotal} tracked power-generation
+          projects name a specific offtaker; the groups below cover those
+          projects only — the rest have a technology and location on record
+          but no disclosed buyer.
+        </p>
         <div className="space-y-8">
           {offtakerGroups.map((group) => (
             <div key={group.offtaker} className="space-y-3">
@@ -271,25 +265,10 @@ export default async function PowerPage() {
               <ul className="divide-y divide-border">
                 {group.facilities.map((f) => (
                   <li key={f.id}>
-                    <Link
-                      href={`/facilities/${f.id}`}
-                      className="flex min-h-11 flex-col gap-1 py-3 sm:flex-row sm:items-center sm:justify-between sm:gap-4 transition-colors hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 rounded-sm"
-                    >
-                      <span className="flex flex-col gap-0.5 min-w-0">
-                        <span className="text-sm text-foreground truncate">
-                          {f.name}
-                        </span>
-                        <span className="text-xs text-muted-foreground truncate">
-                          {technologyLabel(f)} &middot; {formatLocation(f)}
-                        </span>
-                      </span>
-                      <span className="flex shrink-0 items-center gap-3">
-                        <StatusBadge status={f.status} />
-                        <span className="font-mono tabular-nums text-xs text-muted-foreground">
-                          {formatCapacity(f)}
-                        </span>
-                      </span>
-                    </Link>
+                    <FacilityListRow
+                      facility={f}
+                      secondary={<>{technologyLabel(f)} &middot; {formatLocation(f)}</>}
+                    />
                   </li>
                 ))}
               </ul>
@@ -298,65 +277,37 @@ export default async function PowerPage() {
         </div>
       </section>
 
-      {/* ------------------------------------------------------------------ */}
-      {/* § By technology                                                     */}
-      {/* ------------------------------------------------------------------ */}
       <section
         aria-labelledby="technology-heading"
         className="space-y-6 border-t border-border pt-10"
       >
-        <p className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
-          § By technology
-        </p>
-        <h2 id="technology-heading" className="font-display text-2xl text-foreground">
-          Technology mix
-        </h2>
+        <SectionHeading kicker="By technology" id="technology-heading" title="Technology mix" />
         <div className="space-y-4">
           {presentTechnologies.map((tech) => {
             const count = technologyCounts.get(tech) ?? 0;
             const pct = allProjects.length > 0 ? (count / allProjects.length) * 100 : 0;
             return (
-              <div key={tech} className="space-y-1.5">
-                <div className="flex items-baseline justify-between gap-2 text-sm">
-                  <span className="text-foreground">{GENERATION_TECHNOLOGY_LABELS[tech]}</span>
-                  <span className="font-mono tabular-nums text-muted-foreground">
+              <PercentageBar
+                key={tech}
+                label={GENERATION_TECHNOLOGY_LABELS[tech]}
+                valueLabel={
+                  <>
                     {count} &middot; {pct.toFixed(0)}%
-                  </span>
-                </div>
-                <div className="h-1.5 w-full overflow-hidden rounded-full bg-muted">
-                  <div
-                    aria-hidden="true"
-                    className="h-full rounded-full"
-                    style={{
-                      width: `${pct.toFixed(2)}%`,
-                      backgroundColor: "var(--primary)",
-                      opacity: 0.7,
-                    }}
-                  />
-                </div>
-              </div>
+                  </>
+                }
+                pct={pct}
+              />
             );
           })}
         </div>
       </section>
 
-      {/* ------------------------------------------------------------------ */}
-      {/* § Energy source                                                     */}
-      {/* ------------------------------------------------------------------ */}
       <section
         aria-labelledby="energy-source-heading"
         className="space-y-6 border-t border-border pt-10"
       >
         <div className="space-y-2">
-          <p className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
-            § Energy source
-          </p>
-          <h2
-            id="energy-source-heading"
-            className="font-display text-2xl text-foreground"
-          >
-            On-site generation vs. the grid
-          </h2>
+          <SectionHeading kicker="Energy source" id="energy-source-heading" title="On-site generation vs. the grid" />
         </div>
         <p className="max-w-2xl text-base leading-relaxed text-muted-foreground">
           Beyond the dedicated projects above, individual data centers and
@@ -377,25 +328,17 @@ export default async function PowerPage() {
                   ? (count / energySourceReporting) * 100
                   : 0;
               return (
-                <li key={key} className="space-y-1.5">
-                  <div className="flex items-baseline justify-between gap-2 text-sm">
-                    <span className="text-foreground">{label}</span>
-                    <span className="font-mono tabular-nums text-muted-foreground">
+                <PercentageBar
+                  key={key}
+                  as="li"
+                  label={label}
+                  valueLabel={
+                    <>
                       {count} &middot; {pct.toFixed(0)}%
-                    </span>
-                  </div>
-                  <div className="h-1.5 w-full overflow-hidden rounded-full bg-muted">
-                    <div
-                      aria-hidden="true"
-                      className="h-full rounded-full"
-                      style={{
-                        width: `${pct.toFixed(2)}%`,
-                        backgroundColor: "var(--primary)",
-                        opacity: 0.7,
-                      }}
-                    />
-                  </div>
-                </li>
+                    </>
+                  }
+                  pct={pct}
+                />
               );
             })}
           </ul>
@@ -406,23 +349,12 @@ export default async function PowerPage() {
         )}
       </section>
 
-      {/* ------------------------------------------------------------------ */}
-      {/* § Water use                                                         */}
-      {/* ------------------------------------------------------------------ */}
       <section
         aria-labelledby="water-use-heading"
         className="space-y-6 border-t border-border pt-10"
       >
         <div className="space-y-2">
-          <p className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
-            § Water use
-          </p>
-          <h2
-            id="water-use-heading"
-            className="font-display text-2xl text-foreground"
-          >
-            Facility-level water use
-          </h2>
+          <SectionHeading kicker="Water use" id="water-use-heading" title="Facility-level water use" />
         </div>
         <p className="max-w-2xl text-base leading-relaxed text-muted-foreground">
           Cooling water is one of the least-transparent civic costs of a data
@@ -442,7 +374,7 @@ export default async function PowerPage() {
               <li key={f.id}>
                 <Link
                   href={`/facilities/${f.id}`}
-                  className="flex min-h-11 flex-col gap-1 py-3 sm:flex-row sm:items-center sm:justify-between sm:gap-4 transition-colors hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 rounded-sm"
+                  className="flex min-h-11 flex-col gap-1 py-3 sm:flex-row sm:items-center sm:justify-between sm:gap-4 transition-colors hover:bg-muted/50 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring rounded-sm"
                 >
                   <span className="flex flex-col gap-0.5 min-w-0">
                     <span className="text-sm text-foreground truncate">
@@ -484,25 +416,17 @@ export default async function PowerPage() {
                     ? (count / coolingTypeReporting) * 100
                     : 0;
                 return (
-                  <li key={key} className="space-y-1.5">
-                    <div className="flex items-baseline justify-between gap-2 text-sm">
-                      <span className="text-foreground">{label}</span>
-                      <span className="font-mono tabular-nums text-muted-foreground">
+                  <PercentageBar
+                    key={key}
+                    as="li"
+                    label={label}
+                    valueLabel={
+                      <>
                         {count} &middot; {pct.toFixed(0)}%
-                      </span>
-                    </div>
-                    <div className="h-1.5 w-full overflow-hidden rounded-full bg-muted">
-                      <div
-                        aria-hidden="true"
-                        className="h-full rounded-full"
-                        style={{
-                          width: `${pct.toFixed(2)}%`,
-                          backgroundColor: "var(--primary)",
-                          opacity: 0.7,
-                        }}
-                      />
-                    </div>
-                  </li>
+                      </>
+                    }
+                    pct={pct}
+                  />
                 );
               })}
             </ul>
@@ -510,41 +434,18 @@ export default async function PowerPage() {
         )}
       </section>
 
-      {/* ------------------------------------------------------------------ */}
-      {/* § Projects                                                          */}
-      {/* ------------------------------------------------------------------ */}
       <section
         aria-labelledby="projects-heading"
         className="space-y-4 border-t border-border pt-10"
       >
-        <p className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
-          § Projects
-        </p>
-        <h2 id="projects-heading" className="font-display text-2xl text-foreground">
-          All projects
-        </h2>
+        <SectionHeading kicker="Projects" id="projects-heading" title="All projects" />
         <ul className="divide-y divide-border">
           {allProjects.map((f) => (
             <li key={f.id}>
-              <Link
-                href={`/facilities/${f.id}`}
-                className="flex min-h-11 flex-col gap-1 py-3 sm:flex-row sm:items-center sm:justify-between sm:gap-4 transition-colors hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 rounded-sm"
-              >
-                <span className="flex flex-col gap-0.5 min-w-0">
-                  <span className="text-sm text-foreground truncate">
-                    {f.name}
-                  </span>
-                  <span className="text-xs text-muted-foreground truncate">
-                    {technologyLabel(f)} &middot; {formatLocation(f)}
-                  </span>
-                </span>
-                <span className="flex shrink-0 items-center gap-3">
-                  <StatusBadge status={f.status} />
-                  <span className="font-mono tabular-nums text-xs text-muted-foreground">
-                    {formatCapacity(f)}
-                  </span>
-                </span>
-              </Link>
+              <FacilityListRow
+                facility={f}
+                secondary={<>{technologyLabel(f)} &middot; {formatLocation(f)}</>}
+              />
             </li>
           ))}
         </ul>

@@ -1,0 +1,422 @@
+// @vitest-environment node
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { describe, expect, it } from "vitest";
+
+import {
+  buildCannotCheckReport,
+  classifyWorkflow,
+  emitOutcome,
+  MONITORED_WORKFLOWS,
+  pickLatestSuccess,
+  sortNewestFirst,
+  type WorkflowConfig,
+  type WorkflowRun,
+} from "./automation-health";
+
+const DAILY: WorkflowConfig = {
+  file: "googlebot-canary.yml",
+  name: "googlebot-canary",
+  cronDescription: "0 6 * * * (daily 06:00 UTC)",
+  staleAfterHours: 36,
+};
+
+const WEEKLY: WorkflowConfig = {
+  file: "release-please.yml",
+  name: "release-please",
+  cronDescription: "0 9 * * 1 (Mondays 09:00 UTC)",
+  staleAfterHours: 8 * 24,
+};
+
+const NOW = new Date("2026-09-09T00:00:00.000Z");
+
+function run(hoursAgo: number, opts: Partial<WorkflowRun> = {}): WorkflowRun {
+  const created = new Date(NOW.getTime() - hoursAgo * 60 * 60 * 1000).toISOString();
+  return {
+    status: "completed",
+    conclusion: "success",
+    created_at: created,
+    ...opts,
+  };
+}
+
+describe("classifyWorkflow", () => {
+  it("is ok for a recent successful run", () => {
+    const result = classifyWorkflow(DAILY, [run(2)], NOW);
+    expect(result.state).toBe("ok");
+    expect(result.streak).toBe(0);
+  });
+
+  it("counts a 6-run consecutive failure streak correctly (the real drift-alert case)", () => {
+    const runs: WorkflowRun[] = [
+      run(2, { conclusion: "failure" }),
+      run(26, { conclusion: "failure" }),
+      run(50, { conclusion: "timed_out" }),
+      run(74, { conclusion: "failure" }),
+      run(98, { conclusion: "cancelled" }),
+      run(122, { conclusion: "failure" }),
+      // an older success further back must NOT extend the streak
+      run(146, { conclusion: "success" }),
+    ];
+    const result = classifyWorkflow(DAILY, runs, NOW);
+    expect(result.state).toBe("failing");
+    expect(result.streak).toBe(6);
+  });
+
+  it("stops the streak count at the first non-failure, even if failures resume further back", () => {
+    const runs: WorkflowRun[] = [
+      run(2, { conclusion: "failure" }),
+      run(26, { conclusion: "success" }),
+      run(50, { conclusion: "failure" }),
+    ];
+    const result = classifyWorkflow(DAILY, runs, NOW);
+    expect(result.state).toBe("failing");
+    expect(result.streak).toBe(1);
+  });
+
+  it("is stale when the newest run succeeded but is older than the budget", () => {
+    const result = classifyWorkflow(DAILY, [run(40, { conclusion: "success" })], NOW);
+    expect(result.state).toBe("stale");
+    expect(result.detail).toMatch(/40\.0h/);
+  });
+
+  it("is never-run when there are no runs at all", () => {
+    const result = classifyWorkflow(DAILY, [], NOW);
+    expect(result.state).toBe("never-run");
+    expect(result.lastRunAt).toBeNull();
+  });
+
+  it("judges on the newest COMPLETED run when the newest run is in_progress", () => {
+    const runs: WorkflowRun[] = [
+      run(1, { status: "in_progress", conclusion: null }),
+      run(25, { status: "completed", conclusion: "failure" }),
+    ];
+    const result = classifyWorkflow(DAILY, runs, NOW);
+    expect(result.state).toBe("failing");
+    expect(result.streak).toBe(1);
+  });
+
+  it("is ok when the only run is in_progress and within budget (nothing completed yet)", () => {
+    const runs: WorkflowRun[] = [run(1, { status: "in_progress", conclusion: null })];
+    const result = classifyWorkflow(DAILY, runs, NOW);
+    expect(result.state).toBe("ok");
+  });
+
+  it("weekly budget: a 5-day-old release-please run is ok", () => {
+    const result = classifyWorkflow(WEEKLY, [run(5 * 24, { conclusion: "success" })], NOW);
+    expect(result.state).toBe("ok");
+  });
+
+  it("weekly budget: a 9-day-old release-please run is stale", () => {
+    const result = classifyWorkflow(WEEKLY, [run(9 * 24, { conclusion: "success" })], NOW);
+    expect(result.state).toBe("stale");
+  });
+
+  // Position is not recency. On 2026-09-28/29 the runs-list API returned a stale
+  // ordering, and the report said "neon-sync — stale, Last run: 2026-09-08"
+  // while daily scheduled successes existed through 2026-09-29. The classifier
+  // must be correct for ANY input order, so every fixture here is deliberately
+  // NOT newest-first.
+  describe("input order independence", () => {
+    it("reports the newest run, not the first one, when an old run leads the list", () => {
+      // The 500h-old run sits at position 0, exactly the incident's shape.
+      const runs: WorkflowRun[] = [run(500), run(50), run(2), run(26), run(74)];
+      const result = classifyWorkflow(DAILY, runs, NOW);
+
+      expect(result.state).toBe("ok");
+      expect(result.lastRunAt).toBe(run(2).created_at);
+    });
+
+    it("is not stale when the newest run is fresh even though position 0 is past the budget", () => {
+      const result = classifyWorkflow(DAILY, [run(40), run(1)], NOW);
+
+      expect(result.state).toBe("ok");
+      expect(result.lastRunAt).toBe(run(1).created_at);
+    });
+
+    it("still counts the leading failure streak when the list is shuffled", () => {
+      // Newest-first this is: 2f, 26f, 50f, 74f, 98s -> streak 4.
+      const runs: WorkflowRun[] = [
+        run(74, { conclusion: "failure" }),
+        run(98, { conclusion: "success" }),
+        run(2, { conclusion: "failure" }),
+        run(50, { conclusion: "timed_out" }),
+        run(26, { conclusion: "cancelled" }),
+      ];
+      const result = classifyWorkflow(DAILY, runs, NOW);
+
+      expect(result.state).toBe("failing");
+      expect(result.streak).toBe(4);
+    });
+
+    it("judges on the newest COMPLETED run when the in_progress run is mid-list", () => {
+      const runs: WorkflowRun[] = [
+        run(26, { conclusion: "failure" }),
+        run(1, { status: "in_progress", conclusion: null }),
+        run(50, { conclusion: "success" }),
+      ];
+      const result = classifyWorkflow(DAILY, runs, NOW);
+
+      expect(result.state).toBe("failing");
+      expect(result.streak).toBe(1);
+      expect(result.lastRunAt).toBe(run(1).created_at);
+    });
+
+    it("does not mutate the caller's array", () => {
+      const runs: WorkflowRun[] = [run(500), run(2)];
+      const before = runs.map((r) => r.created_at);
+      classifyWorkflow(DAILY, runs, NOW);
+
+      expect(runs.map((r) => r.created_at)).toEqual(before);
+    });
+  });
+
+  // The 4th argument is the newest SUCCESS of any event type — normally a
+  // `workflow_dispatch` a maintainer ran to verify a fix. It may clear a
+  // FAILING verdict and nothing else. Real case: drift-alert was fixed and
+  // dispatch-verified on 2026-09-09 while its 6 scheduled failures (Sep 3-8)
+  // were still the only scheduled history, so this check reported an
+  // already-fixed workflow as broken.
+  describe("repaired-but-not-yet-rescheduled", () => {
+    const SIX_FAILURES: WorkflowRun[] = [
+      run(2, { conclusion: "failure" }),
+      run(26, { conclusion: "failure" }),
+      run(50, { conclusion: "failure" }),
+      run(74, { conclusion: "failure" }),
+      run(98, { conclusion: "failure" }),
+      run(122, { conclusion: "failure" }),
+    ];
+
+    it("clears FAILING when a success is newer than the newest scheduled failure", () => {
+      const dispatchedAt = new Date(NOW.getTime() - 1 * 60 * 60 * 1000).toISOString();
+      const result = classifyWorkflow(DAILY, SIX_FAILURES, NOW, dispatchedAt);
+
+      expect(result.state).toBe("ok");
+      expect(result.streak).toBe(0);
+      expect(result.detail).toContain("treating as repaired");
+      // Must stay honest that the schedule itself has not re-confirmed yet.
+      expect(result.detail).toContain("next scheduled run");
+    });
+
+    it("does NOT clear FAILING when the success predates the newest failure", () => {
+      const staleSuccess = new Date(NOW.getTime() - 200 * 60 * 60 * 1000).toISOString();
+      const result = classifyWorkflow(DAILY, SIX_FAILURES, NOW, staleSuccess);
+
+      expect(result.state).toBe("failing");
+      expect(result.streak).toBe(6);
+    });
+
+    it("does NOT mask a NEW scheduled failure that lands after the success", () => {
+      // Newest scheduled failure is 2h old; the dispatch success is 10h old.
+      const dispatchedAt = new Date(NOW.getTime() - 10 * 60 * 60 * 1000).toISOString();
+      const result = classifyWorkflow(DAILY, SIX_FAILURES, NOW, dispatchedAt);
+
+      expect(result.state).toBe("failing");
+      expect(result.streak).toBe(6);
+    });
+
+    it("does NOT clear STALE — a dispatch proves the job, never the schedule", () => {
+      const justNow = NOW.toISOString();
+      const result = classifyWorkflow(DAILY, [run(40, { conclusion: "success" })], NOW, justNow);
+
+      expect(result.state).toBe("stale");
+    });
+
+    it("does NOT clear NEVER-RUN — a dead cron stays reported", () => {
+      const justNow = NOW.toISOString();
+      const result = classifyWorkflow(DAILY, [], NOW, justNow);
+
+      expect(result.state).toBe("never-run");
+    });
+
+    it("is unchanged from previous behaviour when no success timestamp is known", () => {
+      const result = classifyWorkflow(DAILY, SIX_FAILURES, NOW, null);
+
+      expect(result.state).toBe("failing");
+      expect(result.streak).toBe(6);
+    });
+  });
+});
+
+// The workflow decides whether to open an issue from
+// `steps.health.outputs.healthy == 'false'` and reads the body from the report
+// file. Those two artifacts ARE the contract with automation-health.yml, and
+// they were previously written at two separate call sites — so the "cannot
+// check" path wrote neither, went red, and filed nothing. These tests assert
+// both artifacts appear together on every path.
+describe("emitOutcome", () => {
+  function scratch() {
+    const dir = mkdtempSync(join(tmpdir(), "automation-health-"));
+    const out = join(dir, "health.md");
+    const githubOutput = join(dir, "github_output");
+    // GitHub creates $GITHUB_OUTPUT before the step runs; emitOutcome appends.
+    writeFileSync(githubOutput, "", "utf8");
+    return { out, githubOutput, env: { GITHUB_OUTPUT: githubOutput } };
+  }
+
+  it("writes the report AND healthy=false together when unhealthy", () => {
+    const { out, githubOutput, env } = scratch();
+    emitOutcome({ healthy: false, markdown: "# body", out, env });
+
+    expect(readFileSync(out, "utf8")).toBe("# body");
+    expect(readFileSync(githubOutput, "utf8")).toBe("healthy=false\n");
+  });
+
+  it("writes healthy=true when everything is ok", () => {
+    const { out, githubOutput, env } = scratch();
+    emitOutcome({ healthy: true, markdown: "# body", out, env });
+
+    expect(readFileSync(githubOutput, "utf8")).toBe("healthy=true\n");
+  });
+
+  it("appends rather than truncating, so it cannot clobber another step's outputs", () => {
+    const { out, githubOutput, env } = scratch();
+    writeFileSync(githubOutput, "other=1\n", "utf8");
+    emitOutcome({ healthy: false, markdown: "# body", out, env });
+
+    expect(readFileSync(githubOutput, "utf8")).toBe("other=1\nhealthy=false\n");
+  });
+
+  it("still sets the step output when no --out path was given", () => {
+    const { githubOutput, env } = scratch();
+    emitOutcome({ healthy: false, markdown: "# body", out: null, env });
+
+    expect(readFileSync(githubOutput, "utf8")).toBe("healthy=false\n");
+  });
+});
+
+describe("buildCannotCheckReport", () => {
+  it("states plainly that nothing was verified, rather than reading as an all-clear", () => {
+    const body = buildCannotCheckReport("GITHUB_TOKEN is not set.");
+
+    expect(body).toContain("could not run at all");
+    expect(body).toContain("not a clean bill of health");
+    expect(body).toContain("GITHUB_TOKEN is not set.");
+    // Never claim health on a path that checked nothing.
+    expect(body).not.toContain("All monitored scheduled workflows are healthy");
+  });
+
+  it("carries the same self-staleness caveat as the normal report", () => {
+    expect(buildCannotCheckReport("boom")).toContain("cannot detect its own staleness");
+  });
+});
+
+// Guards the one assumption the repair check rests on that no unit test could
+// otherwise reach: that the "newest success" lookup really did return a
+// success. GitHub silently ignores unknown query parameters, so a plausible
+// edit to `fetchLatestSuccessAt`'s URL (`conclusion=success`, which this
+// endpoint does not implement) would return the newest run of ANY conclusion.
+// Measured 2026-09-09: `?status=success` gave total_count 0 on a workflow whose
+// 12 runs were all failures, while `?conclusion=success` gave all 12 back.
+// Checking locally makes the repair check correct regardless.
+describe("pickLatestSuccess", () => {
+  const at = (iso: string, conclusion: string | null): WorkflowRun => ({
+    status: "completed",
+    conclusion,
+    created_at: iso,
+  });
+
+  it("returns the timestamp when the run really did succeed", () => {
+    expect(pickLatestSuccess([at("2026-09-09T12:40:34Z", "success")])).toBe(
+      "2026-09-09T12:40:34Z"
+    );
+  });
+
+  it("returns null for a FAILED run — the server-side filter is not trusted", () => {
+    expect(pickLatestSuccess([at("2026-09-09T16:22:00Z", "failure")])).toBeNull();
+  });
+
+  it("returns null for other non-success conclusions", () => {
+    expect(pickLatestSuccess([at("2026-09-09T16:22:00Z", "cancelled")])).toBeNull();
+    expect(pickLatestSuccess([at("2026-09-09T16:22:00Z", "timed_out")])).toBeNull();
+    expect(pickLatestSuccess([at("2026-09-09T16:22:00Z", null)])).toBeNull();
+  });
+
+  it("returns null when there are no runs at all", () => {
+    expect(pickLatestSuccess([])).toBeNull();
+  });
+
+  // List position is not recency (stale ordering observed 2026-09-28/29), so
+  // the newest success is chosen by timestamp across the whole page.
+  it("returns the NEWEST success from an unsorted mixed list, not the first or the first success", () => {
+    const runs: WorkflowRun[] = [
+      at("2026-09-02T08:00:00Z", "success"),
+      at("2026-09-10T08:00:00Z", "failure"),
+      at("2026-09-07T08:00:00Z", "success"),
+      at("2026-09-08T08:00:00Z", "cancelled"),
+      at("2026-09-04T08:00:00Z", "success"),
+    ];
+
+    expect(pickLatestSuccess(runs)).toBe("2026-09-07T08:00:00Z");
+  });
+
+  it("returns null for an unsorted list in which nothing succeeded", () => {
+    const runs: WorkflowRun[] = [
+      at("2026-09-02T08:00:00Z", "failure"),
+      at("2026-09-09T08:00:00Z", "timed_out"),
+      at("2026-09-05T08:00:00Z", null),
+    ];
+
+    expect(pickLatestSuccess(runs)).toBeNull();
+  });
+});
+
+describe("sortNewestFirst", () => {
+  const at = (iso: string): WorkflowRun => ({
+    status: "completed",
+    conclusion: "success",
+    created_at: iso,
+  });
+
+  it("orders by created_at descending, regardless of input order", () => {
+    const sorted = sortNewestFirst([
+      at("2026-09-08T12:36:57Z"),
+      at("2026-09-29T08:10:00Z"),
+      at("2026-09-15T08:05:00Z"),
+    ]);
+
+    expect(sorted.map((r) => r.created_at)).toEqual([
+      "2026-09-29T08:10:00Z",
+      "2026-09-15T08:05:00Z",
+      "2026-09-08T12:36:57Z",
+    ]);
+  });
+
+  it("returns a new array and leaves the input untouched", () => {
+    const input = [at("2026-09-08T12:36:57Z"), at("2026-09-29T08:10:00Z")];
+    const sorted = sortNewestFirst(input);
+
+    expect(sorted).not.toBe(input);
+    expect(input.map((r) => r.created_at)).toEqual([
+      "2026-09-08T12:36:57Z",
+      "2026-09-29T08:10:00Z",
+    ]);
+  });
+
+  it("returns an empty array for no runs", () => {
+    expect(sortNewestFirst([])).toEqual([]);
+  });
+});
+
+describe("MONITORED_WORKFLOWS", () => {
+  it("monitors schema-check.yml daily with a 36h staleness budget", () => {
+    expect(MONITORED_WORKFLOWS).toContainEqual({
+      file: "schema-check.yml",
+      name: "schema-check",
+      cronDescription: "0 22 * * * (daily 22:00 UTC)",
+      staleAfterHours: 36,
+    });
+  });
+
+  it("schema-check cronDescription starts with the cron string in the workflow", () => {
+    const yml = readFileSync(
+      join(__dirname, "..", ".github", "workflows", "schema-check.yml"),
+      "utf8",
+    );
+    const cron = /^\s*-\s*cron:\s*["']?([^"'#\n]*[^"'#\s])/m.exec(yml)?.[1];
+    expect(cron).toBeTruthy();
+    const entry = MONITORED_WORKFLOWS.find((w) => w.file === "schema-check.yml");
+    expect(entry?.cronDescription.startsWith(cron as string)).toBe(true);
+  });
+});

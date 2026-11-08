@@ -1,6 +1,5 @@
 import Fuse from "fuse.js";
-import { loadFacilitiesForSearch, operatorSlug } from "@/lib/data";
-import { stateNameFromCode, stateSlugFromCode } from "@/lib/us-states";
+import { stateNameFromCode } from "@/lib/us-states";
 import type { Facility } from "@/lib/schema";
 
 /** The kind of thing a search result points to. */
@@ -40,15 +39,44 @@ const DEFAULT_LIMITS: Record<SearchEntryType, number> = {
   state: 5,
 };
 
-function pluralize(n: number, singular: string, plural: string): string {
-  return n === 1 ? singular : plural;
+/** The only Facility fields the palette reads. Derived from `Facility` so it
+ * cannot drift from the schema; `/api/search?shape=palette` serves this. */
+export type FacilitySearchHit = Pick<Facility, "id" | "name" | "operator"> & {
+  location: Pick<Facility["location"], "state"> &
+    Partial<Pick<Facility["location"], "city" | "county" | "street">>;
+};
+
+/** `/api/search?shape=palette` answers nothing for a trimmed query shorter than this. */
+export const PALETTE_MIN_QUERY_LEN = 2;
+
+/** `/api/search?shape=palette` returns at most this many hits (the palette shows 7). */
+export const PALETTE_MAX_RESULTS = 25;
+
+/** Projects a Facility onto a FacilitySearchHit. Always builds a NEW object
+ * (facility arrays are shared across requests) and omits absent optionals. */
+export function toFacilitySearchHit(f: Facility): FacilitySearchHit {
+  const { city, county, street, state } = f.location;
+  return {
+    id: f.id,
+    name: f.name,
+    operator: f.operator,
+    location: {
+      state,
+      ...(city != null && { city }),
+      ...(county != null && { county }),
+      ...(street != null && { street }),
+    },
+  };
 }
 
-/** Builds one facility SearchEntry. Shared by buildSearchIndex (the Fuse
- * index) and the live DB-search merge path so both produce identical entry
- * shapes. Pure — depends only on stateNameFromCode. */
-export function facilityToSearchEntry(f: Facility): SearchEntry {
-  const stateName = stateNameFromCode(f.location.state) ?? f.location.state;
+/** Builds one facility SearchEntry. The single place a Facility becomes a
+ * palette entry — used by the live /api/search merge path in
+ * command-palette.tsx. Pure — depends only on stateNameFromCode. */
+export function facilityToSearchEntry(f: FacilitySearchHit): SearchEntry {
+  // The DB jsonb doc is not zod-parsed, so `state` can be null at runtime; a
+  // throw here would blank every DB result in the palette. Treat it as absent.
+  const state = typeof f.location.state === "string" ? f.location.state : undefined;
+  const stateName = state && (stateNameFromCode(state) ?? state);
   const sublabel = [f.location.city, stateName].filter(Boolean).join(", ");
   const keywords = [
     f.name,
@@ -57,7 +85,7 @@ export function facilityToSearchEntry(f: Facility): SearchEntry {
     f.location.county,
     f.location.street,
     stateName,
-    f.location.state,
+    state,
   ]
     .filter(Boolean)
     .join(" ")
@@ -69,61 +97,6 @@ export function facilityToSearchEntry(f: Facility): SearchEntry {
     href: `/facilities/${f.id}`,
     keywords,
   };
-}
-
-/**
- * Builds the data-backed search index: one entry per facility, operator, and
- * state. Does NOT include "page" entries — those are UI config supplied by
- * the command palette component, not data.
- */
-export async function buildSearchIndex(): Promise<SearchEntry[]> {
-  const facilities = await loadFacilitiesForSearch();
-  const entries: SearchEntry[] = [];
-
-  // Facilities — one entry each.
-  for (const f of facilities) {
-    entries.push(facilityToSearchEntry(f));
-  }
-
-  // Operators — count facilities per operator in one pass, and derive the
-  // unique operator name list from the same `facilities` read (avoids a
-  // second loadFacilities-family read that would re-pin the ISR floor).
-  const operatorCounts = new Map<string, number>();
-  for (const f of facilities) {
-    operatorCounts.set(f.operator, (operatorCounts.get(f.operator) ?? 0) + 1);
-  }
-  const operatorNames = [...new Set(facilities.map((f) => f.operator))].sort();
-  for (const name of operatorNames) {
-    const n = operatorCounts.get(name) ?? 0;
-    entries.push({
-      type: "operator",
-      label: name,
-      sublabel: `${n} ${pluralize(n, "facility", "facilities")}`,
-      href: `/operators/${operatorSlug(name)}`,
-      keywords: name.toLowerCase(),
-    });
-  }
-
-  // States — derive unique codes from facilities, skip any without a slug.
-  const stateCounts = new Map<string, number>();
-  for (const f of facilities) {
-    const code = f.location.state;
-    stateCounts.set(code, (stateCounts.get(code) ?? 0) + 1);
-  }
-  for (const [code, n] of stateCounts) {
-    const slug = stateSlugFromCode(code);
-    const stateName = stateNameFromCode(code);
-    if (!slug || !stateName) continue;
-    entries.push({
-      type: "state",
-      label: stateName,
-      sublabel: `${n} ${pluralize(n, "facility", "facilities")}`,
-      href: `/states/${slug}`,
-      keywords: `${stateName} ${code}`.toLowerCase(),
-    });
-  }
-
-  return entries;
 }
 
 /**

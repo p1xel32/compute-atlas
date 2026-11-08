@@ -1,0 +1,545 @@
+// @vitest-environment node
+import { randomUUID } from "node:crypto";
+import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+
+vi.mock("../lib/db/client");
+
+import * as dbClient from "../lib/db/client";
+import { makeTestDb, type TestDbHandle } from "../test/pglite-db";
+import {
+  apiAccessGrantsTable,
+  apiDailyUsageTable,
+  contactMessagesTable,
+  intakeAttemptsTable,
+  leadsTable,
+  submissionsTable,
+  submissionNotifyRequestsTable,
+  submissionNotifySendsTable,
+  emailSendsTable,
+  subscribeAttemptsTable,
+  subscriptionsTable,
+} from "../lib/db/schema";
+import { CONFIRM_CAP_WINDOW_MS } from "../lib/email-sends";
+import { EMAIL_SENDS_RETENTION_DAYS, runRetentionPrune } from "./retention-prune";
+
+let tdb: TestDbHandle;
+let tmpBase: string;
+let backupDir: string;
+
+// Fixed clock — every window-boundary assertion below is computed relative
+// to this instant, never Date.now(), so the suite can't go flaky at midnight.
+const NOW = new Date("2026-09-04T12:00:00.000Z");
+const DAY_MS = 24 * 60 * 60 * 1000;
+const daysBefore = (days: number): Date => new Date(NOW.getTime() - days * DAY_MS);
+
+function readBackupLines(): { table: string; action: string; row: { id: string } }[] {
+  const files = readdirSync(backupDir).filter((f) => f.endsWith(".jsonl"));
+  expect(files).toHaveLength(1);
+  const content = readFileSync(path.join(backupDir, files[0]), "utf-8");
+  return content
+    .split("\n")
+    .filter((line) => line.trim().length > 0)
+    .map((line) => JSON.parse(line));
+}
+
+beforeAll(async () => {
+  tdb = await makeTestDb();
+  vi.mocked(dbClient.getDb).mockReturnValue(tdb.db as never);
+});
+
+beforeEach(async () => {
+  await tdb.reset();
+  tmpBase = mkdtempSync(path.join(os.tmpdir(), "retention-prune-test-"));
+  backupDir = path.join(tmpBase, "retention-backups");
+});
+
+afterEach(() => {
+  rmSync(tmpBase, { recursive: true, force: true });
+});
+
+afterAll(async () => {
+  await tdb.client.close();
+});
+
+/** Seeds one in-window + one out-of-window (+ table-specific protected) row per table. Returns the ids expected to be mutated, per table. */
+async function seedAllTables() {
+  // contact_messages: retention window 180 days.
+  const [contactOld] = await tdb.db
+    .insert(contactMessagesTable)
+    .values({
+      name: "Old Sender",
+      email: "old@example.com",
+      topic: "other",
+      message: "old message",
+      createdAt: daysBefore(190),
+    })
+    .returning({ id: contactMessagesTable.id });
+  const [contactFresh] = await tdb.db
+    .insert(contactMessagesTable)
+    .values({
+      name: "Fresh Sender",
+      email: "fresh@example.com",
+      topic: "other",
+      message: "fresh message",
+      createdAt: daysBefore(170),
+    })
+    .returning({ id: contactMessagesTable.id });
+
+  // leads: retention window 365 days, only status IN (promoted, dismissed).
+  const [leadOldPromoted] = await tdb.db
+    .insert(leadsTable)
+    .values({ url: "https://old-promoted.example", status: "promoted", reviewedAt: daysBefore(375) })
+    .returning({ id: leadsTable.id });
+  const [leadFreshPromoted] = await tdb.db
+    .insert(leadsTable)
+    .values({ url: "https://fresh-promoted.example", status: "promoted", reviewedAt: daysBefore(355) })
+    .returning({ id: leadsTable.id });
+  const [leadOldNew] = await tdb.db
+    .insert(leadsTable)
+    .values({ url: "https://old-new.example", status: "new", reviewedAt: daysBefore(375) })
+    .returning({ id: leadsTable.id });
+  // COALESCE fallback: no reviewedAt at all, but createdAt is old — must still be caught.
+  const [leadOldDismissedNoReview] = await tdb.db
+    .insert(leadsTable)
+    .values({ url: "https://old-dismissed.example", status: "dismissed", createdAt: daysBefore(375) })
+    .returning({ id: leadsTable.id });
+
+  // submissions: retention window 90 days, status != pending, strips provenance.submitterIpHash only.
+  const [subOldReviewed] = await tdb.db
+    .insert(submissionsTable)
+    .values({
+      kind: "create",
+      status: "approved",
+      payload: {},
+      provenance: { submitterIpHash: "hash-old", sources: ["https://a.example"] },
+      reviewedAt: daysBefore(100),
+    })
+    .returning({ id: submissionsTable.id });
+  const [subFreshReviewed] = await tdb.db
+    .insert(submissionsTable)
+    .values({
+      kind: "create",
+      status: "approved",
+      payload: {},
+      provenance: { submitterIpHash: "hash-fresh", sources: ["https://b.example"] },
+      reviewedAt: daysBefore(80),
+    })
+    .returning({ id: submissionsTable.id });
+  // Protected: still pending, despite an old reviewedAt-shaped value — proves the
+  // status!='pending' predicate itself protects it, not merely a null reviewedAt.
+  const [subOldPending] = await tdb.db
+    .insert(submissionsTable)
+    .values({
+      kind: "create",
+      status: "pending",
+      payload: {},
+      provenance: { submitterIpHash: "hash-pending", sources: [] },
+      reviewedAt: daysBefore(100),
+    })
+    .returning({ id: submissionsTable.id });
+
+  // subscriptions: retention window 30 days, status == unsubscribed only.
+  const [subscriptionOldUnsub] = await tdb.db
+    .insert(subscriptionsTable)
+    .values({
+      email: "unsub-old@example.com",
+      targetType: "facility",
+      targetId: "facility-a",
+      status: "unsubscribed",
+      confirmToken: "token-unsub-old",
+      unsubscribeToken: "unsub-token-old",
+      unsubscribedAt: daysBefore(40),
+    })
+    .returning({ id: subscriptionsTable.id });
+  const [subscriptionFreshUnsub] = await tdb.db
+    .insert(subscriptionsTable)
+    .values({
+      email: "unsub-fresh@example.com",
+      targetType: "facility",
+      targetId: "facility-b",
+      status: "unsubscribed",
+      confirmToken: "token-unsub-fresh",
+      unsubscribeToken: "unsub-token-fresh",
+      unsubscribedAt: daysBefore(20),
+    })
+    .returning({ id: subscriptionsTable.id });
+  const [subscriptionOldConfirmed] = await tdb.db
+    .insert(subscriptionsTable)
+    .values({
+      email: "confirmed-old@example.com",
+      targetType: "facility",
+      targetId: "facility-c",
+      status: "confirmed",
+      confirmToken: "token-confirmed-old",
+      unsubscribeToken: "unsub-token-confirmed-old",
+      confirmedAt: daysBefore(400),
+    })
+    .returning({ id: subscriptionsTable.id });
+
+  // subscribe_attempts: retention window 2 days, by createdAt. These are the
+  // per-IP subscribe rate-limit counters; the cap window is one hour, so they
+  // are the shortest-lived PII-bearing rows in the schema.
+  const [attemptOld] = await tdb.db
+    .insert(subscribeAttemptsTable)
+    .values({ submitterIpHash: "attempt-hash-old", createdAt: daysBefore(3) })
+    .returning({ id: subscribeAttemptsTable.id });
+  const [attemptFresh] = await tdb.db
+    .insert(subscribeAttemptsTable)
+    .values({ submitterIpHash: "attempt-hash-fresh", createdAt: daysBefore(1) })
+    .returning({ id: subscribeAttemptsTable.id });
+
+  // intake_attempts: retention window 2 days, by createdAt — the exact sibling
+  // of subscribe_attempts above, for the other four public write surfaces. The
+  // predicate is deliberately NOT scoped by `surface` (every surface shares the
+  // 1h cap window), so the old row from one surface and the old row from another
+  // must BOTH be candidates while the fresh one survives.
+  const [intakeOldContribute] = await tdb.db
+    .insert(intakeAttemptsTable)
+    .values({ surface: "contribute", submitterIpHash: "intake-hash-old-a", createdAt: daysBefore(3) })
+    .returning({ id: intakeAttemptsTable.id });
+  const [intakeOldContact] = await tdb.db
+    .insert(intakeAttemptsTable)
+    .values({ surface: "contact", submitterIpHash: "intake-hash-old-b", createdAt: daysBefore(5) })
+    .returning({ id: intakeAttemptsTable.id });
+  const [intakeFresh] = await tdb.db
+    .insert(intakeAttemptsTable)
+    .values({ surface: "leads", submitterIpHash: "intake-hash-fresh", createdAt: daysBefore(1) })
+    .returning({ id: intakeAttemptsTable.id });
+
+  // submission_notify_requests: retention window 90 days, by createdAt — a
+  // surviving row this old means its submission was never reviewed (a
+  // reviewed one is deleted immediately, well inside the window).
+  const [notifyOld] = await tdb.db
+    .insert(submissionNotifyRequestsTable)
+    .values({ submissionId: randomUUID(), email: "notify-old@example.com", createdAt: daysBefore(100) })
+    .returning({ id: submissionNotifyRequestsTable.id });
+  const [notifyFresh] = await tdb.db
+    .insert(submissionNotifyRequestsTable)
+    .values({ submissionId: randomUUID(), email: "notify-fresh@example.com", createdAt: daysBefore(80) })
+    .returning({ id: submissionNotifyRequestsTable.id });
+
+  // api_access_grants: retention window 90 days, (revoked AND revokedAt old) OR (expiresAt old).
+  const [grantOldRevoked] = await tdb.db
+    .insert(apiAccessGrantsTable)
+    .values({ email: "revoked-old@example.com", status: "revoked", confirmToken: "c1", revokedAt: daysBefore(100) })
+    .returning({ id: apiAccessGrantsTable.id });
+  const [grantFreshRevoked] = await tdb.db
+    .insert(apiAccessGrantsTable)
+    .values({ email: "revoked-fresh@example.com", status: "revoked", confirmToken: "c2", revokedAt: daysBefore(80) })
+    .returning({ id: apiAccessGrantsTable.id });
+  const [grantOldExpired] = await tdb.db
+    .insert(apiAccessGrantsTable)
+    .values({ email: "expired-old@example.com", status: "active", confirmToken: "c3", expiresAt: daysBefore(100) })
+    .returning({ id: apiAccessGrantsTable.id });
+  const [grantActiveFuture] = await tdb.db
+    .insert(apiAccessGrantsTable)
+    .values({
+      email: "active-future@example.com",
+      status: "active",
+      confirmToken: "c4",
+      expiresAt: new Date(NOW.getTime() + 30 * DAY_MS),
+    })
+    .returning({ id: apiAccessGrantsTable.id });
+
+  // api_daily_usage: retention window 35 days, `day` is a plain YYYY-MM-DD string.
+  const oldDay = daysBefore(45).toISOString().slice(0, 10);
+  const freshDay = daysBefore(20).toISOString().slice(0, 10);
+  const [usageOld] = await tdb.db
+    .insert(apiDailyUsageTable)
+    .values({ ipHash: "ip-old", day: oldDay, count: 3 })
+    .returning({ id: apiDailyUsageTable.id });
+  const [usageFresh] = await tdb.db
+    .insert(apiDailyUsageTable)
+    .values({ ipHash: "ip-fresh", day: freshDay, count: 3 })
+    .returning({ id: apiDailyUsageTable.id });
+
+  return {
+    contactOld: contactOld.id,
+    contactFresh: contactFresh.id,
+    leadOldPromoted: leadOldPromoted.id,
+    leadFreshPromoted: leadFreshPromoted.id,
+    leadOldNew: leadOldNew.id,
+    leadOldDismissedNoReview: leadOldDismissedNoReview.id,
+    subOldReviewed: subOldReviewed.id,
+    subFreshReviewed: subFreshReviewed.id,
+    subOldPending: subOldPending.id,
+    subscriptionOldUnsub: subscriptionOldUnsub.id,
+    subscriptionFreshUnsub: subscriptionFreshUnsub.id,
+    subscriptionOldConfirmed: subscriptionOldConfirmed.id,
+    attemptOld: attemptOld.id,
+    attemptFresh: attemptFresh.id,
+    intakeOldContribute: intakeOldContribute.id,
+    intakeOldContact: intakeOldContact.id,
+    intakeFresh: intakeFresh.id,
+    notifyOld: notifyOld.id,
+    notifyFresh: notifyFresh.id,
+    grantOldRevoked: grantOldRevoked.id,
+    grantFreshRevoked: grantFreshRevoked.id,
+    grantOldExpired: grantOldExpired.id,
+    grantActiveFuture: grantActiveFuture.id,
+    usageOld: usageOld.id,
+    usageFresh: usageFresh.id,
+  };
+}
+
+describe("runRetentionPrune — dry run", () => {
+  it("selects and counts candidates across every table but writes and deletes nothing", async () => {
+    await seedAllTables();
+
+    const summary = await runRetentionPrune({ apply: false, now: NOW, backupDir });
+
+    expect(summary.dryRun).toBe(true);
+    expect(summary.backupPath).toBeNull();
+    expect(summary.ok).toBe(true);
+
+    const byTable = Object.fromEntries(summary.tables.map((t) => [t.table, t]));
+    expect(byTable.contact_messages.candidates).toBe(1);
+    expect(byTable.leads.candidates).toBe(2); // old-promoted + old-dismissed-no-review
+    expect(byTable.submissions.candidates).toBe(1);
+    expect(byTable.subscriptions.candidates).toBe(1);
+    expect(byTable.subscribe_attempts.candidates).toBe(1);
+    expect(byTable.intake_attempts.candidates).toBe(2); // both old rows, across two surfaces
+    expect(byTable.submission_notify_requests.candidates).toBe(1);
+    expect(byTable.api_access_grants.candidates).toBe(2); // old-revoked + old-expired
+    expect(byTable.api_daily_usage.candidates).toBe(1);
+    for (const t of summary.tables) {
+      expect(t.applied).toBe(0);
+    }
+
+    // Nothing written: no backup dir/files, no rows removed, no provenance stripped.
+    expect(() => readdirSync(backupDir)).toThrow();
+    expect(await tdb.db.select().from(subscribeAttemptsTable)).toHaveLength(2);
+    expect(await tdb.db.select().from(intakeAttemptsTable)).toHaveLength(3);
+    expect(await tdb.db.select().from(submissionNotifyRequestsTable)).toHaveLength(2);
+    expect(await tdb.db.select().from(contactMessagesTable)).toHaveLength(2);
+    expect(await tdb.db.select().from(leadsTable)).toHaveLength(4);
+    const submissions = await tdb.db.select().from(submissionsTable);
+    expect(submissions).toHaveLength(3);
+    for (const s of submissions) {
+      expect((s.provenance as Record<string, unknown>).submitterIpHash).toBeDefined();
+    }
+  });
+});
+
+describe("runRetentionPrune — apply", () => {
+  it("mutates only rows past their retention window and leaves everything else untouched", async () => {
+    const ids = await seedAllTables();
+
+    const summary = await runRetentionPrune({ apply: true, now: NOW, backupDir });
+
+    expect(summary.dryRun).toBe(false);
+    expect(summary.ok).toBe(true);
+    expect(summary.backupPath).toBeTruthy();
+
+    const byTable = Object.fromEntries(summary.tables.map((t) => [t.table, t]));
+    expect(byTable.contact_messages).toMatchObject({ candidates: 1, applied: 1 });
+    expect(byTable.leads).toMatchObject({ candidates: 2, applied: 2 });
+    expect(byTable.submissions).toMatchObject({ candidates: 1, applied: 1, action: "strip-ip-hash" });
+    expect(byTable.subscriptions).toMatchObject({ candidates: 1, applied: 1 });
+    expect(byTable.subscribe_attempts).toMatchObject({ candidates: 1, applied: 1 });
+    expect(byTable.intake_attempts).toMatchObject({ candidates: 2, applied: 2 });
+    expect(byTable.submission_notify_requests).toMatchObject({ candidates: 1, applied: 1 });
+    expect(byTable.api_access_grants).toMatchObject({ candidates: 2, applied: 2 });
+    expect(byTable.api_daily_usage).toMatchObject({ candidates: 1, applied: 1 });
+
+    // contact_messages: only the old row is gone.
+    const remainingContacts = await tdb.db.select().from(contactMessagesTable);
+    expect(remainingContacts.map((r) => r.id)).toEqual([ids.contactFresh]);
+
+    // leads: old-promoted and old-dismissed-no-review are gone; fresh-promoted and
+    // the status='new' row (however old) survive.
+    const remainingLeads = await tdb.db.select().from(leadsTable);
+    expect(new Set(remainingLeads.map((r) => r.id))).toEqual(
+      new Set([ids.leadFreshPromoted, ids.leadOldNew])
+    );
+
+    // submissions: no row is ever deleted; only the reviewed+old row loses its hash.
+    const remainingSubs = await tdb.db.select().from(submissionsTable);
+    expect(remainingSubs).toHaveLength(3);
+    const subOld = remainingSubs.find((r) => r.id === ids.subOldReviewed)!;
+    expect((subOld.provenance as Record<string, unknown>).submitterIpHash).toBeUndefined();
+    expect((subOld.provenance as { sources: string[] }).sources).toEqual(["https://a.example"]); // other keys survive
+    const subFresh = remainingSubs.find((r) => r.id === ids.subFreshReviewed)!;
+    expect((subFresh.provenance as Record<string, unknown>).submitterIpHash).toBe("hash-fresh");
+    const subPending = remainingSubs.find((r) => r.id === ids.subOldPending)!;
+    expect((subPending.provenance as Record<string, unknown>).submitterIpHash).toBe("hash-pending");
+
+    // subscriptions: only the old unsubscribed row is gone.
+    const remainingSubscriptions = await tdb.db.select().from(subscriptionsTable);
+    expect(new Set(remainingSubscriptions.map((r) => r.id))).toEqual(
+      new Set([ids.subscriptionFreshUnsub, ids.subscriptionOldConfirmed])
+    );
+
+    // subscribe_attempts: only the 3-day-old counter row is gone.
+    const remainingAttempts = await tdb.db.select().from(subscribeAttemptsTable);
+    expect(remainingAttempts.map((r) => r.id)).toEqual([ids.attemptFresh]);
+
+    // intake_attempts: both aged rows are gone regardless of surface, the fresh
+    // one survives — the prune is by age only, never per-surface.
+    const remainingIntake = await tdb.db.select().from(intakeAttemptsTable);
+    expect(remainingIntake.map((r) => r.id)).toEqual([ids.intakeFresh]);
+
+    // submission_notify_requests: only the never-reviewed (100-day-old) row is gone.
+    const remainingNotify = await tdb.db.select().from(submissionNotifyRequestsTable);
+    expect(remainingNotify.map((r) => r.id)).toEqual([ids.notifyFresh]);
+
+    // api_access_grants: both the old-revoked and old-expired rows are gone.
+    const remainingGrants = await tdb.db.select().from(apiAccessGrantsTable);
+    expect(new Set(remainingGrants.map((r) => r.id))).toEqual(
+      new Set([ids.grantFreshRevoked, ids.grantActiveFuture])
+    );
+
+    // api_daily_usage: only the old day-bucket is gone.
+    const remainingUsage = await tdb.db.select().from(apiDailyUsageTable);
+    expect(remainingUsage.map((r) => r.id)).toEqual([ids.usageFresh]);
+
+    // Backup file: exactly one JSONL line per applied mutation, correctly tagged.
+    const lines = readBackupLines();
+    expect(lines).toHaveLength(12); // 1+2+1+1+1+2+1+2+1 == sum of `applied` above
+    const byId = Object.fromEntries(lines.map((l) => [l.row.id, l]));
+    expect(byId[ids.contactOld]).toMatchObject({ table: "contact_messages", action: "delete" });
+    expect(byId[ids.leadOldPromoted]).toMatchObject({ table: "leads", action: "delete" });
+    expect(byId[ids.leadOldDismissedNoReview]).toMatchObject({ table: "leads", action: "delete" });
+    expect(byId[ids.subOldReviewed]).toMatchObject({ table: "submissions", action: "strip-ip-hash" });
+    expect(byId[ids.subscriptionOldUnsub]).toMatchObject({ table: "subscriptions", action: "delete" });
+    expect(byId[ids.attemptOld]).toMatchObject({ table: "subscribe_attempts", action: "delete" });
+    expect(byId[ids.intakeOldContribute]).toMatchObject({ table: "intake_attempts", action: "delete" });
+    expect(byId[ids.intakeOldContact]).toMatchObject({ table: "intake_attempts", action: "delete" });
+    expect(byId[ids.notifyOld]).toMatchObject({ table: "submission_notify_requests", action: "delete" });
+    expect(byId[ids.grantOldRevoked]).toMatchObject({ table: "api_access_grants", action: "delete" });
+    expect(byId[ids.grantOldExpired]).toMatchObject({ table: "api_access_grants", action: "delete" });
+    expect(byId[ids.usageOld]).toMatchObject({ table: "api_daily_usage", action: "delete" });
+    // Rows that must NOT appear in the backup at all (never touched).
+    for (const untouchedId of [ids.contactFresh, ids.leadFreshPromoted, ids.leadOldNew, ids.subFreshReviewed, ids.subOldPending, ids.attemptFresh, ids.intakeFresh, ids.notifyFresh]) {
+      expect(byId[untouchedId]).toBeUndefined();
+    }
+  });
+});
+
+describe("runRetentionPrune — window boundary", () => {
+  it("a row exactly one day inside the contact_messages window survives; one day outside is deleted", async () => {
+    const [insideId] = (
+      await tdb.db
+        .insert(contactMessagesTable)
+        .values({
+          name: "Inside",
+          email: "inside@example.com",
+          topic: "other",
+          message: "inside window",
+          createdAt: daysBefore(179), // 180-day window minus 1 day => still inside
+        })
+        .returning({ id: contactMessagesTable.id })
+    );
+    const [outsideId] = (
+      await tdb.db
+        .insert(contactMessagesTable)
+        .values({
+          name: "Outside",
+          email: "outside@example.com",
+          topic: "other",
+          message: "outside window",
+          createdAt: daysBefore(181), // 180-day window plus 1 day => outside
+        })
+        .returning({ id: contactMessagesTable.id })
+    );
+
+    const summary = await runRetentionPrune({ apply: true, now: NOW, backupDir });
+    expect(summary.ok).toBe(true);
+
+    const remaining = await tdb.db.select().from(contactMessagesTable);
+    expect(remaining.map((r) => r.id)).toEqual([insideId.id]);
+    const lines = readBackupLines();
+    expect(lines.map((l) => l.row.id)).toEqual([outsideId.id]);
+  });
+});
+
+// Isolated (not folded into seedAllTables/the dry-run/apply tests above) so a
+// new table here never has to touch that fixture's many hardcoded per-table
+// candidate/applied counts and the aggregate backup-line count — same
+// self-contained shape as "window boundary" above.
+describe("runRetentionPrune — submission_notify_sends (persistent send-attempt counter)", () => {
+  it("a 70-day-old row is a candidate; a 50-day-old row is not", async () => {
+    const [oldId] = await tdb.db
+      .insert(submissionNotifySendsTable)
+      .values({ emailHash: "hash-old", createdAt: daysBefore(70) })
+      .returning({ id: submissionNotifySendsTable.id });
+    const [freshId] = await tdb.db
+      .insert(submissionNotifySendsTable)
+      .values({ emailHash: "hash-fresh", createdAt: daysBefore(50) })
+      .returning({ id: submissionNotifySendsTable.id });
+
+    const summary = await runRetentionPrune({ apply: true, now: NOW, backupDir });
+    expect(summary.ok).toBe(true);
+
+    const outcome = summary.tables.find((t) => t.table === "submission_notify_sends")!;
+    expect(outcome).toMatchObject({ candidates: 1, applied: 1, action: "delete" });
+
+    const remaining = await tdb.db.select().from(submissionNotifySendsTable);
+    expect(remaining.map((r) => r.id)).toEqual([freshId.id]);
+
+    const lines = readBackupLines();
+    expect(lines.map((l) => l.row.id)).toEqual([oldId.id]);
+    expect(lines[0]).toMatchObject({ table: "submission_notify_sends", action: "delete" });
+  });
+});
+
+describe("runRetentionPrune — backup failure is back-up-or-abort", () => {
+  it("skips the mutation, leaves the row in place, and reports failure when the backup path can't be written", async () => {
+    // Occupy the backup directory's path with a plain FILE, so mkdirSync(...,
+    // {recursive:true}) inside appendBackup throws instead of creating a dir.
+    writeFileSync(backupDir, "not a directory");
+
+    const [contactOld] = await tdb.db
+      .insert(contactMessagesTable)
+      .values({
+        name: "Old Sender",
+        email: "old@example.com",
+        topic: "other",
+        message: "old message",
+        createdAt: daysBefore(190),
+      })
+      .returning({ id: contactMessagesTable.id });
+
+    const summary = await runRetentionPrune({ apply: true, now: NOW, backupDir });
+
+    expect(summary.ok).toBe(false);
+    const contactOutcome = summary.tables.find((t) => t.table === "contact_messages")!;
+    expect(contactOutcome.candidates).toBe(1);
+    expect(contactOutcome.applied).toBe(0);
+    expect(contactOutcome.error).toMatch(/backup failed, mutation skipped/);
+
+    // The row survives — the mutation was never attempted.
+    const remaining = await tdb.db.select().from(contactMessagesTable);
+    expect(remaining.map((r) => r.id)).toEqual([contactOld.id]);
+  });
+});
+
+describe("runRetentionPrune — email_sends (outbound send log)", () => {
+  it("a 200-day-old row is a candidate; a 170-day-old row is not", async () => {
+    const [oldId] = await tdb.db
+      .insert(emailSendsTable)
+      .values({ kind: "confirm", emailHash: "hash-old", createdAt: daysBefore(200) })
+      .returning({ id: emailSendsTable.id });
+    const [freshId] = await tdb.db
+      .insert(emailSendsTable)
+      .values({ kind: "confirm", emailHash: "hash-fresh", createdAt: daysBefore(170) })
+      .returning({ id: emailSendsTable.id });
+
+    const summary = await runRetentionPrune({ apply: true, now: NOW, backupDir });
+    expect(summary.ok).toBe(true);
+
+    const outcome = summary.tables.find((t) => t.table === "email_sends")!;
+    expect(outcome).toMatchObject({ candidates: 1, applied: 1, action: "delete" });
+
+    const remaining = await tdb.db.select().from(emailSendsTable);
+    expect(remaining.map((r) => r.id)).toEqual([freshId.id]);
+    expect(readBackupLines().map((l) => l.row.id)).toEqual([oldId.id]);
+  });
+
+  it("retention is at least 3x the confirm-cap window, so pruning can never shorten the cap", () => {
+    expect(EMAIL_SENDS_RETENTION_DAYS * 86_400_000).toBeGreaterThanOrEqual(3 * CONFIRM_CAP_WINDOW_MS);
+  });
+});

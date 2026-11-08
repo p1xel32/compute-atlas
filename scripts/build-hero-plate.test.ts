@@ -1,0 +1,638 @@
+import { mkdtempSync, readFileSync, statSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { describe, it, expect } from "vitest";
+
+import facilitiesRaw from "@/data/facilities.json";
+import metaRaw from "@/data/facilities.meta.json";
+import { HERO_PLATE } from "@/components/home/hero-plate-paths";
+import { STATUS_ORDER as STATUS_ORDER_FROM_LIB } from "@/lib/status";
+import {
+  makeAlbersUsa,
+  buildPlateData,
+  renderModule,
+  assertUsableAsOf,
+  buildHeroPlate,
+  buildOutlines,
+  OUTLINE_BYTE_BUDGET,
+  OMITTED_JURISDICTIONS,
+  STATUS_ORDER,
+  WIDTH,
+  HEIGHT,
+} from "./build-hero-plate.mjs";
+
+/** The subset of a facility this generator reads. */
+interface PlateFacility {
+  id: string;
+  status: string;
+  location: { lat: number; lon: number; state: string };
+}
+
+const HERE = dirname(fileURLToPath(import.meta.url));
+const facilities = facilitiesRaw as unknown as PlateFacility[];
+
+/**
+ * The fixture (tests/fixtures) has Alaska records but no Hawaii or territory
+ * records, which the real dataset does (see build-hero-plate.dataset.test.ts).
+ * These synthetic ones keep the Hawaii inset and territory-omission checks from
+ * running over zero items. They are appended only where those checks need them.
+ */
+const SYNTHETIC_HAWAII: PlateFacility[] = [
+  { id: "synthetic-honolulu-hi", status: "operational", location: { lat: 21.3069, lon: -157.8583, state: "HI" } },
+  { id: "synthetic-kahului-hi", status: "proposed", location: { lat: 20.8893, lon: -156.4729, state: "HI" } },
+];
+const SYNTHETIC_TERRITORIES: PlateFacility[] = [
+  { id: "synthetic-guam", status: "operational", location: { lat: 13.4443, lon: 144.7937, state: "GU" } },
+  { id: "synthetic-saipan", status: "proposed", location: { lat: 15.1778, lon: 145.7501, state: "MP" } },
+  { id: "synthetic-san-juan", status: "permitted", location: { lat: 18.4655, lon: -66.1057, state: "PR" } },
+  { id: "synthetic-st-thomas", status: "cancelled", location: { lat: 18.3358, lon: -64.8963, state: "VI" } },
+];
+const plateInput = [...facilities, ...SYNTHETIC_HAWAII, ...SYNTHETIC_TERRITORIES];
+const usTopology = JSON.parse(
+  readFileSync(resolve(HERE, "../node_modules/us-atlas/states-10m.json"), "utf8"),
+);
+
+/**
+ * Anchors verified against d3-geo's albersUsa at the reference framing
+ * (960x600, scale 1070). Deliberately written as LITERALS rather than derived
+ * from the projection under test — a derived expectation cannot fail.
+ */
+const ANCHORS: Array<[name: string, lon: number, lat: number, x: number, y: number]> = [
+  ["Seattle", -122.3321, 47.6062, 159, 47],
+  ["Los Angeles", -118.2437, 34.0522, 150, 308],
+  ["Denver", -104.9903, 39.7392, 361, 234],
+  ["Chicago", -87.6298, 41.8781, 604, 195],
+  ["Loudoun VA", -77.5636, 39.0437, 752, 227],
+  ["Miami", -80.1918, 25.7617, 756, 480],
+  ["Houston", -95.3698, 29.7604, 499, 428],
+  ["Portland ME", -70.2553, 43.6591, 831, 120],
+  ["geographic centre", -98.5, 39.5, 453, 244],
+];
+
+function facility(
+  over: Partial<PlateFacility> & { location?: Partial<PlateFacility["location"]> } = {},
+): PlateFacility {
+  return {
+    id: over.id ?? "test-facility",
+    status: over.status ?? "operational",
+    location: {
+      lat: over.location?.lat ?? 39.5,
+      lon: over.location?.lon ?? -98.5,
+      state: over.location?.state ?? "KS",
+    },
+  };
+}
+
+describe("STATUS_ORDER — duplicated from lib/status.ts", () => {
+  it("matches lib/status.ts exactly, including ORDER", () => {
+    // The generated module is `as const satisfies HeroPlate` over
+    // `Record<Status, ...>`, which catches an ADD or a RENAME at typecheck but
+    // NOT a reorder — key order is not part of a Record's type. Order is the
+    // SVG paint order here, so a silent reorder changes which status draws on
+    // top of which. This equality is the only thing that catches it, which is
+    // why it compares two independently-declared lists rather than deriving
+    // one from the other.
+    expect(STATUS_ORDER).toEqual([...STATUS_ORDER_FROM_LIB]);
+  });
+});
+
+describe("makeAlbersUsa — projection", () => {
+  const project = makeAlbersUsa(960, 600);
+
+  it.each(ANCHORS)(
+    "places %s at the verified anchor",
+    (_name, lon, lat, x, y) => {
+      const [px, py] = project(lon, lat, "XX") as [number, number];
+      // +/-1px: the anchors are integers, the projection is continuous.
+      expect(Math.round(px)).toBeGreaterThanOrEqual(x - 1);
+      expect(Math.round(px)).toBeLessThanOrEqual(x + 1);
+      expect(Math.round(py)).toBeGreaterThanOrEqual(y - 1);
+      expect(Math.round(py)).toBeLessThanOrEqual(y + 1);
+    },
+  );
+
+  it("scales anchors uniformly to the production viewBox", () => {
+    // The 1600x1000 plate keeps the reference 8:5 ratio precisely so every
+    // anchor scales by WIDTH/960 in BOTH axes. If this breaks, the anchor set
+    // above has silently stopped being an oracle for the shipped framing.
+    const big = makeAlbersUsa(WIDTH, HEIGHT);
+    const k = WIDTH / 960;
+    // The anchors are integers carrying the same +/-1px the test above allows,
+    // so scaling by k amplifies that to +/-k. Anything beyond is a framing
+    // change, not rounding.
+    const tolerance = k + 0.01;
+    for (const [, lon, lat, x, y] of ANCHORS) {
+      const [px, py] = big(lon, lat, "XX") as [number, number];
+      expect(Math.abs(px - x * k)).toBeLessThanOrEqual(tolerance);
+      expect(Math.abs(py - y * k)).toBeLessThanOrEqual(tolerance);
+    }
+  });
+});
+
+describe("makeAlbersUsa — y orientation (screen space, not math space)", () => {
+  // The standard Albers formula returns NORTH-POSITIVE y; screen space is
+  // south-positive. A naive port that drops the negation in makeAlbers renders
+  // the map upside down. An anchor list alone can miss this, because under a
+  // pure flip every anchor moves together and a sloppier tolerance would still
+  // pass — so assert the ORDERING directly, independently of any anchor value.
+  const project = makeAlbersUsa(WIDTH, HEIGHT);
+  const yOf = (lon: number, lat: number) => (project(lon, lat, "XX") as [number, number])[1];
+
+  it("puts Seattle above Miami", () => {
+    expect(yOf(-122.3321, 47.6062)).toBeLessThan(yOf(-80.1918, 25.7617));
+  });
+
+  it("puts Portland ME above Houston", () => {
+    expect(yOf(-70.2553, 43.6591)).toBeLessThan(yOf(-95.3698, 29.7604));
+  });
+
+  it("puts the northern border above the southern border at one longitude", () => {
+    // Same lon, so only latitude varies: nothing but the flip can explain it.
+    expect(yOf(-98.5, 48.9)).toBeLessThan(yOf(-98.5, 26.0));
+  });
+
+  it("keeps x increasing west to east", () => {
+    const xOf = (lon: number, lat: number) =>
+      (project(lon, lat, "XX") as [number, number])[0];
+    expect(xOf(-122.3321, 47.6062)).toBeLessThan(xOf(-70.2553, 43.6591));
+  });
+});
+
+describe("makeAlbersUsa — AK and HI insets", () => {
+  const project = makeAlbersUsa(WIDTH, HEIGHT);
+
+  /**
+   * Where the inset marks actually land, at 1600x1000, plus a 15px margin
+   * (~1% of the width). Literals, not imported from the script and not derived
+   * from the projection under test.
+   *
+   * Bounded this tightly on purpose: the earlier boxes were 3-5x looser than
+   * the data — Alaska's marks span x 254-257 inside an asserted 150-420 — so
+   * an inset translate could have shifted ~80px and still passed, which is not
+   * an oracle. Mutation-checked: a 60px shift of the AK translate fails these.
+   *
+   * ⚠️ These bound TODAY'S mark clouds, not the insets' full drawable area
+   * (all of Alaska spans roughly x 67-404 in this framing). A genuinely new
+   * facility far from the existing ones can fail these legitimately. Widen
+   * them deliberately, after confirming the projection and the translates are
+   * unchanged — never to make an unexplained failure go quiet.
+   */
+  // x1 widened 272 -> 282 on 2026-09-28 for greensparc-cordova-ak (60.6099,
+  // -145.644), which projects to x=279.7 — the first facility in EASTERN
+  // Alaska; every other AK mark sits between x=247 and x=264. Widened per the
+  // note above, after confirming scripts/build-hero-plate.mjs is byte-identical
+  // to origin/main (projection, scale, translate, rotate, center, parallels all
+  // unchanged), so this is a genuinely new mark location and not drift. Cordova
+  // lands well inside Alaska's drawable span (x 67-404), so it renders on the
+  // landmass. The box stays an oracle: at 43px wide it still fails the
+  // mutation-checked 60px translate shift.
+  // x1 widened 282 -> 378 and y1 815 -> 846 on 2026-10-18 for the first two
+  // facilities in the Alaska PANHANDLE: greensparc-petersburg-ak (56.8125,
+  // -132.9556) projects to (358.5, 828.9) and greensparc-wrangell-ak (56.4708,
+  // -132.3767) to (363.0, 831.4); every other AK mark sits between x=247 and
+  // x=280. Widened per the note above, after confirming
+  // scripts/build-hero-plate.mjs has no diff against origin/main. Both land
+  // inside Alaska's drawable span (x 67-404), so they render on the landmass.
+  // The box still leaves at most 15px of slack beyond the mark cloud (x 247-363,
+  // y 701-831) on every side, so a 60px shift of the AK translate in any
+  // direction still pushes a mark out and fails this test.
+  const AK_MARKS = { x0: 239, y0: 686, x1: 378, y1: 846 };
+  const HI_MARKS = { x0: 552, y0: 817, x1: 650, y1: 891 };
+
+  /**
+   * The wider areas the insets RESERVE. Only the CONUS-collision test below
+   * uses these, and it wants them wide: a larger exclusion zone catches more
+   * near-misses, so tightening these would WEAKEN that oracle rather than
+   * sharpen it.
+   */
+  const AK_RESERVE = { x0: 150, y0: 660, x1: 420, y1: 1000 };
+  const HI_RESERVE = { x0: 500, y0: 800, x1: 700, y1: 960 };
+
+  const inBox = (p: [number, number], b: typeof AK_MARKS) =>
+    p[0] >= b.x0 && p[0] <= b.x1 && p[1] >= b.y0 && p[1] <= b.y1;
+
+  const akFacilities = plateInput.filter((f) => f.location.state === "AK");
+  const hiFacilities = plateInput.filter((f) => f.location.state === "HI");
+  const conusFacilities = plateInput.filter(
+    (f) =>
+      f.location.state !== "AK" &&
+      f.location.state !== "HI" &&
+      !OMITTED_JURISDICTIONS.has(f.location.state),
+  );
+
+  it("has Alaska and Hawaii facilities to place", () => {
+    // Guards the two suites below from passing vacuously on an empty filter.
+    // Alaska is real fixture data; Hawaii is the synthetic pair above.
+    expect(akFacilities.length).toBeGreaterThan(0);
+    expect(hiFacilities.length).toBeGreaterThan(0);
+  });
+
+  it("lands every Alaska facility inside the Alaska inset region", () => {
+    for (const f of akFacilities) {
+      const p = project(f.location.lon, f.location.lat, "AK") as [number, number];
+      expect({ id: f.id, inBox: inBox(p, AK_MARKS) }).toEqual({ id: f.id, inBox: true });
+    }
+  });
+
+  it("lands every Hawaii facility inside the Hawaii inset region", () => {
+    for (const f of hiFacilities) {
+      const p = project(f.location.lon, f.location.lat, "HI") as [number, number];
+      expect({ id: f.id, inBox: inBox(p, HI_MARKS) }).toEqual({ id: f.id, inBox: true });
+    }
+  });
+
+  it("draws no CONUS facility on top of either inset", () => {
+    const collisions = conusFacilities
+      .map((f) => ({
+        id: f.id,
+        p: project(f.location.lon, f.location.lat, f.location.state) as [number, number],
+      }))
+      .filter(({ p }) => inBox(p, AK_RESERVE) || inBox(p, HI_RESERVE))
+      .map(({ id }) => id);
+    expect(collisions).toEqual([]);
+  });
+
+  it("does not project Alaska into the CONUS conic", () => {
+    // Anchorage through the CONUS conic lands far from the inset; if the
+    // dispatch is dropped, this is what changes.
+    const inset = project(-149.9003, 61.2181, "AK") as [number, number];
+    const conus = project(-149.9003, 61.2181, "XX") as [number, number];
+    expect(Math.hypot(inset[0] - conus[0], inset[1] - conus[1])).toBeGreaterThan(200);
+  });
+});
+
+describe("makeAlbersUsa — unrepresentable jurisdictions", () => {
+  it("returns null for every territory code, by CODE not by longitude", () => {
+    for (const code of ["AS", "GU", "MP", "PR", "VI"]) {
+      // Coordinates deliberately inside the CONUS window: a longitude-range
+      // guess would happily plot these. Only a code check rejects them.
+      expect(project(code)).toBeNull();
+    }
+    function project(code: string) {
+      return makeAlbersUsa(WIDTH, HEIGHT)(-98.5, 39.5, code);
+    }
+  });
+
+  it("refuses to plot Guam through the CONUS conic", () => {
+    // +144.8 deg lon. Any lon-window heuristic ("west of -130 is an inset")
+    // misroutes this; the code check is the only thing that catches it.
+    expect(makeAlbersUsa(WIDTH, HEIGHT)(144.7937, 13.4443, "GU")).toBeNull();
+  });
+});
+
+describe("buildPlateData — the fixture dataset plus synthetic territories", () => {
+  const data = buildPlateData(plateInput, WIDTH, HEIGHT);
+
+  const territoryFacilities = plateInput.filter((f) =>
+    OMITTED_JURISDICTIONS.has(f.location.state),
+  );
+
+  // The real dataset's territory counts (9 facilities: GU 4, MP 2, PR 2, VI 1)
+  // are asserted in build-hero-plate.dataset.test.ts.
+  it("omits exactly the territory facilities, and reports them", () => {
+    expect(territoryFacilities).toHaveLength(SYNTHETIC_TERRITORIES.length);
+    expect(data.omitted).toBe(4);
+    expect(data.omittedJurisdictions).toEqual(["GU", "MP", "PR", "VI"]);
+  });
+
+  it("omits each territory facility individually", () => {
+    const byCode: Record<string, number> = {};
+    for (const f of territoryFacilities) {
+      byCode[f.location.state] = (byCode[f.location.state] ?? 0) + 1;
+    }
+    expect(byCode).toEqual({ GU: 1, MP: 1, PR: 1, VI: 1 });
+  });
+
+  it("reconciles plotted + deduped + omitted against the input length", () => {
+    expect(data.total).toBe(plateInput.length);
+    expect(data.plotted + data.deduped + data.omitted).toBe(plateInput.length);
+  });
+
+  it("counts drawn marks per status, summing to plotted", () => {
+    const sum = STATUS_ORDER.reduce((acc: number, s: string) => acc + data.counts[s], 0);
+    expect(sum).toBe(data.plotted);
+    // Every status in the dataset draws something — a silently empty path
+    // would just look like "no facilities have that status".
+    for (const status of STATUS_ORDER) {
+      expect({ status, marks: data.counts[status] > 0 }).toEqual({ status, marks: true });
+    }
+  });
+
+  it("collapses co-located same-status marks (and actually collapses some)", () => {
+    expect(data.deduped).toBeGreaterThan(0);
+    for (const status of STATUS_ORDER) {
+      const moves = data.paths[status].match(/M-?[\d.]+ -?[\d.]+/g) ?? [];
+      expect({ status, unique: new Set(moves).size }).toEqual({
+        status,
+        unique: moves.length,
+      });
+    }
+  });
+
+  it("emits `d` strings of integer zero-length subpaths, with no NaN", () => {
+    for (const status of STATUS_ORDER) {
+      const d = data.paths[status];
+      expect({ status, nan: d.includes("NaN") }).toEqual({ status, nan: false });
+      expect({ status, shape: /^(?:M\d+ \d+h\.01)+$/.test(d) }).toEqual({
+        status,
+        shape: true,
+      });
+      expect({ status, marks: d.split("h.01").length - 1 }).toEqual({
+        status,
+        marks: data.counts[status],
+      });
+    }
+  });
+
+  it("keeps every mark inside the viewBox", () => {
+    for (const status of STATUS_ORDER) {
+      for (const [, xs, ys] of data.paths[status].matchAll(/M(\d+) (\d+)h\.01/g)) {
+        const x = Number(xs);
+        const y = Number(ys);
+        expect(x).toBeGreaterThanOrEqual(0);
+        expect(x).toBeLessThanOrEqual(WIDTH);
+        expect(y).toBeGreaterThanOrEqual(0);
+        expect(y).toBeLessThanOrEqual(HEIGHT);
+      }
+    }
+  });
+});
+
+describe("buildPlateData — fails loudly rather than shipping a wrong plate", () => {
+  it("throws when a point projects outside the viewBox", () => {
+    // Mexico City, mislabeled as a CONUS jurisdiction: in-range coordinates,
+    // out-of-frame result. A silently clipped plate is the failure this catches.
+    expect(() =>
+      buildPlateData([facility({ location: { lat: 19.4326, lon: -99.1332, state: "TX" } })]),
+    ).toThrow(/outside the 1600x1000 viewBox/);
+  });
+
+  it("throws on an unrecognized status", () => {
+    expect(() => buildPlateData([facility({ status: "decommissioned" })])).toThrow(
+      /unrecognized status/,
+    );
+  });
+
+  it("throws on non-finite coordinates", () => {
+    expect(() =>
+      buildPlateData([
+        facility({ location: { lat: Number.NaN, lon: -98.5, state: "KS" } }),
+      ]),
+    ).toThrow(/non-finite coordinates/);
+  });
+
+  it("throws when location.state is missing or malformed", () => {
+    expect(() =>
+      buildPlateData([facility({ location: { lat: 39.5, lon: -98.5, state: "Kansas" } })]),
+    ).toThrow(/no usable location\.state/);
+  });
+
+  it("throws when handed something that is not an array", () => {
+    expect(() => buildPlateData({} as unknown as PlateFacility[])).toThrow(
+      /expected an array of facilities/,
+    );
+  });
+});
+
+// Whether the committed artifact is CURRENT against the real dataset (paths,
+// counts, asOf) is asserted in
+// build-hero-plate.dataset.test.ts: the fixture cannot reproduce a plate drawn
+// from the full data. Here, only what holds of the artifact on its own.
+describe("hero-plate-paths.ts — the committed artifact is self-consistent", () => {
+  it("reconciles plotted + deduped + omitted against its own total", () => {
+    expect(HERO_PLATE.plotted + HERO_PLATE.deduped + HERO_PLATE.omitted).toBe(HERO_PLATE.total);
+    const marks = STATUS_ORDER.reduce(
+      (acc: number, s: string) => acc + HERO_PLATE.counts[s as keyof typeof HERO_PLATE.counts],
+      0,
+    );
+    expect(marks).toBe(HERO_PLATE.plotted);
+  });
+
+  it("carries one well-formed zero-length-subpath string per status", () => {
+    for (const status of STATUS_ORDER) {
+      const d = HERO_PLATE.paths[status as keyof typeof HERO_PLATE.paths];
+      expect({ status, shape: /^(?:M\d+ \d+h\.01)+$/.test(d) }).toEqual({ status, shape: true });
+      expect({ status, marks: d.split("h.01").length - 1 }).toEqual({
+        status,
+        marks: HERO_PLATE.counts[status as keyof typeof HERO_PLATE.counts],
+      });
+    }
+  });
+
+  it("records the viewBox and the snapshot date it drew", () => {
+    expect(HERO_PLATE.viewBox).toBe(`0 0 ${WIDTH} ${HEIGHT}`);
+    expect(HERO_PLATE.width).toBe(WIDTH);
+    expect(HERO_PLATE.height).toBe(HEIGHT);
+    // The default run cannot compare asOf to the real dataset's meta (see
+    // build-hero-plate.dataset.test.ts); it proves only that the committed
+    // value is a usable ISO instant, not that it is the CURRENT snapshot.
+    expect(assertUsableAsOf(HERO_PLATE.asOf)).toBe(HERO_PLATE.asOf);
+  });
+
+  it("stays small enough to inline in the server-rendered markup", () => {
+    // The whole point is a phone-friendly alternative to the WebGL globe.
+    // Measured design target: ~20 KB of path data across 5 nodes.
+    const pathBytes = STATUS_ORDER.reduce(
+      (sum: number, s: string) => sum + HERO_PLATE.paths[s as keyof typeof HERO_PLATE.paths].length,
+      0,
+    );
+    expect(pathBytes).toBeLessThan(40_000);
+  });
+});
+
+describe("buildHeroPlate — leaves the frozen README map alone", () => {
+  it("does not write docs/media/map.svg", () => {
+    const svgPath = resolve(HERE, "../docs/media/map.svg");
+    const before = statSync(svgPath);
+    const bytesBefore = readFileSync(svgPath, "utf8");
+    const outPath = resolve(mkdtempSync(join(tmpdir(), "hero-plate-")), "hero-plate-paths.ts");
+    const result = buildHeroPlate({ outPath });
+    const after = statSync(svgPath);
+    expect(after.mtimeMs).toBe(before.mtimeMs);
+    expect(readFileSync(svgPath, "utf8")).toBe(bytesBefore);
+    expect(result).not.toHaveProperty("svgPath");
+    expect(result.outPath).toBe(outPath);
+    expect(readFileSync(outPath, "utf8")).toContain("GENERATED FILE");
+  });
+});
+
+describe("renderModule", () => {
+  const data = buildPlateData(
+    [
+      facility({ id: "a", status: "operational" }),
+      facility({ id: "b", status: "proposed", location: { lat: 41.8781, lon: -87.6298, state: "IL" } }),
+    ],
+    WIDTH,
+    HEIGHT,
+  );
+  const source = renderModule(data, "2026-01-01T00:00:00.000Z", WIDTH, HEIGHT);
+
+  it("marks the output as generated", () => {
+    expect(source).toContain("GENERATED FILE");
+    expect(source).toContain("scripts/build-hero-plate.mjs");
+  });
+
+  it("emits every status key even when a status has no marks", () => {
+    for (const status of STATUS_ORDER) {
+      expect({ status, present: source.includes(`    ${status}:`) }).toEqual({
+        status,
+        present: true,
+      });
+    }
+  });
+
+  it("carries the asOf it was given", () => {
+    expect(source).toContain('asOf: "2026-01-01T00:00:00.000Z"');
+  });
+});
+
+describe("assertUsableAsOf — a corrupt meta file must not emit a broken module", () => {
+  // `asOf` is interpolated into a double-quoted TS string literal by
+  // renderModule. A merely "non-empty string" check lets a value carrying a
+  // quote through, which emits a generated module that does not parse while the
+  // generator still exits 0 — the error then surfaces as a confusing typecheck
+  // failure in a file nobody hand-wrote. So the guard demands an ISO-8601
+  // instant.
+  const realAsOf = (metaRaw as { asOf: string }).asOf;
+
+  it("accepts the shape data/facilities.meta.json actually ships", () => {
+    // Keeps the pattern honest against production data rather than only
+    // against invented ones.
+    expect(assertUsableAsOf(realAsOf)).toBe(realAsOf);
+  });
+
+  it.each([
+    ["a closing quote, which breaks the generated string literal", '2026-09-15T13:17:42.320Z"'],
+    ["a quote plus injected source", '2026-01-01T00:00:00.000Z", evil: "yes'],
+    ["a bare date — plausible, but not an instant", "2026-09-15"],
+    ["a date-time with no zone", "2026-09-15T13:17:42"],
+    ["a local-offset instant", "2026-09-15T13:17:42+02:00"],
+    ["a newline inside the literal", "2026-09-15T13:17:42.320Z\n"],
+    ["free text", "just now"],
+    ["the empty string", ""],
+  ])("throws on %s", (_label, value) => {
+    expect(() => assertUsableAsOf(value)).toThrow(/no usable `asOf`/);
+  });
+
+  it.each([
+    ["undefined", undefined],
+    ["null", null],
+    ["a number", 1_757_941_062_320],
+    ["an object", { asOf: "2026-09-15T13:17:42.320Z" }],
+  ])("throws on %s", (_label, value) => {
+    expect(() => assertUsableAsOf(value)).toThrow(/no usable `asOf`/);
+  });
+
+  it("names the offending value in the error, so the fix is obvious", () => {
+    expect(() => assertUsableAsOf("2026-09-15")).toThrow(/"2026-09-15"/);
+  });
+});
+
+/** Decode `M x y l dx dy ...` path data (as emitted by buildOutlines) to absolute points. */
+function outlinePoints(d: string): Array<[number, number]> {
+  const pts: Array<[number, number]> = [];
+  for (const seg of d.split("M").filter(Boolean)) {
+    const [start, rel] = seg.split("l");
+    const [sx, sy] = start.trim().split(/\s+/).map(Number);
+    let x = sx;
+    let y = sy;
+    pts.push([x, y]);
+    const nums = (rel.match(/-?\d+/g) ?? []).map(Number);
+    for (let i = 0; i < nums.length; i += 2) {
+      x += nums[i];
+      y += nums[i + 1];
+      pts.push([x, y]);
+    }
+  }
+  return pts;
+}
+
+describe("buildOutlines — faint state linework", () => {
+  const outlines = buildOutlines(usTopology, WIDTH, HEIGHT);
+  const project = makeAlbersUsa(WIDTH, HEIGHT);
+  const nationPts = outlinePoints(outlines.nation);
+  const bbox = (pts: Array<[number, number]>) => ({
+    x0: Math.min(...pts.map((p) => p[0])),
+    x1: Math.max(...pts.map((p) => p[0])),
+    y0: Math.min(...pts.map((p) => p[1])),
+    y1: Math.max(...pts.map((p) => p[1])),
+  });
+
+  it("emits non-empty nation and border paths of the documented shape", () => {
+    expect(outlines.nation.length).toBeGreaterThan(1000);
+    expect(outlines.borders.length).toBeGreaterThan(1000);
+    for (const d of [outlines.nation, outlines.borders]) {
+      expect(/^(?:M\d+ \d+l(?:-?\d+(?: |(?=-))?)+)+$/.test(d)).toBe(true);
+    }
+  });
+
+  it("keeps every point inside the viewBox", () => {
+    for (const d of [outlines.nation, outlines.borders]) {
+      for (const [x, y] of outlinePoints(d)) {
+        expect(x).toBeGreaterThanOrEqual(0);
+        expect(x).toBeLessThanOrEqual(WIDTH);
+        expect(y).toBeGreaterThanOrEqual(0);
+        expect(y).toBeLessThanOrEqual(HEIGHT);
+      }
+    }
+  });
+
+  it("is deterministic and matches the committed artifact", () => {
+    expect(buildOutlines(usTopology, WIDTH, HEIGHT)).toEqual(outlines);
+    expect(HERO_PLATE.outlines).toEqual(outlines);
+  });
+
+  it("stays within the homepage HTML byte budget", () => {
+    expect(outlines.nation.length + outlines.borders.length).toBeLessThan(OUTLINE_BYTE_BUDGET);
+  });
+
+  it("aligns with the dots: CONUS cities fall inside the nation outline's bbox", () => {
+    // The CONUS nation outline spans the mainland only; AK/HI are separate insets.
+    const conus = bbox(nationPts.filter(([x, y]) => !(x < 430 && y > 580) && !(x < 720 && y > 780)));
+    for (const [, lon, lat] of ANCHORS) {
+      const [x, y] = project(lon, lat, "XX") as [number, number];
+      expect(x).toBeGreaterThan(conus.x0);
+      expect(x).toBeLessThan(conus.x1);
+      expect(y).toBeGreaterThan(conus.y0);
+      expect(y).toBeLessThan(conus.y1);
+    }
+  });
+
+  it("traces the CONUS coast where the dots are projected (Key West, Quoddy Head)", () => {
+    // Vertex proximity, not a bbox: a 15-unit x-shift was mutation-checked to
+    // fail this while the bbox test above still passed.
+    for (const [lon, lat] of [[-81.78, 24.55], [-66.95, 44.82]]) {
+      const [x, y] = project(lon, lat, "XX") as [number, number];
+      expect(nationPts.some(([px, py]) => Math.hypot(px - x, py - y) < 3)).toBe(true);
+    }
+  });
+
+  it("projects the Aleutians (Attu, ~172.9E) into the AK inset instead of off-plate", () => {
+    // Positive longitudes are shifted by -360 for AK so the conic does not wrap.
+    const [x, y] = project(172.9 - 360, 52.9, "AK") as [number, number];
+    expect(x).toBeGreaterThan(0);
+    expect(x).toBeLessThan(150); // west of the mainland-Alaska reserve, still on the plate
+    expect(y).toBeGreaterThan(660);
+    expect(y).toBeLessThan(HEIGHT);
+    expect(nationPts.some(([px, py]) => Math.hypot(px - x, py - y) < 8)).toBe(true);
+  });
+
+  it("puts the Alaska inset's outline where Alaska facilities are projected", () => {
+    // Point Barrow, the northernmost point of the US: a coastline extreme that
+    // simplification keeps. A vertex within 5 units proves the outline went
+    // through the AK inset projection exactly as the dots do (a 15-unit shift
+    // was mutation-checked to fail this).
+    const [ax, ay] = project(-156.4789, 71.2906, "AK") as [number, number];
+    const near = nationPts.some(([x, y]) => Math.hypot(x - ax, y - ay) < 5);
+    expect(near).toBe(true);
+    // ...and nothing from the AK outline leaks into the CONUS interior at the same lat/lon.
+    const [cx, cy] = project(-149.9003, 61.2181, "XX") as [number, number];
+    expect(nationPts.some(([x, y]) => Math.hypot(x - cx, y - cy) < 3)).toBe(false);
+  });
+
+  it("puts the Hawaii outline at the Hawaii inset (Ka Lae, the southernmost point)", () => {
+    const [hx, hy] = project(-155.6816, 18.9111, "HI") as [number, number];
+    expect(nationPts.some(([x, y]) => Math.hypot(x - hx, y - hy) < 5)).toBe(true);
+  });
+});

@@ -2,14 +2,17 @@ import Link from "next/link";
 import { Zap, Plug } from "lucide-react";
 
 import type { Facility } from "@/lib/schema";
+import { SectionGapPrompt } from "@/components/contribute/field-gap-prompt";
 import { getPoweredCampuses, getPoweredByGenerators } from "@/lib/data";
 import { getGenerationTechnologyLabel } from "@/lib/generation";
 import { getStatusMeta } from "@/lib/status";
 import { FACILITY_TYPE_META } from "@/lib/facility-type";
 import { formatCapacity, formatLocation } from "@/lib/format";
+import { Separator } from "@/components/ui/separator";
+import { MetaLine } from "./fact-row";
 
 const LINK_CLASSNAME =
-  "text-primary underline-offset-4 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 rounded-sm";
+  "text-primary underline-offset-4 hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring rounded-sm";
 
 // --- Predicate ---
 export async function hasPowerLinks(facility: Facility): Promise<boolean> {
@@ -45,11 +48,7 @@ async function PowersGroup({ facility }: { facility: Facility & { facilityType: 
                 <Link href={`/facilities/${c.id}`} className={LINK_CLASSNAME}>
                   {c.name}
                 </Link>
-                {metaParts.length > 0 && (
-                  <div className="text-muted-foreground text-xs mt-0.5">
-                    {metaParts.join(" · ")}
-                  </div>
-                )}
+                <MetaLine parts={metaParts} />
               </li>
             );
           })}
@@ -90,11 +89,7 @@ async function PoweredByGroup({ facility }: { facility: Facility }) {
             <Link href={`/facilities/${g.id}`} className={LINK_CLASSNAME}>
               {g.name}
             </Link>
-            {metaParts.length > 0 && (
-              <div className="text-muted-foreground text-xs mt-0.5">
-                {metaParts.join(" · ")}
-              </div>
-            )}
+            <MetaLine parts={metaParts} />
           </li>
         );
       })}
@@ -112,28 +107,39 @@ async function PoweredByGroup({ facility }: { facility: Facility }) {
 // Vitest under jsdom, and by any client-side re-render) cannot — resolving
 // here keeps the returned tree renderable by both.
 export async function PowerLinksSection({ facility }: { facility: Facility }) {
-  if (!(await hasPowerLinks(facility))) return null;
+  const isGenerator = facility.facilityType === "power_generation";
+  if (!(await hasPowerLinks(facility))) {
+    return (
+      <SectionGapPrompt
+        facilityId={facility.id}
+        facilityName={facility.name}
+        label={isGenerator ? "what this facility powers" : "its power supply"}
+      />
+    );
+  }
 
   const headingId = `power-links-${facility.id}`;
-  const isGenerator = facility.facilityType === "power_generation";
   const group = isGenerator
     ? await PowersGroup({ facility })
     : await PoweredByGroup({ facility });
 
   return (
-    <section aria-labelledby={headingId} className="space-y-4">
-      <h2
-        id={headingId}
-        className="font-display text-xl text-foreground mb-4 flex items-center gap-2"
-      >
-        {isGenerator ? (
-          <Zap className="size-5 text-primary" aria-hidden="true" />
-        ) : (
-          <Plug className="size-5 text-primary" aria-hidden="true" />
-        )}
-        {isGenerator ? "Powers" : "Power supply"}
-      </h2>
-      {group}
-    </section>
+    <>
+      <Separator />
+      <section aria-labelledby={headingId} className="space-y-4">
+        <h2
+          id={headingId}
+          className="font-display text-xl text-foreground mb-4 flex items-center gap-2"
+        >
+          {isGenerator ? (
+            <Zap className="size-5 text-primary" aria-hidden="true" />
+          ) : (
+            <Plug className="size-5 text-primary" aria-hidden="true" />
+          )}
+          {isGenerator ? "Powers" : "Power supply"}
+        </h2>
+        {group}
+      </section>
+    </>
   );
 }

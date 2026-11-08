@@ -9,12 +9,39 @@ setup() {
 	REPO_ROOT="$(cd "$(dirname "$BATS_TEST_FILENAME")/../.." && pwd)"
 	RUN_SH="$REPO_ROOT/scripts/discovery/run.sh"
 
+	# Portable timeout resolution (macOS lacks GNU `timeout` unless a
+	# coreutils-providing formula is installed) + the shared "tsx -e"
+	# import-safety script, both used only by the Task 7 "verification-gate
+	# import safety" tests near the bottom of this file — mirrors run.sh's
+	# own TIMEOUT_BIN resolution and the `npx tsx -e` inline script inside
+	# candidates_file_shape() exactly. (Cite names, not line numbers: see
+	# the note above notify() in run.sh.)
+	TIMEOUT_BIN=""
+	if command -v timeout >/dev/null 2>&1; then
+		TIMEOUT_BIN="timeout"
+	elif command -v gtimeout >/dev/null 2>&1; then
+		TIMEOUT_BIN="gtimeout"
+	fi
+	IMPORT_CHECK_SCRIPT='
+import { parseCandidatesJson } from "./scripts/discovery/submit-candidates.ts";
+import { readFileSync } from "node:fs";
+try {
+  const a = parseCandidatesJson(readFileSync(process.argv[1], "utf8"));
+  process.exit(Array.isArray(a) ? 0 : 1);
+} catch {
+  process.exit(1);
+}
+'
+
 	TEST_TMP="$(mktemp -d)"
 	HOME="$TEST_TMP/home"
 	mkdir -p "$HOME"
 
 	LOG_DIR="$TEST_TMP/discovery-logs"
 	mkdir -p "$LOG_DIR"
+
+	# claude's secret-free cwd; never let a test create the real-home default.
+	export DISCOVERY_WORK_DIR="$TEST_TMP/work"
 
 	BIN_DIR="$TEST_TMP/bin"
 	mkdir -p "$BIN_DIR"
@@ -25,10 +52,37 @@ setup() {
 	cat >"$BIN_DIR/claude" <<'EOF'
 #!/usr/bin/env bash
 echo "claude $*" >> "$CLAUDE_CALL_LOG"
+echo "cwd=$(pwd -P)" >> "$CLAUDE_CALL_LOG"
 echo '[]'
 exit 0
 EOF
 	chmod +x "$BIN_DIR/claude"
+
+	# --- fake submit-candidates: like the real script it leaves a
+	# run-<runId>.json summary for run.sh's false-OK guard. Counts come from
+	# the environment (default: nothing discovered);
+	# SUBMIT_COUNTS_<STATE>="<discovered> <skippedInvalid>" overrides per state;
+	# SUBMIT_SUMMARY_MODE=missing|garbage breaks the summary on purpose.
+	cat >"$BIN_DIR/fake-submit" <<'FAKE_SUBMIT_EOF'
+#!/usr/bin/env bash
+rid=""; st=""
+for a in "$@"; do
+	case "$a" in
+	--run-id=*) rid="${a#--run-id=}" ;;
+	--state=*) st="${a#--state=}" ;;
+	esac
+done
+var="SUBMIT_COUNTS_$st"
+counts="${!var:-${SUBMIT_COUNTS:-0 0}}"
+set -- $counts
+case "${SUBMIT_SUMMARY_MODE:-ok}" in
+missing) ;;
+garbage) echo "not json" >"$DISCOVERY_LOG_DIR/run-$rid.json" ;;
+*) printf '{"runId":"%s","discovered":%s,"submitted":0,"skippedInvalid":%s}\n' "$rid" "$1" "$2" >"$DISCOVERY_LOG_DIR/run-$rid.json" ;;
+esac
+exit 0
+FAKE_SUBMIT_EOF
+	chmod +x "$BIN_DIR/fake-submit"
 
 	# --- fake `npx`: intercepts the tsx helper invocations run.sh shells out
 	# to, so run.sh's own control flow is exercised without the real network
@@ -41,7 +95,7 @@ EOF
 echo "npx \$*" >>"$NPX_CALL_LOG"
 case "\$*" in
 *"tsx -e"*)
-	# The retry gate's candidates_file_has_array() validation call — MUST be
+	# The retry gate's candidates_file_shape() validation call — MUST be
 	# checked before the *submit-candidates.ts* case below, because this
 	# call's inline script imports from "./scripts/discovery/submit-candidates.ts",
 	# which would otherwise match that case first. Delegate to the REAL
@@ -55,12 +109,12 @@ case "\$*" in
 	exit 0
 	;;
 *submit-candidates.ts*)
-	exit 0
+	exec "$BIN_DIR/fake-submit" "\$@"
 	;;
 *check-sources.ts*)
-	# Simulate the shimmed failure/empty-input case; run.sh appends "|| true"
-	# to this call so a nonzero exit here must NOT fail the overall run.
-	exit 1
+	# Healthy by default. A nonzero exit is a recorded FAILURES entry (see the
+	# source-liveness tests), so tests that want one set CHECK_SOURCES_RC.
+	exit \${CHECK_SOURCES_RC:-0}
 	;;
 *)
 	exit 0
@@ -69,9 +123,83 @@ esac
 EOF
 	chmod +x "$BIN_DIR/npx"
 
-	export HOME LOG_DIR CLAUDE_CALL_LOG NPX_CALL_LOG
+	# --- fake notification surfaces (HARD RULE: tests must produce ZERO real
+	# GUI side effects). run.sh's notify() prefers terminal-notifier and falls
+	# back to osascript; BOTH are shimmed so neither can fire a real banner on
+	# the maintainer's desktop, and the call log lets the alerting tests assert
+	# that notify() actually reached a notifier — a DISPATCH, not a delivery.
+	# DISCOVERY_NOTIFY is deliberately left at its default (true) so the tests
+	# exercise the REAL default path rather than a disabled one.
+	# `caffeinate` is a real macOS binary run.sh prefixes onto every claude
+	# invocation. Shimmed to a pass-through so the suite has zero effect on the
+	# host's power-assertion state — drop caffeinate's own flags, exec the rest.
+	cat >"$BIN_DIR/caffeinate" <<'EOF'
+#!/usr/bin/env bash
+while [[ "${1:-}" == -* ]]; do shift; done
+exec "$@"
+EOF
+	chmod +x "$BIN_DIR/caffeinate"
+
+	# --- fake `security` (the macOS keychain CLI). run.sh reads the long-lived
+	# Claude token with `security find-generic-password`; without this shim every
+	# live-path test would query the maintainer's REAL login keychain (and, once the
+	# token is stored there, hand a real credential to the claude shim). The default
+	# shim answers "item not found" (exit 44) — the same answer a machine with no
+	# token gives. The service name is also pointed at a nonexistent item as a second
+	# layer, in case a test rewrites PATH and the shim stops shadowing the real one.
+	cat >"$BIN_DIR/security" <<'EOF'
+#!/usr/bin/env bash
+exit 44
+EOF
+	chmod +x "$BIN_DIR/security"
+	export DISCOVERY_CLAUDE_TOKEN_SERVICE="compute-atlas-discovery-claude-token-BATS-TEST"
+	# A Claude Code session exports these to its own children, so a bats run
+	# launched from one would otherwise hand the token tests an inherited value
+	# and make every "UNSET" / "scrub var forced by run.sh" assertion meaningless.
+	unset CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR CLAUDE_CODE_SUBPROCESS_ENV_SCRUB CLAUDE_CONFIG_DIR
+
+	NOTIFY_CALL_LOG="$TEST_TMP/notify-calls.log"
+	for _surface in terminal-notifier osascript; do
+		cat >"$BIN_DIR/$_surface" <<EOF
+#!/usr/bin/env bash
+echo "$_surface \$*" >>"$NOTIFY_CALL_LOG"
+exit 0
+EOF
+		chmod +x "$BIN_DIR/$_surface"
+	done
+
+	export HOME LOG_DIR CLAUDE_CALL_LOG NPX_CALL_LOG NOTIFY_CALL_LOG
 	export PATH="$BIN_DIR:$PATH"
 	export DISCOVERY_LOG_DIR="$LOG_DIR"
+
+	# Pin the rotation. run.sh's DEFAULT rotation was rebalanced 2026-08-14
+	# (22 states, gap-states first); every rotation/cursor assertion in this
+	# file was written against the prior 15-state list, and they are testing
+	# CURSOR MECHANICS, not which states are in the list. Pinning the old list
+	# here keeps those assertions exact and makes them immune to the next
+	# rebalance. The default list's CONTENT is asserted separately, in the
+	# dedicated test near the bottom that unsets this.
+	export DISCOVERY_DEFAULT_STATES="TX VA OH GA AZ NV NC PA IL WI IN OK WY NM LA"
+
+	# run.sh now defaults STATES_PER_RUN=2 (Unit 2, 2026-08-14). Every existing
+	# test in this file was written against the prior single-state-per-run
+	# behavior, so pin STATES_PER_RUN=1 here to preserve exactly what they
+	# assert (one claude call, one cursor advance, etc.) without weakening any
+	# assertion. The dedicated multi-state tests below override this per-test.
+	export STATES_PER_RUN=1
+
+	# The stubs below return `[]` instantly; run.sh's suspect_short guard
+	# (DISCOVERY_MIN_CLAUDE_SECS, default 120) would flag every such run. 0
+	# disables it so the pre-existing tests keep asserting what they always did.
+	# The suspect_short tests set the threshold they need explicitly.
+	export DISCOVERY_MIN_CLAUDE_SECS=0
+
+	# Strict-credential preflight reads this file for KEY names only. Default
+	# fixture carries both required keys (dummy values); preflight tests swap it.
+	ENV_FIXTURE="$TEST_TMP/env-fixture"
+	printf 'DISCOVERY_READ_DATABASE_URL=dummy-reader-value\nAPI_INTAKE_TOKEN=dummy-intake-value\n' >"$ENV_FIXTURE"
+	export DISCOVERY_ENV_FILE="$ENV_FIXTURE" DISCOVERY_TEST_MODE=1
+	unset DISCOVERY_REQUIRE_READER DISCOVERY_REQUIRE_INTAKE_TOKEN
 }
 
 teardown() {
@@ -123,7 +251,8 @@ teardown() {
 
 @test "cursor advances exactly once per run" {
 	export DISCOVERY_ENABLED=true
-	export DISCOVERY_DRY_RUN=true
+	# Live (non-dry) run: dry runs no longer advance the cursor.
+	export DISCOVERY_DRY_RUN=false
 	echo "TX" >"$LOG_DIR/cursor.txt"
 
 	run bash "$RUN_SH"
@@ -141,15 +270,14 @@ teardown() {
 	[ "$cursor_after_2" = "OH" ]
 }
 
-@test "check-sources failure after submit does not fail the overall run" {
+@test "check-sources runs after submit-candidates" {
 	export DISCOVERY_ENABLED=true
 	export DISCOVERY_DRY_RUN=true
 	run bash "$RUN_SH"
 	[ "$status" -eq 0 ]
 
 	# both submit-candidates.ts and check-sources.ts must have been invoked,
-	# with check-sources coming after submit in the call log (fail-open
-	# ordering: check-sources' shimmed nonzero exit must not propagate).
+	# with check-sources coming after submit in the call log.
 	run grep -n "submit-candidates.ts\|check-sources.ts" "$NPX_CALL_LOG"
 	[ "$status" -eq 0 ]
 	submit_line="$(grep -n "submit-candidates.ts" "$NPX_CALL_LOG" | head -1 | cut -d: -f1)"
@@ -159,13 +287,15 @@ teardown() {
 	[ "$check_line" -gt "$submit_line" ]
 }
 
-@test "check-sources failure emits a visible WARN and still completes the run" {
+@test "check-sources failure emits a visible WARN, is recorded as a FAIL, and still completes the run" {
 	export DISCOVERY_ENABLED=true
 	export DISCOVERY_DRY_RUN=true
+	export CHECK_SOURCES_RC=1
 	run bash "$RUN_SH"
-	[ "$status" -eq 0 ]
-	[[ "$output" == *"WARN: source-liveness check failed"* ]]
-	[[ "$output" == *"discovery run"*"complete"* ]]
+	[ "$status" -eq 1 ]
+	[[ "$output" == *"WARN: source-liveness check failed"* ]] || return 1
+	[[ "$output" == *"liveness: check-sources failed"* ]] || return 1
+	[[ "$output" == *"discovery run"*"complete"* ]] || return 1
 }
 
 @test "live path invokes claude with the batch-contract system prompt" {
@@ -177,6 +307,520 @@ teardown() {
 	[ "$status" -eq 0 ]
 	[ -s "$CLAUDE_CALL_LOG" ]
 	grep -q -- "--append-system-prompt" "$CLAUDE_CALL_LOG"
+}
+
+# The isolated CLAUDE_CONFIG_DIR stops claude loading ~/.claude/settings.json, so
+# model + effort must be explicit argv (2026-10-11: silent Sonnet/default-effort run).
+@test "claude is invoked with --model opus --effort high by default" {
+	export DISCOVERY_ENABLED=true
+	run bash "$RUN_SH"
+	[ "$status" -eq 0 ]
+	grep -q -- "--model opus --effort high" "$CLAUDE_CALL_LOG"
+	[[ "$output" == *"claude model=opus effort=high"* ]] || return 1
+}
+
+@test "DISCOVERY_CLAUDE_MODEL and DISCOVERY_CLAUDE_EFFORT overrides are honoured" {
+	export DISCOVERY_ENABLED=true
+	export DISCOVERY_CLAUDE_MODEL=sonnet DISCOVERY_CLAUDE_EFFORT=xhigh
+	run bash "$RUN_SH"
+	[ "$status" -eq 0 ]
+	grep -q -- "--model sonnet --effort xhigh" "$CLAUDE_CALL_LOG"
+}
+
+@test "claude is invoked with --restricted, --strict-mcp-config and a capped --tools list" {
+	export DISCOVERY_ENABLED=true
+	run bash "$RUN_SH"
+	[ "$status" -eq 0 ]
+	grep -q -- "--restricted" "$CLAUDE_CALL_LOG"
+	grep -q -- "--strict-mcp-config" "$CLAUDE_CALL_LOG"
+	grep -q -- "--tools WebSearch,WebFetch,Read,Glob,Grep,Bash" "$CLAUDE_CALL_LOG"
+}
+
+@test "disallowedTools denies process-listing commands (ps, pgrep, lsof)" {
+	export DISCOVERY_ENABLED=true
+	run bash "$RUN_SH"
+	[ "$status" -eq 0 ]
+	grep -qF -- "--disallowedTools Write Edit NotebookEdit Agent Task Bash(ps:*) Bash(pgrep:*) Bash(lsof:*)" "$CLAUDE_CALL_LOG"
+}
+
+@test "the Bash grant is the fetch-url.sh wrapper, never raw curl" {
+	export DISCOVERY_ENABLED=true
+	run bash "$RUN_SH"
+	[ "$status" -eq 0 ]
+	grep -qF -- "Bash($REPO_ROOT/scripts/discovery/fetch-url.sh:*)" "$CLAUDE_CALL_LOG"
+	if grep -qF -- "Bash(curl" "$CLAUDE_CALL_LOG"; then return 1; fi
+}
+
+@test "the batch contract names the absolute fetch-url.sh path" {
+	export DISCOVERY_ENABLED=true
+	run bash "$RUN_SH"
+	[ "$status" -eq 0 ]
+	grep -qF -- "run exactly: $REPO_ROOT/scripts/discovery/fetch-url.sh 'https://" "$CLAUDE_CALL_LOG"
+}
+
+@test "claude runs with cwd = DISCOVERY_WORK_DIR, not the repo root" {
+	export DISCOVERY_ENABLED=true
+	run bash "$RUN_SH"
+	[ "$status" -eq 0 ]
+	want="$(cd "$DISCOVERY_WORK_DIR" && pwd -P)"
+	grep -qxF "cwd=$want" "$CLAUDE_CALL_LOG"
+	if grep -qxF "cwd=$(cd "$REPO_ROOT" && pwd -P)" "$CLAUDE_CALL_LOG"; then return 1; fi
+	[ "$(ls -ld "$DISCOVERY_WORK_DIR" | cut -c1-10)" = "drwx------" ]
+}
+
+# 2026-10-28: once Bash was narrowed (#489) the model's `cat lib/schema.ts` was
+# denied, it guessed the candidate schema, and 98 of ~100 candidates were
+# rejected. Read/Glob/Grep are confined to the (empty) cwd, so run.sh stages ONLY
+# schema.ts into a dedicated dir and grants it with --add-dir.
+@test "the prompt points Read at the staged schema copy, not a repo path" {
+	export DISCOVERY_ENABLED=true
+	C="$HOME/.compute-atlas-discovery/contract"
+	run bash "$RUN_SH"
+	[ "$status" -eq 0 ]
+	grep -qF -- "schema in $C/schema.ts" "$CLAUDE_CALL_LOG"
+	grep -qF -- "STATUS_ORDER in $C/status.ts" "$CLAUDE_CALL_LOG"
+	run grep -qF -- "{{SCHEMA_FILE}}" "$CLAUDE_CALL_LOG"
+	[ "$status" -ne 0 ]
+	run grep -qF -- "{{STATUS_FILE}}" "$CLAUDE_CALL_LOG"
+	[ "$status" -ne 0 ]
+	run grep -qF -- "schema in lib/schema.ts" "$CLAUDE_CALL_LOG"
+	[ "$status" -ne 0 ]
+}
+
+@test "the contract dir is the only extra dir granted and holds fresh copies of schema.ts and status.ts" {
+	export DISCOVERY_ENABLED=true
+	C="$HOME/.compute-atlas-discovery/contract"
+	run bash "$RUN_SH"
+	[ "$status" -eq 0 ]
+	grep -qF -- "--add-dir $C --tools" "$CLAUDE_CALL_LOG"
+	[ "$(grep -o -- '--add-dir' "$CLAUDE_CALL_LOG" | wc -l | tr -d ' ')" = "1" ]
+	cmp "$REPO_ROOT/lib/schema.ts" "$C/schema.ts"
+	cmp "$REPO_ROOT/lib/status.ts" "$C/status.ts"
+	[ "$(ls -A "$C" | tr '\n' ' ')" = "schema.ts status.ts " ]
+	[ "$(_mode_of "$C")" = "drwx------" ]
+}
+
+@test "DISCOVERY_CONTRACT_DIR in the environment is ignored" {
+	export DISCOVERY_ENABLED=true
+	export DISCOVERY_CONTRACT_DIR="$TEST_TMP/elsewhere"
+	run bash "$RUN_SH"
+	[ "$status" -eq 0 ]
+	[ ! -e "$TEST_TMP/elsewhere" ]
+	grep -qF -- "--add-dir $HOME/.compute-atlas-discovery/contract --tools" "$CLAUDE_CALL_LOG"
+}
+
+@test "an unstageable contract dir: claude never starts, classified auth" {
+	export DISCOVERY_ENABLED=true
+	: > "$HOME/.compute-atlas-discovery"
+	run bash "$RUN_SH"
+	[ ! -s "$CLAUDE_CALL_LOG" ]
+	[[ "$output" == *"cannot create contract dir"* ]] || return 1
+}
+
+@test "a missing lib/status.ts: claude never starts and no temp files remain" {
+	export DISCOVERY_ENABLED=true
+	mkdir -p "$TEST_TMP/fakerepo/lib"
+	cp -R "$REPO_ROOT/scripts" "$TEST_TMP/fakerepo/scripts"
+	cp "$REPO_ROOT/lib/schema.ts" "$TEST_TMP/fakerepo/lib/schema.ts"
+	run bash "$TEST_TMP/fakerepo/scripts/discovery/run.sh"
+	[ ! -s "$CLAUDE_CALL_LOG" ]
+	[[ "$output" == *"cannot stage the schema contract"* ]] || return 1
+	[ -z "$(find "$HOME/.compute-atlas-discovery/contract" -mindepth 1 \( -name '.schema.*' -o -name '.status.*' \) )" ]
+}
+
+@test "a symlinked contract dir is refused: claude never starts, target mode unchanged" {
+	export DISCOVERY_ENABLED=true
+	mkdir -p "$TEST_TMP/target" "$HOME/.compute-atlas-discovery"
+	chmod 755 "$TEST_TMP/target"
+	ln -s "$TEST_TMP/target" "$HOME/.compute-atlas-discovery/contract"
+	run bash "$RUN_SH"
+	[ ! -s "$CLAUDE_CALL_LOG" ]
+	[[ "$output" == *"is a symlink"* ]] || return 1
+	[ "$(_mode_of "$TEST_TMP/target")" = "drwxr-xr-x" ]
+	[ -z "$(ls -A "$TEST_TMP/target")" ]
+}
+
+@test "a symlinked contract parent dir is refused: claude never starts" {
+	export DISCOVERY_ENABLED=true
+	mkdir -p "$TEST_TMP/target"
+	chmod 755 "$TEST_TMP/target"
+	ln -s "$TEST_TMP/target" "$HOME/.compute-atlas-discovery"
+	run bash "$RUN_SH"
+	[ ! -s "$CLAUDE_CALL_LOG" ]
+	[[ "$output" == *"is a symlink"* ]] || return 1
+	[ -z "$(ls -A "$TEST_TMP/target")" ]
+}
+
+@test "a symlink with an allowlisted name in the contract dir is refused and left in place" {
+	export DISCOVERY_ENABLED=true
+	echo "secret" > "$TEST_TMP/secret.txt"
+	mkdir -p "$HOME/.compute-atlas-discovery/contract"
+	ln -s "$TEST_TMP/secret.txt" "$HOME/.compute-atlas-discovery/contract/.schema.evil"
+	run bash "$RUN_SH"
+	[ ! -s "$CLAUDE_CALL_LOG" ]
+	[[ "$output" == *"non-regular entry"* ]] || return 1
+	[ -L "$HOME/.compute-atlas-discovery/contract/.schema.evil" ]
+}
+
+@test "a pre-existing 755 contract dir ends at 700" {
+	export DISCOVERY_ENABLED=true
+	mkdir -p "$HOME/.compute-atlas-discovery/contract"
+	chmod 755 "$HOME/.compute-atlas-discovery/contract"
+	run bash "$RUN_SH"
+	[ "$status" -eq 0 ]
+	[ "$(_mode_of "$HOME/.compute-atlas-discovery/contract")" = "drwx------" ]
+}
+
+@test "an unexpected entry in the contract dir is refused and left in place" {
+	export DISCOVERY_ENABLED=true
+	mkdir -p "$HOME/.compute-atlas-discovery/contract"
+	: > "$HOME/.compute-atlas-discovery/contract/stray.txt"
+	run bash "$RUN_SH"
+	[ ! -s "$CLAUDE_CALL_LOG" ]
+	[[ "$output" == *"unexpected entry"* ]] || return 1
+	[ -e "$HOME/.compute-atlas-discovery/contract/stray.txt" ]
+}
+
+@test "the default work dir lands under the isolated HOME" {
+	export DISCOVERY_ENABLED=true
+	unset DISCOVERY_WORK_DIR
+	run bash "$RUN_SH"
+	[ "$status" -eq 0 ]
+	[ -d "$HOME/.compute-atlas-discovery/work" ]
+}
+
+@test "DISCOVERY_WORK_DIR inside the repo: claude never starts, classified auth" {
+	export DISCOVERY_ENABLED=true
+	unset DISCOVERY_STATES
+	export STATES_PER_RUN=2
+	echo "TX" >"$LOG_DIR/cursor.txt"
+	# A fake repo under TEST_TMP, so nothing real is created or chmod'd.
+	mkdir -p "$TEST_TMP/fakerepo"
+	cp -R "$REPO_ROOT/scripts" "$TEST_TMP/fakerepo/scripts"
+	mkdir -p "$TEST_TMP/fakerepo/lib" && cp "$REPO_ROOT/lib/schema.ts" "$REPO_ROOT/lib/status.ts" "$TEST_TMP/fakerepo/lib/"
+	export DISCOVERY_WORK_DIR="$TEST_TMP/fakerepo/work"
+	run bash "$TEST_TMP/fakerepo/scripts/discovery/run.sh"
+	[ "$status" -eq 1 ]
+	[[ "$output" == *"ERROR: discovery work dir"*"inside it"* ]] || return 1
+	[ ! -s "$CLAUDE_CALL_LOG" ]
+	[[ "$output" == *"cause=auth"* ]] || return 1
+}
+
+# Work-dir guard helpers. Everything stays under $TEST_TMP: never aim
+# DISCOVERY_WORK_DIR (it gets mkdir'd, and chmod'd when accepted) at a real dir.
+_work_dir_refused_setup() {
+	export DISCOVERY_ENABLED=true
+	unset DISCOVERY_STATES
+	export STATES_PER_RUN=2
+	echo "TX" >"$LOG_DIR/cursor.txt"
+}
+
+_assert_work_dir_refused() {
+	[ "$status" -eq 1 ]
+	[[ "$output" == *"ERROR: discovery work dir"* ]] || return 1
+	[ ! -s "$CLAUDE_CALL_LOG" ]
+	[[ "$output" == *"cause=auth"* ]] || return 1
+}
+
+_mode_of() { ls -ld "$1" | cut -c1-10; }
+
+@test "DISCOVERY_WORK_DIR that contains the repo: refused, claude never starts" {
+	_work_dir_refused_setup
+	# A fake repo under TEST_TMP so REPO_ROOT resolves inside the work dir.
+	mkdir -p "$TEST_TMP/outer/repo"
+	cp -R "$REPO_ROOT/scripts" "$TEST_TMP/outer/repo/scripts"
+	mkdir -p "$TEST_TMP/outer/repo/lib" && cp "$REPO_ROOT/lib/schema.ts" "$REPO_ROOT/lib/status.ts" "$TEST_TMP/outer/repo/lib/"
+	export DISCOVERY_WORK_DIR="$TEST_TMP/outer"
+	run bash "$TEST_TMP/outer/repo/scripts/discovery/run.sh"
+	_assert_work_dir_refused
+	[[ "$output" == *"contains the repo"* ]] || return 1
+}
+
+@test "DISCOVERY_WORK_DIR with a regular file in it: refused (not empty)" {
+	_work_dir_refused_setup
+	mkdir -p "$DISCOVERY_WORK_DIR"
+	: >"$DISCOVERY_WORK_DIR/notes.txt"
+	run bash "$RUN_SH"
+	_assert_work_dir_refused
+	[[ "$output" == *"not empty (first entry: "*"notes.txt"* ]] || return 1
+}
+
+@test "DISCOVERY_WORK_DIR holding .env.local: refused" {
+	_work_dir_refused_setup
+	mkdir -p "$DISCOVERY_WORK_DIR"
+	: >"$DISCOVERY_WORK_DIR/.env.local"
+	run bash "$RUN_SH"
+	_assert_work_dir_refused
+}
+
+@test "DISCOVERY_WORK_DIR holding a dangling .env symlink: refused" {
+	_work_dir_refused_setup
+	mkdir -p "$DISCOVERY_WORK_DIR"
+	ln -s "$TEST_TMP/does-not-exist" "$DISCOVERY_WORK_DIR/.env"
+	run bash "$RUN_SH"
+	_assert_work_dir_refused
+}
+
+@test "DISCOVERY_WORK_DIR holding .env.local is refused even with noglob inherited" {
+	_work_dir_refused_setup
+	mkdir -p "$DISCOVERY_WORK_DIR"
+	: >"$DISCOVERY_WORK_DIR/.env.local"
+	run env SHELLOPTS=noglob bash "$RUN_SH"
+	_assert_work_dir_refused
+}
+
+@test "a refused pre-existing work dir keeps its mode (chmod only after validation)" {
+	_work_dir_refused_setup
+	mkdir -p "$DISCOVERY_WORK_DIR"
+	: >"$DISCOVERY_WORK_DIR/notes.txt"
+	chmod 755 "$DISCOVERY_WORK_DIR"
+	run bash "$RUN_SH"
+	_assert_work_dir_refused
+	[ "$(_mode_of "$DISCOVERY_WORK_DIR")" = "drwxr-xr-x" ]
+}
+
+@test "an accepted pre-existing work dir ends at 700" {
+	export DISCOVERY_ENABLED=true
+	mkdir -p "$DISCOVERY_WORK_DIR"
+	chmod 755 "$DISCOVERY_WORK_DIR"
+	run bash "$RUN_SH"
+	[ "$status" -eq 0 ]
+	[ -s "$CLAUDE_CALL_LOG" ]
+	[ "$(_mode_of "$DISCOVERY_WORK_DIR")" = "drwx------" ]
+}
+
+@test "a regular .DS_Store in the work dir is accepted" {
+	export DISCOVERY_ENABLED=true
+	mkdir -p "$DISCOVERY_WORK_DIR"
+	: >"$DISCOVERY_WORK_DIR/.DS_Store"
+	run bash "$RUN_SH"
+	[ "$status" -eq 0 ]
+	[ -s "$CLAUDE_CALL_LOG" ]
+}
+
+@test "a .DS_Store symlink in the work dir is refused" {
+	_work_dir_refused_setup
+	mkdir -p "$DISCOVERY_WORK_DIR"
+	ln -s "$TEST_TMP/elsewhere" "$DISCOVERY_WORK_DIR/.DS_Store"
+	run bash "$RUN_SH"
+	_assert_work_dir_refused
+}
+
+@test "token branch also runs claude with cwd = DISCOVERY_WORK_DIR" {
+	export DISCOVERY_ENABLED=true
+	_install_security_with_token
+	_install_claude_recording_token
+	_run_no_fd3 bash "$RUN_SH"
+	[ "$status" -eq 0 ]
+	[ "$(cat "$TEST_TMP/claude-cwd-seen")" = "$(cd "$DISCOVERY_WORK_DIR" && pwd -P)" ]
+}
+
+@test "invalid DISCOVERY_CLAUDE_EFFORT fails before claude is invoked" {
+	export DISCOVERY_ENABLED=true
+	export DISCOVERY_CLAUDE_EFFORT=turbo
+	run bash "$RUN_SH"
+	[ "$status" -ne 0 ]
+	[[ "$output" == *"ERROR: DISCOVERY_CLAUDE_EFFORT"* ]] || return 1
+	[ ! -s "$CLAUDE_CALL_LOG" ]
+}
+
+@test "DISCOVERY_CLAUDE_MODEL with whitespace fails before claude is invoked" {
+	export DISCOVERY_ENABLED=true
+	export DISCOVERY_CLAUDE_MODEL="opus extra"
+	run bash "$RUN_SH"
+	[ "$status" -ne 0 ]
+	[[ "$output" == *"ERROR: DISCOVERY_CLAUDE_MODEL"* ]] || return 1
+	[ ! -s "$CLAUDE_CALL_LOG" ]
+}
+
+@test "DISCOVERY_CLAUDE_MODEL with a leading dash fails before claude is invoked" {
+	export DISCOVERY_ENABLED=true
+	export DISCOVERY_CLAUDE_MODEL="-p"
+	run bash "$RUN_SH"
+	[ "$status" -ne 0 ]
+	[[ "$output" == *"ERROR: DISCOVERY_CLAUDE_MODEL"* ]] || return 1
+	[ ! -s "$CLAUDE_CALL_LOG" ]
+}
+
+@test "invalid DISCOVERY_MIN_CLAUDE_SECS fails before claude is invoked" {
+	export DISCOVERY_ENABLED=true
+	export DISCOVERY_MIN_CLAUDE_SECS=abc
+	run bash "$RUN_SH"
+	[ "$status" -ne 0 ]
+	[[ "$output" == *"ERROR: DISCOVERY_MIN_CLAUDE_SECS"* ]] || return 1
+	[ ! -s "$CLAUDE_CALL_LOG" ]
+}
+
+# --- suspect_short: a valid-but-empty array returned implausibly fast --------
+
+@test "an instant empty [] is classified suspect_short: degraded, cursor rewound, never retried" {
+	export DISCOVERY_ENABLED=true
+	export DISCOVERY_MIN_CLAUDE_SECS=120
+	unset DISCOVERY_STATES
+	export STATES_PER_RUN=1
+	echo "TX" >"$LOG_DIR/cursor.txt"
+
+	run bash "$RUN_SH"
+	[ "$status" -eq 1 ]
+
+	[[ "$output" == *"suspected misconfigured run"* ]] || return 1
+	[[ "$output" != *"retrying once"* ]] || return 1
+	# Exactly one claude call: no retry.
+	# (the logged prompt spans many lines; count call records, not lines)
+	[ "$(grep -c '^claude ' "$CLAUDE_CALL_LOG")" = "1" ]
+	# Nothing to stage: the empty array must not reach submit-candidates.ts.
+	if grep -q -- "submit-candidates.ts .*--run-id" "$NPX_CALL_LOG"; then return 1; fi
+	grep -q '"claudeStatus": "suspect_short"' "$LOG_DIR/heartbeat.json"
+	grep -q '"status": "degraded"' "$LOG_DIR/heartbeat.json"
+	# Cursor advanced at start-of-run, then rewound to the consumed state.
+	[ "$(tr -d ' \n' <"$LOG_DIR/cursor.txt")" = "TX" ]
+	[[ "$output" == *"environmental failure: suspect_short"* ]] || return 1
+}
+
+@test "an instant empty [] is ok when DISCOVERY_MIN_CLAUDE_SECS=0 disables the guard" {
+	export DISCOVERY_ENABLED=true
+	export DISCOVERY_MIN_CLAUDE_SECS=0
+	run bash "$RUN_SH"
+	[ "$status" -eq 0 ]
+	grep -q '"claudeStatus": "ok"' "$LOG_DIR/heartbeat.json"
+	grep -q -- "submit-candidates.ts .*--run-id" "$NPX_CALL_LOG"
+}
+
+@test "an instant NON-empty array is ok even under the default threshold (guard is empty-only)" {
+	export DISCOVERY_ENABLED=true
+	export DISCOVERY_MIN_CLAUDE_SECS=120
+	cat >"$BIN_DIR/claude" <<'EOF'
+#!/usr/bin/env bash
+echo "claude $*" >> "$CLAUDE_CALL_LOG"
+echo '[{"name":"X","facilityType":"data_center"}]'
+exit 0
+EOF
+	chmod +x "$BIN_DIR/claude"
+	run bash "$RUN_SH"
+	[ "$status" -eq 0 ]
+	grep -q '"claudeStatus": "ok"' "$LOG_DIR/heartbeat.json"
+	[[ "$output" != *"suspected misconfigured run"* ]] || return 1
+}
+
+@test "dry-run is unaffected by the suspect_short guard" {
+	export DISCOVERY_ENABLED=true DISCOVERY_DRY_RUN=true
+	export DISCOVERY_MIN_CLAUDE_SECS=120
+	run bash "$RUN_SH"
+	[ "$status" -eq 0 ]
+	[[ "$output" != *"suspected misconfigured run"* ]] || return 1
+}
+
+@test "shape helper failing to spawn reads as bad: no_array path, retried, never ok" {
+	export DISCOVERY_ENABLED=true
+	export DISCOVERY_MIN_CLAUDE_SECS=120
+	cat >"$BIN_DIR/npx" <<EOS
+#!/usr/bin/env bash
+echo "npx \$*" >>"$NPX_CALL_LOG"
+case "\$*" in
+*"tsx -e"*) exit 1 ;;
+esac
+exit 0
+EOS
+	chmod +x "$BIN_DIR/npx"
+	run bash "$RUN_SH"
+	[ "$status" -eq 1 ]
+	[[ "$output" == *"retrying once"* ]] || return 1
+	if grep -q '"claudeStatus": "ok"' "$LOG_DIR/heartbeat.json"; then return 1; fi
+	if grep -q -- "submit-candidates.ts .*--run-id" "$NPX_CALL_LOG"; then return 1; fi
+}
+
+@test "suspect_short rewinds once and records the state in suspect-short-requeued.txt" {
+	export DISCOVERY_ENABLED=true
+	export DISCOVERY_MIN_CLAUDE_SECS=120
+	unset DISCOVERY_STATES
+	export STATES_PER_RUN=1
+	echo "TX" >"$LOG_DIR/cursor.txt"
+	run bash "$RUN_SH"
+	[ "$status" -eq 1 ]
+	[ "$(tr -d ' \n' <"$LOG_DIR/suspect-short-requeued.txt")" = "TX" ]
+	[ "$(tr -d ' \n' <"$LOG_DIR/cursor.txt")" = "TX" ]
+}
+
+@test "second consecutive suspect_short on the same state does NOT rewind" {
+	export DISCOVERY_ENABLED=true
+	export DISCOVERY_MIN_CLAUDE_SECS=120
+	unset DISCOVERY_STATES
+	export STATES_PER_RUN=1
+	echo "TX" >"$LOG_DIR/cursor.txt"
+	echo "TX" >"$LOG_DIR/suspect-short-requeued.txt"
+	run bash "$RUN_SH"
+	[ "$status" -eq 1 ]
+	[[ "$output" == *"suspect_short twice in a row"* ]] || return 1
+	[[ "$output" != *"re-queued: cursor rewound"* ]] || return 1
+	[ "$(tr -d ' \n' <"$LOG_DIR/cursor.txt")" != "TX" ]
+	[ ! -e "$LOG_DIR/suspect-short-requeued.txt" ]
+	# still red for the watchdog
+	grep -q '"claudeStatus": "suspect_short"' "$LOG_DIR/heartbeat.json"
+	grep -q '"status": "degraded"' "$LOG_DIR/heartbeat.json"
+}
+
+@test "a clean batch clears suspect-short-requeued.txt" {
+	export DISCOVERY_ENABLED=true
+	export DISCOVERY_MIN_CLAUDE_SECS=0
+	unset DISCOVERY_STATES
+	export STATES_PER_RUN=1
+	echo "TX" >"$LOG_DIR/suspect-short-requeued.txt"
+	run bash "$RUN_SH"
+	[ "$status" -eq 0 ]
+	[ ! -e "$LOG_DIR/suspect-short-requeued.txt" ]
+}
+
+@test "suspect_short twice for state A then a blocked state B: rewinds to B, warns for A, clears the marker" {
+	export DISCOVERY_ENABLED=true
+	export DISCOVERY_MIN_CLAUDE_SECS=120
+	unset DISCOVERY_STATES
+	export STATES_PER_RUN=2
+	echo "TX" >"$LOG_DIR/cursor.txt"
+	echo "TX" >"$LOG_DIR/suspect-short-requeued.txt"
+	# Batch [TX VA]: TX (call 1) returns an instant [] (suspect_short, second
+	# time in a row); VA (call 2) hits the session limit (blocked).
+	CLAUDE_COUNTER_FILE="$TEST_TMP/claude-call-count"
+	echo 0 >"$CLAUDE_COUNTER_FILE"
+	cat >"$BIN_DIR/claude" <<EOF
+#!/usr/bin/env bash
+echo "claude \$*" >> "$CLAUDE_CALL_LOG"
+n="\$(cat "$CLAUDE_COUNTER_FILE")"
+n=\$((n + 1))
+echo "\$n" >"$CLAUDE_COUNTER_FILE"
+if [ "\$n" -le 1 ]; then
+	echo '[]'
+	exit 0
+else
+	echo "You've hit your session limit"
+	exit 1
+fi
+EOF
+	chmod +x "$BIN_DIR/claude"
+	run bash "$RUN_SH"
+	[ "$status" -eq 1 ]
+	[ "$(tr -d ' \n' <"$LOG_DIR/cursor.txt")" = "VA" ]
+	[[ "$output" == *"suspect_short twice in a row"* ]] || return 1
+	[[ "$output" == *"environmental failure: blocked"* ]] || return 1
+	[ ! -e "$LOG_DIR/suspect-short-requeued.txt" ]
+}
+
+@test "a non-suspect rewind (blocked) clears suspect-short-requeued.txt" {
+	export DISCOVERY_ENABLED=true
+	export DISCOVERY_MIN_CLAUDE_SECS=120
+	unset DISCOVERY_STATES
+	export STATES_PER_RUN=1
+	echo "TX" >"$LOG_DIR/cursor.txt"
+	echo "TX" >"$LOG_DIR/suspect-short-requeued.txt"
+	cat >"$BIN_DIR/claude" <<'EOS'
+#!/usr/bin/env bash
+echo "claude $*" >> "$CLAUDE_CALL_LOG"
+echo "You've hit your session limit"
+exit 1
+EOS
+	chmod +x "$BIN_DIR/claude"
+	run bash "$RUN_SH"
+	[[ "$output" == *"re-queued: cursor rewound"* ]] || return 1
+	[ ! -e "$LOG_DIR/suspect-short-requeued.txt" ]
 }
 
 @test "retry recovers when first claude call emits prose with no JSON array" {
@@ -205,7 +849,7 @@ EOF
 
 	call_count="$(cat "$CLAUDE_COUNTER_FILE")"
 	[ "$call_count" -eq 2 ]
-	[[ "$output" == *"WARN: claude output for"*"had no parseable JSON array — retrying once"* ]]
+	[[ "$output" == *"WARN: claude output for"*"had no parseable JSON array (cause=no_array,"*"retrying once"* ]] || return 1
 
 	outfile="$(find "$LOG_DIR" -name 'candidates-*.json' -print -quit)"
 	[ -n "$outfile" ]
@@ -232,7 +876,7 @@ EOF
 
 	call_count="$(cat "$CLAUDE_COUNTER_FILE")"
 	[ "$call_count" -eq 1 ]
-	[[ "$output" != *"retrying once"* ]]
+	[[ "$output" != *"retrying once"* ]] || return 1
 }
 
 @test "dry-run never retries even though it writes an empty array" {
@@ -242,5 +886,2492 @@ EOF
 	[ "$status" -eq 0 ]
 	# dry-run must never invoke the real claude binary at all, retry or not
 	[ ! -s "$CLAUDE_CALL_LOG" ]
-	[[ "$output" != *"retrying once"* ]]
+	[[ "$output" != *"retrying once"* ]] || return 1
+}
+
+# --- failure classification (2026-09-11) ------------------------------------
+# Every candidate-parse failure used to be reported as `no_array` — "the model
+# emitted bad JSON". A census of discovery-logs/ found that of eight such
+# failures only ONE (2026-07-15 AZ, a prose session summary) actually was:
+# three were transient "API Error", three were hard environmental blocks
+# (computer asleep, session limit), one was empty. The bounded retry is right
+# for the first two and useless for the third — the 2026-09-11 NC "retry" ran
+# for 3 seconds against a limit that reset hours later.
+#
+# These tests pin the three classes, the retry suppression, and the ordering
+# trap. They do NOT touch the safety gate: CLAUDE_ARRAY_OK remains the only
+# thing that lets candidates reach submit, in every class.
+
+@test "a session-limit failure classifies as blocked and does NOT retry" {
+	export DISCOVERY_ENABLED=true
+	CLAUDE_COUNTER_FILE="$TEST_TMP/claude-call-count"
+	echo 0 >"$CLAUDE_COUNTER_FILE"
+	cat >"$BIN_DIR/claude" <<EOF
+#!/usr/bin/env bash
+echo "claude \$*" >> "$CLAUDE_CALL_LOG"
+n="\$(cat "$CLAUDE_COUNTER_FILE")"
+echo "\$((n + 1))" >"$CLAUDE_COUNTER_FILE"
+echo "You've hit your session limit"
+exit 1
+EOF
+	chmod +x "$BIN_DIR/claude"
+
+	run bash "$RUN_SH"
+	[ "$status" -eq 1 ]
+
+	# ONE call, not two — the retry is suppressed because it cannot help.
+	call_count="$(cat "$CLAUDE_COUNTER_FILE")"
+	[ "$call_count" -eq 1 ]
+	[[ "$output" != *"retrying once"* ]] || return 1
+	[[ "$output" == *"NOT retrying"* ]] || return 1
+	grep -q '"claudeStatus": "blocked"' "$LOG_DIR/heartbeat.json"
+}
+
+@test "a slept-computer failure classifies as blocked, not api_error" {
+	export DISCOVERY_ENABLED=true
+	# THE ORDERING TRAP. "API Error: Your computer went to sleep mid-response."
+	# contains BOTH markers. If run.sh tests `API Error` before the blocked
+	# patterns, this lands in api_error and earns a pointless retry into a
+	# machine that is asleep. Mutation-tested by swapping the two cases.
+	CLAUDE_COUNTER_FILE="$TEST_TMP/claude-call-count"
+	echo 0 >"$CLAUDE_COUNTER_FILE"
+	cat >"$BIN_DIR/claude" <<EOF
+#!/usr/bin/env bash
+echo "claude \$*" >> "$CLAUDE_CALL_LOG"
+n="\$(cat "$CLAUDE_COUNTER_FILE")"
+echo "\$((n + 1))" >"$CLAUDE_COUNTER_FILE"
+echo "API Error: Your computer went to sleep mid-response."
+exit 1
+EOF
+	chmod +x "$BIN_DIR/claude"
+
+	run bash "$RUN_SH"
+	[ "$status" -eq 1 ]
+
+	call_count="$(cat "$CLAUDE_COUNTER_FILE")"
+	[ "$call_count" -eq 1 ]
+	[[ "$output" != *"retrying once"* ]] || return 1
+	grep -q '"claudeStatus": "blocked"' "$LOG_DIR/heartbeat.json"
+	[[ "$output" != *"cause=api_error"* ]] || return 1
+}
+
+@test "a transient API error classifies as api_error and DOES retry" {
+	export DISCOVERY_ENABLED=true
+	# The 2026-07-25 TX / 2026-08-11 VA shape. Retry is the right response, so
+	# the pre-existing behaviour is preserved: two calls, then give up.
+	CLAUDE_COUNTER_FILE="$TEST_TMP/claude-call-count"
+	echo 0 >"$CLAUDE_COUNTER_FILE"
+	cat >"$BIN_DIR/claude" <<EOF
+#!/usr/bin/env bash
+echo "claude \$*" >> "$CLAUDE_CALL_LOG"
+n="\$(cat "$CLAUDE_COUNTER_FILE")"
+echo "\$((n + 1))" >"$CLAUDE_COUNTER_FILE"
+echo "API Error: Connection closed mid-response."
+exit 1
+EOF
+	chmod +x "$BIN_DIR/claude"
+
+	run bash "$RUN_SH"
+	[ "$status" -eq 1 ]
+
+	call_count="$(cat "$CLAUDE_COUNTER_FILE")"
+	[ "$call_count" -eq 2 ]
+	[[ "$output" == *"cause=api_error"* ]] || return 1
+	[[ "$output" == *"retrying once"* ]] || return 1
+	grep -q '"claudeStatus": "api_error"' "$LOG_DIR/heartbeat.json"
+}
+
+@test "prose instead of JSON still classifies as no_array and retries" {
+	export DISCOVERY_ENABLED=true
+	# The 2026-07-15 AZ failure: the run inherited the maintainer's persona and
+	# ended with a session summary + journal write. This is the ONE class the
+	# blanket `no_array` label was ever right about, and retry stays right too.
+	CLAUDE_COUNTER_FILE="$TEST_TMP/claude-call-count"
+	echo 0 >"$CLAUDE_COUNTER_FILE"
+	cat >"$BIN_DIR/claude" <<EOF
+#!/usr/bin/env bash
+echo "claude \$*" >> "$CLAUDE_CALL_LOG"
+n="\$(cat "$CLAUDE_COUNTER_FILE")"
+echo "\$((n + 1))" >"$CLAUDE_COUNTER_FILE"
+echo "Journal written.  Session summary: I completed the bounded discovery pass."
+exit 0
+EOF
+	chmod +x "$BIN_DIR/claude"
+
+	run bash "$RUN_SH"
+	[ "$status" -eq 1 ]
+
+	call_count="$(cat "$CLAUDE_COUNTER_FILE")"
+	[ "$call_count" -eq 2 ]
+	[[ "$output" == *"cause=no_array"* ]] || return 1
+	grep -q '"claudeStatus": "no_array"' "$LOG_DIR/heartbeat.json"
+}
+
+@test "a failure logs the candidates file byte count" {
+	export DISCOVERY_ENABLED=true
+	# Size is the single best tell and was invisible before: 66-91 bytes is an
+	# environmental error string, 3 bytes is a legitimate empty [], a healthy
+	# run writes 3.6 KB-80 KB. The literal below is the stub's exact output
+	# ("You've hit your session limit" = 29 chars + newline), so this asserts a
+	# REAL measurement rather than the word "bytes" appearing somewhere.
+	cat >"$BIN_DIR/claude" <<'EOF'
+#!/usr/bin/env bash
+echo "claude $*" >> "$CLAUDE_CALL_LOG"
+echo "You've hit your session limit"
+exit 1
+EOF
+	chmod +x "$BIN_DIR/claude"
+
+	run bash "$RUN_SH"
+	[ "$status" -eq 1 ]
+	[[ "$output" == *"30 bytes"* ]] || return 1
+}
+
+# --- auth failure class (2026-10-04) ----------------------------------------
+# 2026-10-03 and 10-04 (also 09-26/27): the launchd job's `claude -p` failed in
+# 2-3 s with a 73-byte file, "Failed to authenticate: OAuth session expired and
+# could not be refreshed". That fell through to `no_array` ("no parseable
+# candidate array"), was retried pointlessly, and the second state of the batch
+# then made the same doomed call. `auth` is a hard environmental class like
+# `blocked`: no retry, and no later state in the batch calls claude again.
+
+@test "an expired-login failure classifies as auth and does NOT retry" {
+	export DISCOVERY_ENABLED=true
+	CLAUDE_COUNTER_FILE="$TEST_TMP/claude-call-count"
+	echo 0 >"$CLAUDE_COUNTER_FILE"
+	cat >"$BIN_DIR/claude" <<EOF
+#!/usr/bin/env bash
+echo "claude \$*" >> "$CLAUDE_CALL_LOG"
+n="\$(cat "$CLAUDE_COUNTER_FILE")"
+echo "\$((n + 1))" >"$CLAUDE_COUNTER_FILE"
+echo "Failed to authenticate: OAuth session expired and could not be refreshed"
+exit 1
+EOF
+	chmod +x "$BIN_DIR/claude"
+
+	run bash "$RUN_SH"
+	[ "$status" -eq 1 ]
+
+	# ONE call, not two — a retry cannot revive a dead login.
+	call_count="$(cat "$CLAUDE_COUNTER_FILE")"
+	[ "$call_count" -eq 1 ]
+	[[ "$output" != *"retrying once"* ]] || return 1
+	[[ "$output" == *"NOT retrying"* ]] || return 1
+	# the operator-facing reason names the login, not a JSON bug
+	[[ "$output" == *"Claude Code login expired or invalid"* ]] || return 1
+	[[ "$output" == *"cause=auth"* ]] || return 1
+	[[ "$output" != *"cause=no_array"* ]] || return 1
+	grep -q '"claudeStatus": "auth"' "$LOG_DIR/heartbeat.json"
+}
+
+@test "an auth message wrapped in an API Error envelope still classifies as auth" {
+	export DISCOVERY_ENABLED=true
+	# THE ORDERING TRAP, auth edition: this text contains BOTH markers. If run.sh
+	# tests `API Error` before the auth patterns it lands in api_error and earns a
+	# pointless retry against a dead login. Mutation-tested by swapping the cases.
+	CLAUDE_COUNTER_FILE="$TEST_TMP/claude-call-count"
+	echo 0 >"$CLAUDE_COUNTER_FILE"
+	cat >"$BIN_DIR/claude" <<EOF
+#!/usr/bin/env bash
+echo "claude \$*" >> "$CLAUDE_CALL_LOG"
+n="\$(cat "$CLAUDE_COUNTER_FILE")"
+echo "\$((n + 1))" >"$CLAUDE_COUNTER_FILE"
+echo "API Error: Failed to authenticate: OAuth session expired and could not be refreshed"
+exit 1
+EOF
+	chmod +x "$BIN_DIR/claude"
+
+	run bash "$RUN_SH"
+	[ "$status" -eq 1 ]
+
+	call_count="$(cat "$CLAUDE_COUNTER_FILE")"
+	[ "$call_count" -eq 1 ]
+	[[ "$output" != *"retrying once"* ]] || return 1
+	[[ "$output" != *"cause=api_error"* ]] || return 1
+	grep -q '"claudeStatus": "auth"' "$LOG_DIR/heartbeat.json"
+}
+
+@test "an auth failure short-circuits the rest of the batch" {
+	export DISCOVERY_ENABLED=true
+	export STATES_PER_RUN=2
+	echo "TX" >"$LOG_DIR/cursor.txt"
+
+	# Batch is [TX VA]. TX's single attempt hits the dead login; VA must NOT
+	# invoke claude at all (same login, same failure, 2-3 s wasted per state).
+	CLAUDE_COUNTER_FILE="$TEST_TMP/claude-call-count"
+	echo 0 >"$CLAUDE_COUNTER_FILE"
+	cat >"$BIN_DIR/claude" <<EOF
+#!/usr/bin/env bash
+echo "claude \$*" >> "$CLAUDE_CALL_LOG"
+n="\$(cat "$CLAUDE_COUNTER_FILE")"
+echo "\$((n + 1))" >"$CLAUDE_COUNTER_FILE"
+echo "Failed to authenticate: OAuth session expired and could not be refreshed"
+exit 1
+EOF
+	chmod +x "$BIN_DIR/claude"
+
+	run bash "$RUN_SH"
+	[ "$status" -eq 1 ]
+
+	# exactly ONE claude call across the whole batch (TX only, no retry, no VA)
+	call_count="$(cat "$CLAUDE_COUNTER_FILE")"
+	[ "$call_count" -eq 1 ]
+
+	# VA is named as skipped, in the log and in the failure ledger
+	[[ "$output" == *"skipping claude for VA"* ]] || return 1
+	[[ "$output" == *"VA: skipped"* ]] || return 1
+	# the batch still completed and still covers both states
+	[[ "$output" == *"discovery batch complete"* ]] || return 1
+
+	# per-state heartbeat: TX carries the real class, VA carries `skipped`
+	grep -A1 '"state": "TX"' "$LOG_DIR/heartbeat.json" | grep -q '"claudeStatus": "auth"'
+	grep -A1 '"state": "VA"' "$LOG_DIR/heartbeat.json" | grep -q '"claudeStatus": "skipped"'
+
+	# the submit gate is untouched: nothing reached submit-candidates
+	run grep -c -- "submit-candidates.ts .*--run-id" "$NPX_CALL_LOG"
+	[ "${output//[[:space:]]/}" = "0" ]
+}
+
+# --- re-queue after an environmental failure (2026-10-04) -------------------
+# The cursor advances ONCE, before any research, so a state whose claude call
+# never completed is still consumed: on 2026-10-03/04 an expired login consumed
+# ID KS KY ME, which would not have come round for ~26 days. After the state
+# loop, an `auth` / `skipped` / `blocked` state rewinds the cursor to the first
+# such state. These tests `unset DISCOVERY_STATES` (setup() pins it to a custom
+# list) because the rewind applies ONLY to the default rotation, in which TX is
+# followed by VA, OH.
+
+@test "an auth failure rewinds the cursor to the state it consumed" {
+	export DISCOVERY_ENABLED=true
+	unset DISCOVERY_STATES
+	export STATES_PER_RUN=2
+	echo "TX" >"$LOG_DIR/cursor.txt"
+	CLAUDE_COUNTER_FILE="$TEST_TMP/claude-call-count"
+	echo 0 >"$CLAUDE_COUNTER_FILE"
+	cat >"$BIN_DIR/claude" <<EOF
+#!/usr/bin/env bash
+echo "claude \$*" >> "$CLAUDE_CALL_LOG"
+n="\$(cat "$CLAUDE_COUNTER_FILE")"
+echo "\$((n + 1))" >"$CLAUDE_COUNTER_FILE"
+echo "Failed to authenticate: OAuth session expired and could not be refreshed"
+exit 1
+EOF
+	chmod +x "$BIN_DIR/claude"
+
+	run bash "$RUN_SH"
+	[ "$status" -eq 1 ]
+
+	# Batch was [TX VA]; the start-of-run write put the cursor on OH. TX (auth)
+	# and VA (skipped) were researched for nothing, so both come round again.
+	cursor_after="$(cat "$LOG_DIR/cursor.txt" | tr -d ' \n')"
+	[ "$cursor_after" = "TX" ]
+	[[ "$output" == *"re-queued: cursor rewound OH -> TX (environmental failure: auth); TX VA run again next batch"* ]] || return 1
+}
+
+@test "a blocked (session-limit) failure rewinds the cursor to the state it consumed" {
+	export DISCOVERY_ENABLED=true
+	unset DISCOVERY_STATES
+	export STATES_PER_RUN=1
+	echo "TX" >"$LOG_DIR/cursor.txt"
+	cat >"$BIN_DIR/claude" <<'EOF'
+#!/usr/bin/env bash
+echo "claude $*" >> "$CLAUDE_CALL_LOG"
+echo "You've hit your session limit"
+exit 1
+EOF
+	chmod +x "$BIN_DIR/claude"
+
+	run bash "$RUN_SH"
+	[ "$status" -eq 1 ]
+
+	# start-of-run write put the cursor on VA; the rewind puts it back on TX
+	cursor_after="$(cat "$LOG_DIR/cursor.txt" | tr -d ' \n')"
+	[ "$cursor_after" = "TX" ]
+	[[ "$output" == *"environmental failure: blocked"* ]] || return 1
+}
+
+@test "the rewind targets the FIRST environmental failure, never a state that succeeded" {
+	export DISCOVERY_ENABLED=true
+	unset DISCOVERY_STATES
+	export STATES_PER_RUN=2
+	echo "TX" >"$LOG_DIR/cursor.txt"
+
+	# Batch [TX VA]: TX (call 1) returns a valid array, VA (call 2) hits the
+	# session limit. The target must be VA, not the batch's first state TX.
+	CLAUDE_COUNTER_FILE="$TEST_TMP/claude-call-count"
+	echo 0 >"$CLAUDE_COUNTER_FILE"
+	cat >"$BIN_DIR/claude" <<EOF
+#!/usr/bin/env bash
+echo "claude \$*" >> "$CLAUDE_CALL_LOG"
+n="\$(cat "$CLAUDE_COUNTER_FILE")"
+n=\$((n + 1))
+echo "\$n" >"$CLAUDE_COUNTER_FILE"
+if [ "\$n" -le 1 ]; then
+	echo '[{"name":"First State Facility","facilityType":"data_center"}]'
+	exit 0
+else
+	echo "You've hit your session limit"
+	exit 1
+fi
+EOF
+	chmod +x "$BIN_DIR/claude"
+
+	run bash "$RUN_SH"
+	[ "$status" -eq 1 ]
+
+	cursor_after="$(cat "$LOG_DIR/cursor.txt" | tr -d ' \n')"
+	[ "$cursor_after" = "VA" ]
+	[[ "$output" == *"re-queued: cursor rewound OH -> VA (environmental failure: blocked); VA run again next batch"* ]] || return 1
+}
+
+@test "a DISCOVERY_STATES override run never rewinds the cursor" {
+	export DISCOVERY_ENABLED=true
+	# The known trap: an override-list state must never be written into the live
+	# cursor.txt, by the start-of-run advance (would write WA, index 2 of the
+	# batch [IA NE]) or by an unguarded rewind (would write IA, the first failed
+	# state). The cursor file must not exist afterwards at all.
+	export DISCOVERY_STATES="IA NE WA"
+	export STATES_PER_RUN=2
+	rm -f "$LOG_DIR/cursor.txt"
+	cat >"$BIN_DIR/claude" <<'EOF'
+#!/usr/bin/env bash
+echo "claude $*" >> "$CLAUDE_CALL_LOG"
+echo "Failed to authenticate: OAuth session expired and could not be refreshed"
+exit 1
+EOF
+	chmod +x "$BIN_DIR/claude"
+
+	run bash "$RUN_SH"
+	[ "$status" -eq 1 ]
+
+	# An override run never touches the live cursor (2026-11-07: it did, NC -> NE).
+	[ ! -e "$LOG_DIR/cursor.txt" ]
+	[[ "$output" != *"re-queued"* ]] || return 1
+}
+
+@test "an override run and a dry run each leave an existing cursor.txt byte-identical" {
+	export DISCOVERY_ENABLED=true
+	export DISCOVERY_DRY_RUN=true
+	printf 'NC\n' >"$LOG_DIR/cursor.txt"
+	_before="$(shasum -a 256 <"$LOG_DIR/cursor.txt")"
+
+	# (1) dry run + override list (the exact 2026-11-07 incident)
+	export DISCOVERY_STATES="NE"
+	run bash "$RUN_SH"
+	[ "$status" -eq 0 ]
+	[ "$(shasum -a 256 <"$LOG_DIR/cursor.txt")" = "$_before" ]
+
+	# (2) dry run on the default rotation
+	unset DISCOVERY_STATES
+	run bash "$RUN_SH"
+	[ "$status" -eq 0 ]
+	[ "$(shasum -a 256 <"$LOG_DIR/cursor.txt")" = "$_before" ]
+
+	# (3) non-dry override run
+	export DISCOVERY_DRY_RUN=false
+	export DISCOVERY_STATES="NE IA"
+	run bash "$RUN_SH"
+	[ "$(shasum -a 256 <"$LOG_DIR/cursor.txt")" = "$_before" ]
+}
+
+@test "a default-rotation non-dry run still advances the cursor" {
+	export DISCOVERY_ENABLED=true
+	unset DISCOVERY_STATES
+	printf 'TX\n' >"$LOG_DIR/cursor.txt"
+	run bash "$RUN_SH"
+	[ "$(tr -d ' \n' <"$LOG_DIR/cursor.txt")" = "VA" ]
+}
+
+@test "DISCOVERY_DEFAULT_STATES is ignored without DISCOVERY_TEST_MODE (full default rotation used)" {
+	export DISCOVERY_ENABLED=true DISCOVERY_DRY_RUN=true
+	# strict flags off so the (sentinel-less) preflight does not need a real .env.local
+	export DISCOVERY_REQUIRE_READER=0 DISCOVERY_REQUIRE_INTAKE_TOKEN=0
+	unset DISCOVERY_STATES DISCOVERY_TEST_MODE
+	export DISCOVERY_DEFAULT_STATES="ZZ"
+	export STATES_PER_RUN=1
+	# IA is index 0 of the real default list; under the seam the list would be ZZ
+	# and an absent cursor state reads as index 0, so the batch would be ZZ.
+	printf 'IA\n' >"$LOG_DIR/cursor.txt"
+	run bash "$RUN_SH"
+	[ "$status" -eq 0 ]
+	[[ "$output" == *"starting discovery batch for states=IA "* ]] || return 1
+	[[ "$output" != *"states=ZZ"* ]] || return 1
+}
+
+@test "notify falls back to osascript and writes ALERTS-PENDING when terminal-notifier exits 3" {
+	export DISCOVERY_ENABLED=true
+	unset DISCOVERY_STATES
+	cat >"$BIN_DIR/terminal-notifier" <<'EOF'
+#!/usr/bin/env bash
+echo "terminal-notifier $*" >>"$NOTIFY_CALL_LOG"
+exit 3
+EOF
+	chmod +x "$BIN_DIR/terminal-notifier"
+	cat >"$BIN_DIR/claude" <<'EOF'
+#!/usr/bin/env bash
+echo "Failed to authenticate: OAuth session expired and could not be refreshed"
+exit 1
+EOF
+	chmod +x "$BIN_DIR/claude"
+	run bash "$RUN_SH"
+	[ "$status" -eq 1 ]
+	[[ "$output" == *"notify: FAILED via terminal-notifier (exit 3"* ]] || return 1
+	[[ "$output" == *"notify: dispatched via osascript"* ]] || return 1
+	grep -q "^osascript " "$NOTIFY_CALL_LOG"
+	grep -q "Compute Atlas discovery FAILED" "$LOG_DIR/ALERTS-PENDING.txt"
+	# owner-only: the file can name states/run ids
+	[ "$(ls -l "$LOG_DIR/ALERTS-PENDING.txt" | cut -c1-10)" = "-rw-------" ]
+}
+
+@test "a transient api_error does NOT rewind the cursor" {
+	export DISCOVERY_ENABLED=true
+	unset DISCOVERY_STATES
+	export STATES_PER_RUN=1
+	echo "TX" >"$LOG_DIR/cursor.txt"
+	# Not proven environmental, so the rotation moves on exactly as before.
+	cat >"$BIN_DIR/claude" <<'EOF'
+#!/usr/bin/env bash
+echo "claude $*" >> "$CLAUDE_CALL_LOG"
+echo "API Error: Connection closed mid-response."
+exit 1
+EOF
+	chmod +x "$BIN_DIR/claude"
+
+	run bash "$RUN_SH"
+	[ "$status" -eq 1 ]
+
+	cursor_after="$(cat "$LOG_DIR/cursor.txt" | tr -d ' \n')"
+	[ "$cursor_after" = "VA" ]
+	[[ "$output" != *"re-queued"* ]] || return 1
+}
+
+@test "a fully successful default-rotation batch still advances the cursor by 2" {
+	export DISCOVERY_ENABLED=true
+	unset DISCOVERY_STATES
+	export STATES_PER_RUN=2
+	echo "TX" >"$LOG_DIR/cursor.txt"
+	cat >"$BIN_DIR/claude" <<'EOF'
+#!/usr/bin/env bash
+echo "claude $*" >> "$CLAUDE_CALL_LOG"
+echo '[{"name":"Fine Facility","facilityType":"data_center"}]'
+exit 0
+EOF
+	chmod +x "$BIN_DIR/claude"
+
+	run bash "$RUN_SH"
+	[ "$status" -eq 0 ]
+
+	cursor_after="$(cat "$LOG_DIR/cursor.txt" | tr -d ' \n')"
+	[ "$cursor_after" = "OH" ]
+	[[ "$output" != *"re-queued"* ]] || return 1
+}
+
+@test "a legitimately empty [] is never classified as a failure" {
+	export DISCOVERY_ENABLED=true
+	# candidates-20260713T161505-TX.json is 3 bytes of "[]" and recorded `ok`.
+	# A zero-yield night is a real, valid result — classification must not
+	# turn it into an alert.
+	cat >"$BIN_DIR/claude" <<'EOF'
+#!/usr/bin/env bash
+echo "claude $*" >> "$CLAUDE_CALL_LOG"
+echo '[]'
+exit 0
+EOF
+	chmod +x "$BIN_DIR/claude"
+
+	run bash "$RUN_SH"
+	[ "$status" -eq 0 ]
+	[[ "$output" != *"retrying once"* ]] || return 1
+	# The empty array must reach submit, not be skipped as a parse failure.
+	# (A bare `"skipping submit"` check would false-positive here: the
+	# enrichment lane logs that phrase of its own accord under the npx stub.)
+	grep -q -- "submit-candidates.ts .*--run-id" "$NPX_CALL_LOG"
+	grep -q '"claudeStatus": "ok"' "$LOG_DIR/heartbeat.json"
+	[ ! -s "$NOTIFY_CALL_LOG" ]
+}
+
+# --- session-limit hardening (2026-07-29 AZ crash) --------------------------
+
+@test "claude nonzero exit does not kill the run — reaches completion" {
+	export DISCOVERY_ENABLED=true
+	# Reproduces the 2026-07-29 AZ crash: claude -p exits nonzero on
+	# "You've hit your session limit" instead of a JSON array.
+	cat >"$BIN_DIR/claude" <<'EOF'
+#!/usr/bin/env bash
+echo "claude $*" >> "$CLAUDE_CALL_LOG"
+echo "You've hit your session limit"
+exit 1
+EOF
+	chmod +x "$BIN_DIR/claude"
+
+	run bash "$RUN_SH"
+	# Exit status is now 1 (alerting, 2026-08-14) — a run that staged nothing
+	# must not look identical to a successful one from outside. The point of
+	# this test is unchanged and asserted below: the run still REACHES
+	# completion rather than aborting at the failure.
+	[ "$status" -eq 1 ]
+	[[ "$output" == *"discovery run"*"complete"* ]] || return 1
+	[[ "$output" == *"skipping submit"* ]] || return 1
+	# check-sources still ran after the failure — nothing was short-circuited
+	run grep -q "check-sources.ts" "$NPX_CALL_LOG"
+	[ "$status" -eq 0 ]
+}
+
+@test "no-array result skips the submit step" {
+	export DISCOVERY_ENABLED=true
+	cat >"$BIN_DIR/claude" <<'EOF'
+#!/usr/bin/env bash
+echo "claude $*" >> "$CLAUDE_CALL_LOG"
+echo "You've hit your session limit"
+exit 1
+EOF
+	chmod +x "$BIN_DIR/claude"
+
+	run bash "$RUN_SH"
+	[ "$status" -eq 1 ]
+
+	# The retry gate's candidates_file_shape() call is a `tsx -e` inline
+	# script that itself imports from submit-candidates.ts, so a bare
+	# "submit-candidates.ts" grep would false-positive on it — match on the
+	# actual submit invocation's --run-id flag instead.
+	run grep -c -- "submit-candidates.ts .*--run-id" "$NPX_CALL_LOG"
+	[ "$status" -ne 0 ] || [ "${output//[[:space:]]/}" = "0" ]
+
+	run grep -q "check-sources.ts" "$NPX_CALL_LOG"
+	[ "$status" -eq 0 ]
+}
+
+@test "live run writes a heartbeat with claudeStatus ok on a valid array" {
+	export DISCOVERY_ENABLED=true
+	cat >"$BIN_DIR/claude" <<'EOF'
+#!/usr/bin/env bash
+echo "claude $*" >> "$CLAUDE_CALL_LOG"
+echo '[{"name":"X","facilityType":"data_center"}]'
+exit 0
+EOF
+	chmod +x "$BIN_DIR/claude"
+
+	run bash "$RUN_SH"
+	[ "$status" -eq 0 ]
+
+	[ -f "$LOG_DIR/heartbeat.json" ]
+	grep -q '"claudeStatus": "ok"' "$LOG_DIR/heartbeat.json"
+	grep -q '"lastRunAt"' "$LOG_DIR/heartbeat.json"
+}
+
+@test "session-limit run writes heartbeat with claudeStatus blocked" {
+	export DISCOVERY_ENABLED=true
+	cat >"$BIN_DIR/claude" <<'EOF'
+#!/usr/bin/env bash
+echo "claude $*" >> "$CLAUDE_CALL_LOG"
+echo "You've hit your session limit"
+exit 1
+EOF
+	chmod +x "$BIN_DIR/claude"
+
+	run bash "$RUN_SH"
+	[ "$status" -eq 1 ]
+
+	[ -f "$LOG_DIR/heartbeat.json" ]
+	# NOT "no_array": a session limit is a hard environmental block, and
+	# reporting it as bad model output sent six days of diagnosis down the
+	# wrong path. The top-level verdict below is deliberately unchanged.
+	grep -q '"claudeStatus": "blocked"' "$LOG_DIR/heartbeat.json"
+	# the heartbeat must ALSO carry a top-level verdict, so a reader does not
+	# have to scan per-state entries to know the run was bad
+	grep -q '"status": "degraded"' "$LOG_DIR/heartbeat.json"
+}
+
+@test "dry-run does not write a heartbeat" {
+	export DISCOVERY_ENABLED=true
+	export DISCOVERY_DRY_RUN=true
+	run bash "$RUN_SH"
+	[ "$status" -eq 0 ]
+	[ ! -f "$LOG_DIR/heartbeat.json" ]
+}
+
+# --- self-reverting review cap (Phase 2 Unit B) ------------------------------
+# BURST_START_DATE is a script constant (2026-07-30, 20-day burst window), not
+# injectable from the test — so exact --max=25 assertions are clock-fragile
+# once the real calendar passes 2026-08-19. The two tests below are the
+# durable coverage: the env-override always wins regardless of clock, and the
+# cap-computation block always emits a sane, parseable --max value.
+
+@test "MAX_CANDIDATES env overrides the computed cap" {
+	export DISCOVERY_ENABLED=true
+	export MAX_CANDIDATES=3
+	cat >"$BIN_DIR/claude" <<'EOF'
+#!/usr/bin/env bash
+echo "claude $*" >> "$CLAUDE_CALL_LOG"
+echo '[{"name":"Cap Override Facility","facilityType":"data_center"}]'
+exit 0
+EOF
+	chmod +x "$BIN_DIR/claude"
+
+	run bash "$RUN_SH"
+	[ "$status" -eq 0 ]
+
+	npx_output="$output"
+	run grep -c -- "submit-candidates.ts .*--max=3" "$NPX_CALL_LOG"
+	[ "$status" -eq 0 ]
+	[ "${output//[[:space:]]/}" != "0" ]
+	[[ "$npx_output" == *"review cap for"* ]] || return 1
+}
+
+@test "review cap log line is emitted with a sane computed --max when no override is set" {
+	export DISCOVERY_ENABLED=true
+	cat >"$BIN_DIR/claude" <<'EOF'
+#!/usr/bin/env bash
+echo "claude $*" >> "$CLAUDE_CALL_LOG"
+echo '[{"name":"Cap Compute Facility","facilityType":"data_center"}]'
+exit 0
+EOF
+	chmod +x "$BIN_DIR/claude"
+
+	run bash "$RUN_SH"
+	[ "$status" -eq 0 ]
+
+	# the compute_cap block ran and logged its decision
+	[[ "$output" == *"review cap for"* ]] || return 1
+
+	# the submit call's --max is a bare run of digits that terminates cleanly at
+	# a space or end of line — i.e. never empty (`--max=`), never non-numeric
+	# (`--max=abc`), never a half-expanded value (`--max=25foo`). The specific
+	# number is deliberately NOT pinned here: both caps are 25 today, but the
+	# value is a maintainer knob and BURST_START_DATE is clock-dependent (see
+	# the block comment above), so pinning it would make this test fragile
+	# without guarding the bug class it exists for.
+	run grep -Eo -- "submit-candidates.ts .*--max=[0-9]+([[:space:]]|$)" "$NPX_CALL_LOG"
+	[ "$status" -eq 0 ]
+	[ -n "$output" ]
+}
+
+@test "caffeinate-absent regression: live run completes without an unbound-variable error" {
+	# CAFFEINATE_PREFIX is an empty array whenever `caffeinate` is not on PATH
+	# (true on this Linux/CI shim PATH by default). Under `set -u`, expanding
+	# an empty array without the bash-3.2-safe idiom trips "unbound variable"
+	# and the run would exit nonzero here with that message on stderr.
+	export DISCOVERY_ENABLED=true
+	cat >"$BIN_DIR/claude" <<'EOF'
+#!/usr/bin/env bash
+echo "claude $*" >> "$CLAUDE_CALL_LOG"
+echo '[{"name":"Caffeinate Safety Facility","facilityType":"data_center"}]'
+exit 0
+EOF
+	chmod +x "$BIN_DIR/claude"
+
+	run bash "$RUN_SH"
+	[ "$status" -eq 0 ]
+	[[ "$output" != *"unbound variable"* ]] || return 1
+	[[ "$output" == *"discovery run"*"complete"* ]] || return 1
+}
+
+# --- verification-gate import safety (Track 1 Task 7) -----------------------
+# submit-candidates.ts now imports verify-source.ts / fetch-page-text.ts /
+# ollama-client.ts at module scope (Task 6). The ONE place a BATS run
+# genuinely executes that module scope for REAL — not the shimmed `npx`
+# no-op at the `*submit-candidates.ts*` case in setup() above — is
+# candidates_file_shape()'s "tsx -e" inline import in run.sh;
+# this file's npx shim deliberately delegates any "tsx -e" invocation to the
+# real npx/tsx (see the comment at the top of that case). The gate's real
+# verifyImpl is constructed only inside submit-candidates.ts's main() (see
+# its buildRealVerifyImpl doc-comment), and main() never runs in a "-e"
+# context because process.argv[1] there is not submit-candidates.ts's own
+# path — but that is a structural guarantee internal to the module, not
+# something visible from outside it, so it is pinned here as an explicit
+# regression rather than left implicit. VERIFY_SOURCES_ENABLED is
+# deliberately left UNSET in both tests below — the default (gate ON) config
+# is exactly the scenario that matters: safety here must not depend on the
+# opt-out being set.
+
+@test "importing submit-candidates.ts via tsx -e attempts no connection to localhost:11434 (valid array input)" {
+	cd "$REPO_ROOT"
+	CANDIDATES_FILE="$TEST_TMP/candidates-import-safety-ok.json"
+	echo '[{"name":"Import Safety Facility","facilityType":"data_center"}]' >"$CANDIDATES_FILE"
+
+	# `timeout` is a defensive backstop only, not the real assertion below —
+	# a refused connection to a closed localhost port fails near-instantly,
+	# it would not hang.
+	if [[ -n "$TIMEOUT_BIN" ]]; then
+		run "$TIMEOUT_BIN" 10 npx tsx -e "$IMPORT_CHECK_SCRIPT" "$CANDIDATES_FILE"
+	else
+		run npx tsx -e "$IMPORT_CHECK_SCRIPT" "$CANDIDATES_FILE"
+	fi
+
+	[ "$status" -eq 0 ]
+	[[ "$output" != *"ECONNREFUSED"* ]] || return 1
+	[[ "$output" != *"11434"* ]] || return 1
+	[[ "$output" != *"fetch failed"* ]] || return 1
+	[[ "$output" != *"OLLAMA"* ]] || return 1
+	# Exit-code 1 alone is ambiguous — main()'s own early "API_ADMIN_TOKEN is
+	# not set" exit(1) coincides with the intentional invalid-array exit(1)
+	# below, so these are the sharper, structural signal: they can ONLY
+	# appear if `main()` ran in this "-e" context at all (a broken `isMain`
+	# guard), which is the actual regression this test exists to catch —
+	# confirmed by deliberately breaking `isMain` and re-running this file.
+	[[ "$output" != *"API_ADMIN_TOKEN"* ]] || return 1
+	[[ "$output" != *"Usage: submit-candidates.ts"* ]] || return 1
+}
+
+# --- multi-state batch (Unit 2, 2026-08-14) ----------------------------------
+# STATES=(TX VA OH GA AZ NV NC PA IL WI IN OK WY NM LA) — starting at TX, a
+# 2-state batch is [TX VA] and the cursor should land on OH (advance-by-2).
+
+@test "STATES_PER_RUN=1 preserves today's single-state behavior" {
+	export DISCOVERY_ENABLED=true
+	# Live (non-dry) run: dry runs no longer advance the cursor.
+	export DISCOVERY_DRY_RUN=false
+	export STATES_PER_RUN=1
+	echo "TX" >"$LOG_DIR/cursor.txt"
+
+	run bash "$RUN_SH"
+	[ "$status" -eq 0 ]
+
+	# exactly one candidates file written (one state processed)
+	outfile_count="$(find "$LOG_DIR" -name 'candidates-*.json' | wc -l | tr -d ' ')"
+	[ "$outfile_count" = "1" ]
+
+	# cursor advances by exactly 1: TX -> VA
+	cursor_after="$(cat "$LOG_DIR/cursor.txt" | tr -d ' \n')"
+	[ "$cursor_after" = "VA" ]
+}
+
+@test "a 2-state batch processes both states and advances the cursor by 2" {
+	export DISCOVERY_ENABLED=true
+	# Live (non-dry) run: dry runs no longer advance the cursor.
+	export DISCOVERY_DRY_RUN=false
+	export STATES_PER_RUN=2
+	echo "TX" >"$LOG_DIR/cursor.txt"
+
+	run bash "$RUN_SH"
+	[ "$status" -eq 0 ]
+
+	[[ "$output" == *"states=TX VA"* ]] || return 1
+
+	# two distinct candidates files, one per state
+	outfile_count="$(find "$LOG_DIR" -name 'candidates-*.json' | wc -l | tr -d ' ')"
+	[ "$outfile_count" = "2" ]
+	[ -n "$(find "$LOG_DIR" -name 'candidates-*-TX.json' -print -quit)" ]
+	[ -n "$(find "$LOG_DIR" -name 'candidates-*-VA.json' -print -quit)" ]
+
+	# TX VA -> next up is OH (index 0,1 consumed, cursor lands on index 2)
+	cursor_after="$(cat "$LOG_DIR/cursor.txt" | tr -d ' \n')"
+	[ "$cursor_after" = "OH" ]
+}
+
+@test "a 2-state batch wraps the rotation correctly at the end of the list" {
+	export DISCOVERY_ENABLED=true
+	# Live (non-dry) run: dry runs no longer advance the cursor.
+	export DISCOVERY_DRY_RUN=false
+	export STATES_PER_RUN=2
+	# STATES=(TX VA OH GA AZ NV NC PA IL WI IN OK WY NM LA) — NM is index 13,
+	# LA is index 14 (the last). A batch starting at NM must wrap to TX.
+	echo "NM" >"$LOG_DIR/cursor.txt"
+
+	run bash "$RUN_SH"
+	[ "$status" -eq 0 ]
+
+	[[ "$output" == *"states=NM LA"* ]] || return 1
+	cursor_after="$(cat "$LOG_DIR/cursor.txt" | tr -d ' \n')"
+	[ "$cursor_after" = "TX" ]
+}
+
+@test "one state's claude failure does not prevent the other state in the batch from completing" {
+	export DISCOVERY_ENABLED=true
+	export STATES_PER_RUN=2
+	echo "TX" >"$LOG_DIR/cursor.txt"
+
+	# Batch is [TX VA]. TX's only attempt (call 1) fails with a session-limit
+	# nonzero exit and no array — classified `blocked`, so there is NO retry;
+	# VA's primary attempt (call 2) succeeds with a valid array, proving TX's
+	# total failure does not stop VA from running to completion. A counter (not
+	# wc -l on CLAUDE_CALL_LOG) tracks the call number, since the prompt text
+	# logged per call spans many lines on its own.
+	CLAUDE_COUNTER_FILE="$TEST_TMP/claude-call-count"
+	echo 0 >"$CLAUDE_COUNTER_FILE"
+	cat >"$BIN_DIR/claude" <<EOF
+#!/usr/bin/env bash
+echo "claude \$*" >> "$CLAUDE_CALL_LOG"
+n="\$(cat "$CLAUDE_COUNTER_FILE")"
+n=\$((n + 1))
+echo "\$n" >"$CLAUDE_COUNTER_FILE"
+if [ "\$n" -le 1 ]; then
+	echo "You've hit your session limit"
+	exit 1
+else
+	echo '[{"name":"Second State Facility","facilityType":"data_center"}]'
+	exit 0
+fi
+EOF
+	chmod +x "$BIN_DIR/claude"
+
+	run bash "$RUN_SH"
+	# TX failed, so the batch exit status is 1 — but VA still ran to
+	# completion, which is what this test actually guards.
+	[ "$status" -eq 1 ]
+
+	# two claude calls total: TX primary (blocked — no retry), VA primary
+	call_count="$(cat "$CLAUDE_COUNTER_FILE")"
+	[ "$call_count" -eq 2 ]
+
+	# both states reached completion despite TX's total claude failure
+	[[ "$output" == *"discovery batch complete"* ]] || return 1
+	[[ "$output" == *"skipping submit"* ]] || return 1
+
+	# only VA's candidates made it to submit (TX skipped — no parseable array)
+	run grep -c -- "submit-candidates.ts .*--run-id" "$NPX_CALL_LOG"
+	[ "$status" -eq 0 ]
+	[ "${output//[[:space:]]/}" = "1" ]
+	run grep -- "submit-candidates.ts .*--run-id" "$NPX_CALL_LOG"
+	[[ "$output" == *"--state=VA"* ]] || return 1
+}
+
+@test "batch heartbeat records one entry per state with per-state claudeStatus" {
+	export DISCOVERY_ENABLED=true
+	export STATES_PER_RUN=2
+	echo "TX" >"$LOG_DIR/cursor.txt"
+
+	# Same TX-fails / VA-succeeds shape as the isolation test above, so the
+	# batch produces one `blocked` entry and one `ok` entry. TX's fixture is a
+	# session limit, so its class is `blocked` — not the blanket `no_array`
+	# this test used to assert.
+	CLAUDE_COUNTER_FILE="$TEST_TMP/claude-call-count"
+	echo 0 >"$CLAUDE_COUNTER_FILE"
+	cat >"$BIN_DIR/claude" <<EOF
+#!/usr/bin/env bash
+echo "claude \$*" >> "$CLAUDE_CALL_LOG"
+n="\$(cat "$CLAUDE_COUNTER_FILE")"
+n=\$((n + 1))
+echo "\$n" >"$CLAUDE_COUNTER_FILE"
+if [ "\$n" -le 1 ]; then
+	echo "You've hit your session limit"
+	exit 1
+else
+	echo '[{"name":"Heartbeat Facility","facilityType":"data_center"}]'
+	exit 0
+fi
+EOF
+	chmod +x "$BIN_DIR/claude"
+
+	run bash "$RUN_SH"
+	[ "$status" -eq 1 ]
+
+	[ -f "$LOG_DIR/heartbeat.json" ]
+	grep -q '"lastRunAt"' "$LOG_DIR/heartbeat.json"
+	grep -q '"state": "TX"' "$LOG_DIR/heartbeat.json"
+	grep -q '"state": "VA"' "$LOG_DIR/heartbeat.json"
+	grep -q '"claudeStatus": "blocked"' "$LOG_DIR/heartbeat.json"
+	grep -q '"claudeStatus": "ok"' "$LOG_DIR/heartbeat.json"
+
+	# must stay valid JSON
+	run node -e "JSON.parse(require('fs').readFileSync('$LOG_DIR/heartbeat.json', 'utf8'))"
+	[ "$status" -eq 0 ]
+}
+
+# --- false-OK guard: a state whose candidates mostly get rejected as invalid ----
+# (2026-10-28: 93 of 98 skippedInvalid, run still printed OK). Rule: discovered
+# >= 5 AND skippedInvalid/discovered > 0.5 (strict) degrades the run.
+
+@test "false-OK guard: 10/10 invalid candidates degrade the run and name the state" {
+	export DISCOVERY_ENABLED=true STATES_PER_RUN=1 SUBMIT_COUNTS="10 10"
+	echo "TX" >"$LOG_DIR/cursor.txt"
+	run bash "$RUN_SH"
+	[ "$status" -eq 1 ]
+	_assert_output_has ": 10/10 candidates rejected as invalid"
+	grep -q '"status": "degraded"' "$LOG_DIR/heartbeat.json"
+}
+
+@test "false-OK guard: exactly 50% invalid (5/10) is NOT degraded" {
+	export DISCOVERY_ENABLED=true STATES_PER_RUN=1 SUBMIT_COUNTS="10 5"
+	run bash "$RUN_SH"
+	[ "$status" -eq 0 ]
+	_assert_output_lacks "rejected as invalid"
+	grep -q '"status": "ok"' "$LOG_DIR/heartbeat.json"
+}
+
+@test "false-OK guard: below the floor (4 discovered, 4 invalid) is NOT degraded" {
+	export DISCOVERY_ENABLED=true STATES_PER_RUN=1 SUBMIT_COUNTS="4 4"
+	run bash "$RUN_SH"
+	[ "$status" -eq 0 ]
+	_assert_output_lacks "rejected as invalid"
+}
+
+@test "false-OK guard: at the floor and over half (3/5) is degraded" {
+	export DISCOVERY_ENABLED=true STATES_PER_RUN=1 SUBMIT_COUNTS="5 3"
+	run bash "$RUN_SH"
+	[ "$status" -eq 1 ]
+	_assert_output_has "3/5 candidates rejected as invalid"
+	grep -q '"status": "degraded"' "$LOG_DIR/heartbeat.json"
+}
+
+@test "false-OK guard: 0 discovered is no error and NOT degraded" {
+	export DISCOVERY_ENABLED=true STATES_PER_RUN=1 SUBMIT_COUNTS="0 0"
+	run bash "$RUN_SH"
+	[ "$status" -eq 0 ]
+	_assert_output_lacks "division"
+	grep -q '"status": "ok"' "$LOG_DIR/heartbeat.json"
+}
+
+@test "false-OK guard: a missing summary after a successful submit fails closed" {
+	export DISCOVERY_ENABLED=true STATES_PER_RUN=1 SUBMIT_SUMMARY_MODE=missing
+	run bash "$RUN_SH"
+	[ "$status" -eq 1 ]
+	_assert_output_has "submit summary unreadable"
+	grep -q '"status": "degraded"' "$LOG_DIR/heartbeat.json"
+}
+
+@test "false-OK guard: an unparseable summary after a successful submit fails closed" {
+	export DISCOVERY_ENABLED=true STATES_PER_RUN=1 SUBMIT_SUMMARY_MODE=garbage
+	run bash "$RUN_SH"
+	[ "$status" -eq 1 ]
+	_assert_output_has "submit summary unreadable"
+	grep -q '"status": "degraded"' "$LOG_DIR/heartbeat.json"
+}
+
+@test "false-OK guard: the 10-28 re-run shape (8 discovered, 0 invalid) is OK" {
+	export DISCOVERY_ENABLED=true STATES_PER_RUN=1 SUBMIT_COUNTS="8 0"
+	run bash "$RUN_SH"
+	[ "$status" -eq 0 ]
+	grep -q '"status": "ok"' "$LOG_DIR/heartbeat.json"
+}
+
+@test "false-OK guard: dry-run is unaffected (no summary check)" {
+	export DISCOVERY_ENABLED=true DISCOVERY_DRY_RUN=true SUBMIT_COUNTS="10 10"
+	run bash "$RUN_SH"
+	[ "$status" -eq 0 ]
+	_assert_output_lacks "rejected as invalid"
+}
+
+@test "false-OK guard: one tripping state degrades the batch, other states still submit, no rewind" {
+	export DISCOVERY_ENABLED=true STATES_PER_RUN=2 SUBMIT_COUNTS_TX="10 9" SUBMIT_COUNTS_VA="6 0"
+	echo "TX" >"$LOG_DIR/cursor.txt"
+	run bash "$RUN_SH"
+	[ "$status" -eq 1 ]
+	_assert_output_has "TX: 9/10 candidates rejected as invalid"
+	_assert_output_lacks "VA: 0/6 candidates rejected as invalid"
+	grep -q '"status": "degraded"' "$LOG_DIR/heartbeat.json"
+	grep -q '"claudeStatus": "invalid_majority"' "$LOG_DIR/heartbeat.json"
+	grep -q '"claudeStatus": "ok"' "$LOG_DIR/heartbeat.json"
+	[ "$(grep -c -- "submit-candidates.ts .*--run-id" "$NPX_CALL_LOG")" = "2" ]
+	# degrade only: the cursor is not rewound
+	_assert_output_lacks "re-queued"
+}
+
+@test "importing submit-candidates.ts via tsx -e attempts no connection to localhost:11434 (unparseable input)" {
+	cd "$REPO_ROOT"
+	CANDIDATES_FILE="$TEST_TMP/candidates-import-safety-bad.json"
+	echo 'not an array at all' >"$CANDIDATES_FILE"
+
+	if [[ -n "$TIMEOUT_BIN" ]]; then
+		run "$TIMEOUT_BIN" 10 npx tsx -e "$IMPORT_CHECK_SCRIPT" "$CANDIDATES_FILE"
+	else
+		run npx tsx -e "$IMPORT_CHECK_SCRIPT" "$CANDIDATES_FILE"
+	fi
+
+	[ "$status" -eq 1 ]
+	[[ "$output" != *"ECONNREFUSED"* ]] || return 1
+	[[ "$output" != *"11434"* ]] || return 1
+	[[ "$output" != *"fetch failed"* ]] || return 1
+	[[ "$output" != *"OLLAMA"* ]] || return 1
+	# See the sibling test above — exit(1) is ambiguous on its own between
+	# "correctly detected a non-array" and "main() crashed for an unrelated
+	# reason"; this is the assertion that actually discriminates the two.
+	[[ "$output" != *"API_ADMIN_TOKEN"* ]] || return 1
+	[[ "$output" != *"Usage: submit-candidates.ts"* ]] || return 1
+}
+
+# --- alerting (open item #1, 2026-08-14) -------------------------------------
+# heartbeat.json recorded claudeStatus=no_array every day for SIX consecutive
+# days and nothing surfaced it: a totally failed run and a perfect one were
+# indistinguishable from outside — both logged, both wrote a heartbeat, both
+# exited 0. These tests pin the two halves of the fix (notification + nonzero
+# exit) AND the negative case, which is the one that matters most: an alert
+# that fires on healthy runs gets ignored and is worth nothing.
+
+@test "a run that stages nothing attempts a desktop notification and exits nonzero" {
+	export DISCOVERY_ENABLED=true
+	cat >"$BIN_DIR/claude" <<'EOF'
+#!/usr/bin/env bash
+echo "claude $*" >> "$CLAUDE_CALL_LOG"
+echo "You've hit your session limit"
+exit 1
+EOF
+	chmod +x "$BIN_DIR/claude"
+
+	run bash "$RUN_SH"
+	[ "$status" -eq 1 ]
+	[ -s "$NOTIFY_CALL_LOG" ]
+	grep -q "Compute Atlas discovery FAILED" "$NOTIFY_CALL_LOG"
+	[[ "$output" == *"FAIL: discovery run finished with 1 failure"* ]] || return 1
+	# The alerting behaviour is unchanged for a `blocked` run — only the
+	# message names the real cause now instead of blaming the model's JSON.
+	[[ "$output" == *"run blocked by the environment"* ]] || return 1
+}
+
+@test "a clean run attempts NO notification and exits 0" {
+	export DISCOVERY_ENABLED=true
+	cat >"$BIN_DIR/claude" <<'EOF'
+#!/usr/bin/env bash
+echo "claude $*" >> "$CLAUDE_CALL_LOG"
+echo '[{"name":"Clean Run Facility","facilityType":"data_center"}]'
+exit 0
+EOF
+	chmod +x "$BIN_DIR/claude"
+
+	run bash "$RUN_SH"
+	[ "$status" -eq 0 ]
+	[ ! -s "$NOTIFY_CALL_LOG" ]
+	[[ "$output" == *"discovery run OK — no failures"* ]] || return 1
+	grep -q '"status": "ok"' "$LOG_DIR/heartbeat.json"
+	grep -q '"failureCount": 0' "$LOG_DIR/heartbeat.json"
+}
+
+@test "the alert and exit status come AFTER submit, source-liveness and heartbeat" {
+	export DISCOVERY_ENABLED=true
+	# A failing run must still do every piece of work a passing one does —
+	# alerting must never cost the pipeline output it would otherwise produce.
+	cat >"$BIN_DIR/claude" <<'EOF'
+#!/usr/bin/env bash
+echo "claude $*" >> "$CLAUDE_CALL_LOG"
+echo "You've hit your session limit"
+exit 1
+EOF
+	chmod +x "$BIN_DIR/claude"
+
+	run bash "$RUN_SH"
+	[ "$status" -eq 1 ]
+	grep -q "check-sources.ts" "$NPX_CALL_LOG"
+	[ -f "$LOG_DIR/heartbeat.json" ]
+	run node -e "JSON.parse(require('fs').readFileSync('$LOG_DIR/heartbeat.json', 'utf8'))"
+	[ "$status" -eq 0 ]
+}
+
+@test "a stale heartbeat surfaces missed runs on the next run that happens" {
+	export DISCOVERY_ENABLED=true
+	export DISCOVERY_DRY_RUN=true
+	# BSD (macOS) then GNU (Linux/CI) — this file must pass on both.
+	old="$(date -j -v-5d '+%Y-%m-%dT%H:%M:%S%z' 2>/dev/null \
+		|| date -d '5 days ago' '+%Y-%m-%dT%H:%M:%S%z')"
+	printf '{\n  "lastRunAt": "%s",\n  "states": []\n}\n' "$old" >"$LOG_DIR/heartbeat.json"
+
+	run bash "$RUN_SH"
+	# Missed PRIOR runs do not make THIS run a failure — it is reported, not
+	# punished. Exit stays 0 because this run itself was fine.
+	[ "$status" -eq 0 ]
+	[[ "$output" == *"scheduled runs were MISSED"* ]] || return 1
+	[ -s "$NOTIFY_CALL_LOG" ]
+	grep -q "Missed runs" "$NOTIFY_CALL_LOG"
+}
+
+@test "a fresh heartbeat does not report missed runs" {
+	export DISCOVERY_ENABLED=true
+	export DISCOVERY_DRY_RUN=true
+	now="$(date '+%Y-%m-%dT%H:%M:%S%z')"
+	printf '{\n  "lastRunAt": "%s",\n  "states": []\n}\n' "$now" >"$LOG_DIR/heartbeat.json"
+
+	run bash "$RUN_SH"
+	[ "$status" -eq 0 ]
+	[[ "$output" != *"scheduled runs were MISSED"* ]] || return 1
+	[ ! -s "$NOTIFY_CALL_LOG" ]
+}
+
+# --- wall-clock cap enforcement (open item #2, 2026-08-14) -------------------
+# MEASURED: against a process that ignores SIGTERM, `timeout 2` let it run the
+# full 31s and STILL exited 124. So (a) -k is what actually enforces, and
+# (b) exit status can never detect a cap that failed — only wall-clock can.
+
+@test "the claude invocation passes --kill-after so SIGTERM-ignoring processes are SIGKILLed" {
+	export DISCOVERY_ENABLED=true
+	TIMEOUT_CALL_LOG="$TEST_TMP/timeout-calls.log"
+	# Shim `timeout` to record its own arguments (which the `claude` shim
+	# cannot see) and then pass through to the wrapped command.
+	cat >"$BIN_DIR/timeout" <<EOF
+#!/usr/bin/env bash
+echo "timeout \$*" >>"$TIMEOUT_CALL_LOG"
+shift 3   # -k <kill-after> <duration>
+exec "\$@"
+EOF
+	chmod +x "$BIN_DIR/timeout"
+	cat >"$BIN_DIR/claude" <<'EOF'
+#!/usr/bin/env bash
+echo "claude $*" >> "$CLAUDE_CALL_LOG"
+echo '[{"name":"Kill After Facility","facilityType":"data_center"}]'
+exit 0
+EOF
+	chmod +x "$BIN_DIR/claude"
+
+	run bash "$RUN_SH"
+	[ "$status" -eq 0 ]
+	[ -s "$TIMEOUT_CALL_LOG" ]
+	grep -q -- "-k " "$TIMEOUT_CALL_LOG"
+}
+
+@test "a claude call that outlives the cap is reported as a cap-enforcement failure" {
+	export DISCOVERY_ENABLED=true
+	export DISCOVERY_TIMEOUT_SECS=1
+	export DISCOVERY_KILL_AFTER_SECS=1
+	export DISCOVERY_OVERRUN_GRACE_SECS=1   # overrun limit = 3s
+	# Reproduces the 2026-08-11/12 signature: the machine slept, macOS paused
+	# ITIMER_REAL, and `timeout` never fired despite the cap elapsing (runs of
+	# 106 min against a 600s cap). Shimming `timeout` to pass straight through
+	# makes the cap provably do nothing, which is the condition under test.
+	cat >"$BIN_DIR/timeout" <<'EOF'
+#!/usr/bin/env bash
+shift 3
+exec "$@"
+EOF
+	chmod +x "$BIN_DIR/timeout"
+	cat >"$BIN_DIR/claude" <<'EOF'
+#!/usr/bin/env bash
+echo "claude $*" >> "$CLAUDE_CALL_LOG"
+sleep 5
+echo '[{"name":"Overrun Facility","facilityType":"data_center"}]'
+exit 0
+EOF
+	chmod +x "$BIN_DIR/claude"
+
+	run bash "$RUN_SH"
+	# NOTE the shape: this run produced a perfectly valid candidate array and
+	# submitted it, so claudeStatus is "ok" — and it STILL fails. An overrun is
+	# a failure of the guard, not of the output, and the old code could not see
+	# the difference at all.
+	[ "$status" -eq 1 ]
+	[[ "$output" == *"the wall-clock cap did NOT enforce"* ]] || return 1
+	[ -s "$NOTIFY_CALL_LOG" ]
+	grep -q '"claudeStatus": "ok"' "$LOG_DIR/heartbeat.json"
+	grep -q '"status": "degraded"' "$LOG_DIR/heartbeat.json"
+}
+
+@test "a claude call within the cap is NOT reported as an overrun" {
+	export DISCOVERY_ENABLED=true
+	export DISCOVERY_TIMEOUT_SECS=30
+	export DISCOVERY_KILL_AFTER_SECS=5
+	export DISCOVERY_OVERRUN_GRACE_SECS=5
+	cat >"$BIN_DIR/claude" <<'EOF'
+#!/usr/bin/env bash
+echo "claude $*" >> "$CLAUDE_CALL_LOG"
+echo '[{"name":"Fast Facility","facilityType":"data_center"}]'
+exit 0
+EOF
+	chmod +x "$BIN_DIR/claude"
+
+	run bash "$RUN_SH"
+	[ "$status" -eq 0 ]
+	[[ "$output" != *"did NOT enforce"* ]] || return 1
+	[ ! -s "$NOTIFY_CALL_LOG" ]
+}
+
+@test "per-state wall-clock lands in the heartbeat" {
+	export DISCOVERY_ENABLED=true
+	cat >"$BIN_DIR/claude" <<'EOF'
+#!/usr/bin/env bash
+echo "claude $*" >> "$CLAUDE_CALL_LOG"
+echo '[{"name":"Elapsed Facility","facilityType":"data_center"}]'
+exit 0
+EOF
+	chmod +x "$BIN_DIR/claude"
+
+	run bash "$RUN_SH"
+	[ "$status" -eq 0 ]
+	grep -q '"elapsedSecs"' "$LOG_DIR/heartbeat.json"
+	run node -e "
+		const hb = JSON.parse(require('fs').readFileSync('$LOG_DIR/heartbeat.json', 'utf8'));
+		if (typeof hb.states[0].elapsedSecs !== 'number') process.exit(1);
+	"
+	[ "$status" -eq 0 ]
+}
+
+# --- rotation rebalance (2026-08-14, expanded 2026-09-13) -------------------
+# The prior 15-state rotation held 555 of 941 live facilities; the other 386
+# lived in states the pipeline NEVER visited. Note every test above pins
+# DISCOVERY_STATES to the OLD list (see setup()) because they test cursor
+# MECHANICS; these two are the ones that assert list CONTENT.
+#
+# 2026-09-13: expanded from 22 states to all 50 states + DC (51 tokens,
+# derived from lib/us-states.ts's US_STATE_NAMES). The 22 from the prior
+# rebalance stay first (asserted "not dropped" below); the 29 states that had
+# NEVER been in the rotation at all — not even pre-2026-08-14 — are asserted
+# "present" as their own group so a future edit can't silently drop the newly
+# added half.
+
+@test "the default rotation adds the unvisited hyperscaler states without dropping any" {
+	export DISCOVERY_ENABLED=true
+	export DISCOVERY_DRY_RUN=true
+	unset DISCOVERY_STATES DISCOVERY_DEFAULT_STATES
+	rm -f "$LOG_DIR/cursor.txt"
+	export STATES_PER_RUN=99   # clamped to the rotation length — visits all
+
+	run bash "$RUN_SH"
+	[ "$status" -eq 0 ]
+
+	# newly added in the 2026-08-14 rebalance: the major hyperscaler markets
+	# that had zero attention
+	for s in IA NE WA OR MN MO UT; do
+		[[ "$output" == *"for state=$s"* ]] || {
+			echo "missing newly-added state: $s"
+			false
+		}
+	done
+	# and nothing was removed — dropping TX/VA would silently stop re-checking
+	# their 216 facilities for status changes
+	for s in TX VA OH GA AZ NV NC PA IL WI IN OK WY NM LA; do
+		[[ "$output" == *"for state=$s"* ]] || {
+			echo "default rotation dropped state: $s"
+			false
+		}
+	done
+}
+
+@test "the 2026-09-13 expansion adds all 29 never-swept states plus DC" {
+	export DISCOVERY_ENABLED=true
+	export DISCOVERY_DRY_RUN=true
+	unset DISCOVERY_STATES DISCOVERY_DEFAULT_STATES
+	rm -f "$LOG_DIR/cursor.txt"
+	export STATES_PER_RUN=99   # clamped to the rotation length — visits all
+
+	run bash "$RUN_SH"
+	[ "$status" -eq 0 ]
+
+	# every state that had NEVER been in the rotation before this expansion —
+	# not the 2026-08-14 rebalance's additions, which the test above already
+	# covers — plus DC, a valid facility jurisdiction (lib/us-states.ts).
+	for s in AL AK AR CA CO CT DC DE FL HI ID KS KY ME MD MA MI MS MT NH NJ NY ND RI SC SD TN VT WV; do
+		[[ "$output" == *"for state=$s"* ]] || {
+			echo "2026-09-13 expansion missing state: $s"
+			false
+		}
+	done
+}
+
+@test "DEFAULT_STATES keeps the original 22 in their exact order at the front, with the 29 added states appended, no duplicates" {
+	# ORDER, not just membership — the test above only proves every state is
+	# PRESENT, and cannot fail if the list is re-sorted or a new state is
+	# spliced into the middle of the original 22. That distinction matters
+	# here specifically: the cursor file ($LOG_DIR/cursor.txt) holds a state
+	# CODE, not an index, so the whole safety argument for this rotation
+	# expansion (see run.sh's DEFAULT_STATES comment) is that the original 22
+	# keep their PRIOR order at the front and the 29 new states are appended
+	# after — only that shape keeps a live cursor valid across the change. A
+	# re-sort (e.g. someone alphabetizing the list later) or an insertion
+	# into the middle of the front 22 would keep every state present — still
+	# passing the test above — while silently relocating the cursor mid-cycle.
+	# Do not "simplify" this back to a membership check.
+	export DISCOVERY_ENABLED=true
+	export DISCOVERY_DRY_RUN=true
+	unset DISCOVERY_STATES DISCOVERY_DEFAULT_STATES
+	rm -f "$LOG_DIR/cursor.txt"
+	export STATES_PER_RUN=99   # clamped to 51 — the whole rotation in ONE batch,
+	                           # so BATCH_STATES[*] is the full ordered list.
+
+	run bash "$RUN_SH"
+	[ "$status" -eq 0 ]
+
+	# Pull the exact ordered list run.sh actually iterated from its own
+	# "starting discovery batch for states=..." log line — this
+	# is the runtime BEHAVIOR (BATCH_STATES built from the live STATES array),
+	# not a re-parse of run.sh's source text, so a genuine reordering in
+	# DEFAULT_STATES cannot hide from it.
+	states_actual="$(grep -o 'starting discovery batch for states=[^(]*' <<<"$output" \
+		| sed -e 's/starting discovery batch for states=//' -e 's/[[:space:]]*$//')"
+	[ -n "$states_actual" ]
+
+	read -r -a actual_arr <<<"$states_actual"
+	[ "${#actual_arr[@]}" -eq 51 ]
+
+	unique_count="$(printf '%s\n' "${actual_arr[@]}" | sort -u | wc -l | tr -d ' ')"
+	[ "$unique_count" -eq 51 ]
+
+	# the first 22 tokens, in sequence, against a literal — this is the
+	# original 2026-08-14 rotation, unchanged.
+	first22="${actual_arr[*]:0:22}"
+	[ "$first22" = "IA NE WA OR MN MO UT TX VA OH GA AZ NV NC PA IL WI IN OK WY NM LA" ]
+
+	# the full 51-token sequence, in order, against a literal.
+	expected="IA NE WA OR MN MO UT TX VA OH GA AZ NV NC PA IL WI IN OK WY NM LA AL AK AR CA CO CT DC DE FL HI ID KS KY ME MD MA MI MS MT NH NJ NY ND RI SC SD TN VT WV"
+	[ "$states_actual" = "$expected" ]
+}
+
+@test "DISCOVERY_STATES drives a targeted manual run without editing the script" {
+	export DISCOVERY_ENABLED=true
+	export DISCOVERY_DRY_RUN=true
+	export DISCOVERY_STATES="IA NE"
+	export STATES_PER_RUN=2
+	rm -f "$LOG_DIR/cursor.txt"
+
+	run bash "$RUN_SH"
+	[ "$status" -eq 0 ]
+	[[ "$output" == *"states=IA NE"* ]] || return 1
+	[ -n "$(find "$LOG_DIR" -name 'candidates-*-IA.json' -print -quit)" ]
+	[ -n "$(find "$LOG_DIR" -name 'candidates-*-NE.json' -print -quit)" ]
+	# no state outside the override was touched
+	[ -z "$(find "$LOG_DIR" -name 'candidates-*-TX.json' -print -quit)" ]
+}
+
+@test "a whitespace-only DISCOVERY_STATES falls back to the default rotation instead of doing nothing" {
+	export DISCOVERY_ENABLED=true
+	export DISCOVERY_DRY_RUN=true
+	# Deliberately whitespace, not "" — `${DISCOVERY_STATES:-...}` already
+	# treats an empty value as unset, so "" can never reach the guard. A
+	# whitespace-only value DOES: it is non-empty to the shell but expands to
+	# zero array elements, which would otherwise make the run silently
+	# process no states at all.
+	export DISCOVERY_STATES="   "
+	export STATES_PER_RUN=1
+	rm -f "$LOG_DIR/cursor.txt"
+
+	run bash "$RUN_SH"
+	[ "$status" -eq 0 ]
+	[[ "$output" == *"falling back to the default rotation"* ]] || return 1
+	# it actually processed a state rather than silently no-opping
+	outfile_count="$(find "$LOG_DIR" -name 'candidates-*.json' | wc -l | tr -d ' ')"
+	[ "$outfile_count" = "1" ]
+}
+
+# --- field-extraction/verification lane (2026-09-01, F0) --------------------
+# extract-fields.ts / verify-fields.ts are shimmed by the catch-all `*) exit 0`
+# case in setup()'s fake npx — neither creates its --out file, so the
+# enrichment submit is skipped with the "nothing to stage" WARN. These tests
+# assert run.sh's own invocation of the lane, not the helpers' behavior.
+
+@test "extract-fields.ts is invoked with an explicit --fields allowlist" {
+	export DISCOVERY_ENABLED=true
+	export DISCOVERY_DRY_RUN=false
+	run bash "$RUN_SH"
+	[ "$status" -eq 0 ]
+
+	# THIS IS THE MOST IMPORTANT TEST IN THIS FILE. --fields is a safety
+	# guard: parseFieldsArg() defaults to ALL SIX extractable fields when
+	# --fields is omitted, and two of those (capacityMw.planned at 75%
+	# precision, energy.onSiteGenerationMw at 50%) failed the accuracy bench
+	# and are not safe to stage unattended every night. Do not "simplify"
+	# this flag away — that silently re-enables both benched-unsafe fields.
+	extract_line="$(grep "extract-fields.ts" "$NPX_CALL_LOG" | head -1)"
+	[ -n "$extract_line" ]
+	[[ "$extract_line" == *"--fields=water.coolingType"* ]] || return 1
+
+	# capacityMw.operational was unpinned from the nightly extract lane on
+	# 2026-10-29 (Ed). The positive above is a substring match, so it cannot
+	# catch an appended field; this explicit return 1 also fails on bash 3.2,
+	# where a failed mid-test [[ ]] does not fail the test.
+	if [[ "$extract_line" == *"capacityMw.operational"* ]]; then return 1; fi
+
+	# The positive assertion above is a SUBSTRING match, so it cannot catch an
+	# APPENDED field — `...,water.coolingType,capacityMw.planned` still matches it.
+	# These two negative assertions are what actually enforce the safety property
+	# the comment above claims: the two fields the bench REJECTED must never
+	# appear in the pinned list. Verified 2026-09-01: without these, a list with
+	# capacityMw.planned appended passes.
+	[[ "$extract_line" != *"capacityMw.planned"* ]] || return 1
+	[[ "$extract_line" != *"energy.onSiteGenerationMw"* ]] || return 1
+
+	# energy.source and energy.utility were dropped from the nightly list on
+	# 2026-09-01 (F7): both shipped for months with ZERO bench measurement (no
+	# label in truth.json, no row in any result file) -- unmeasured, not
+	# rejected, but "stop shipping until measured" either way. They remain in
+	# EXTRACTABLE_FIELDS for deliberate manual invocation; this asserts they
+	# stay OUT of the unattended nightly call so nobody re-pins an unmeasured
+	# field back onto this list.
+	[[ "$extract_line" != *"energy.source"* ]] || return 1
+	[[ "$extract_line" != *"energy.utility"* ]] || return 1
+}
+
+@test "verify-fields.ts is invoked with its own explicit --fields allowlist" {
+	export DISCOVERY_ENABLED=true
+	export DISCOVERY_DRY_RUN=false
+	run bash "$RUN_SH"
+	[ "$status" -eq 0 ]
+
+	# NOT the same list as extract-fields.ts above: verify-fields is
+	# read-only and stages nothing, so the ship-safety caveat cannot apply to
+	# it. Since 2026-10-29 it is deliberately WIDER than the extract list: it
+	# keeps re-checking the capacityMw.operational values already recorded
+	# although the fill lane no longer stages new ones. This pins a SCOPE
+	# bound, not a safety one; widening it is a cost decision.
+	verify_line="$(grep "verify-fields.ts" "$NPX_CALL_LOG" | head -1)"
+	[ -n "$verify_line" ]
+	[[ "$verify_line" == *"--fields=capacityMw.operational,water.coolingType"* ]] || return 1
+
+	# The positive assertion above is a SUBSTRING match, so it cannot catch an
+	# APPENDED field — `...,water.coolingType,capacityMw.planned` still matches it.
+	# These two negative assertions keep the SCOPE bound honest: verify-fields
+	# stages nothing, so this is not a ship-safety guard (see above) — it is what
+	# stops the nightly check drifting onto fields the fill lane does not populate
+	# and silently spending time budget. Verified 2026-09-01: without these, a
+	# list with capacityMw.planned appended passes.
+	[[ "$verify_line" != *"capacityMw.planned"* ]] || return 1
+	[[ "$verify_line" != *"energy.onSiteGenerationMw"* ]] || return 1
+
+	# Same F7 drop as extract-fields.ts above: verify-fields takes the fill
+	# lane's field list as a SCOPE bound, so an unmeasured field dropped from
+	# the fill side must disappear from the verify side too.
+	[[ "$verify_line" != *"energy.source"* ]] || return 1
+	[[ "$verify_line" != *"energy.utility"* ]] || return 1
+}
+
+@test "package.json's extract-fields npm script pins the same safe --fields allowlist as run.sh's extract list" {
+	# run.sh's own invocation is pinned by the two tests above, but a maintainer
+	# is far more likely to type `npm run extract-fields` by hand than to read
+	# run.sh first. That script drifted to include the two unmeasured fields
+	# (energy.source, energy.utility) while run.sh stayed correct — the
+	# convenient path was the unsafe one. This reads package.json directly (no
+	# process invocation, no $HOME interaction needed) and asserts it matches
+	# run.sh's pinned list exactly.
+	script_line="$(grep '"extract-fields":' "$REPO_ROOT/package.json")"
+	[ -n "$script_line" ]
+	# Matches run.sh's EXTRACT list (water.coolingType only since 2026-10-29).
+	[[ "$script_line" == *"--fields=water.coolingType"* ]] || return 1
+
+	# capacityMw.operational was unpinned from the nightly extract lane on
+	# 2026-10-29 (Ed). The positive above is a substring match, so it cannot
+	# catch an appended field; this explicit return 1 also fails on bash 3.2,
+	# where a failed mid-test [[ ]] does not fail the test.
+	if [[ "$script_line" == *"capacityMw.operational"* ]]; then return 1; fi
+
+	# Same substring-match caveat as the run.sh tests above: a positive match
+	# alone cannot catch an APPENDED field, so these negative assertions do the
+	# actual enforcement.
+	[[ "$script_line" != *"capacityMw.planned"* ]] || return 1
+	[[ "$script_line" != *"energy.onSiteGenerationMw"* ]] || return 1
+	[[ "$script_line" != *"energy.source"* ]] || return 1
+	[[ "$script_line" != *"energy.utility"* ]] || return 1
+}
+
+@test "dry-run skips the field-extraction/verification lane entirely" {
+	export DISCOVERY_ENABLED=true
+	export DISCOVERY_DRY_RUN=true
+	run bash "$RUN_SH"
+	[ "$status" -eq 0 ]
+
+	# Anchor: prove the run actually reached the point where the lane would
+	# fire. check-sources.ts runs unconditionally, including on dry runs (see
+	# its comment in run.sh) — without this, "extract-fields is absent" is
+	# vacuous, since it would also pass against a missing/empty call log or a
+	# run.sh that died before getting anywhere near the lane.
+	[ -s "$NPX_CALL_LOG" ]
+	grep -q "check-sources.ts" "$NPX_CALL_LOG"
+
+	# Positive assertion: neither lane command appears. `grep -c` with no
+	# matches prints "0" but exits 1 (and exits 2 against a missing file), so
+	# a bare `grep -c ... ; [ "$status" -ne 0 ]` passes vacuously on both a
+	# skipped lane AND a run.sh that never got this far. `! grep -q` after the
+	# anchor above has already proven the log file exists and is populated.
+	if grep -q "extract-fields.ts\|verify-fields.ts" "$NPX_CALL_LOG"; then return 1; fi
+}
+
+@test "extract-fields.ts is invoked after check-sources.ts" {
+	export DISCOVERY_ENABLED=true
+	export DISCOVERY_DRY_RUN=false
+	run bash "$RUN_SH"
+	[ "$status" -eq 0 ]
+
+	extract_line="$(grep -n "extract-fields.ts" "$NPX_CALL_LOG" | head -1 | cut -d: -f1)"
+	check_line="$(grep -n "check-sources.ts" "$NPX_CALL_LOG" | head -1 | cut -d: -f1)"
+	[ -n "$extract_line" ]
+	[ -n "$check_line" ]
+	[ "$extract_line" -gt "$check_line" ]
+}
+
+@test "ENRICHMENT_LIMIT and VERIFY_LIMIT env overrides reach their respective commands" {
+	export DISCOVERY_ENABLED=true
+	export DISCOVERY_DRY_RUN=false
+	export ENRICHMENT_LIMIT=7
+	export VERIFY_LIMIT=9
+	run bash "$RUN_SH"
+	[ "$status" -eq 0 ]
+
+	extract_line="$(grep "extract-fields.ts" "$NPX_CALL_LOG" | head -1)"
+	verify_line="$(grep "verify-fields.ts" "$NPX_CALL_LOG" | head -1)"
+	[[ "$extract_line" == *"--limit=7"* ]] || return 1
+	[[ "$verify_line" == *"--limit=9"* ]] || return 1
+}
+
+@test "malformed ENRICHMENT_LIMIT/VERIFY_LIMIT fall back to the safe defaults" {
+	# Fail-open hazard: ${VAR:-default} only substitutes when VAR is UNSET or
+	# EMPTY, so a non-empty malformed value (a typo'd env var) passes straight
+	# through to --limit=<garbage>. extract-fields.ts/verify-fields.ts parse an
+	# unparseable limit as `undefined`, and an undefined limit SKIPS the
+	# bounding slice entirely — turning a ~60-value bounded lane into an
+	# unattended ~10h sweep of ~2,190 gap values (2,190 gaps across the two
+	# pinned fields, measured 2026-09-01 via selectGaps(); the ~10h is a
+	# proportional rescale of the measured 12h/2,525-gap figure, not a fresh
+	# timing run). Do not simplify
+	# this validation away; it is the only thing standing between an operator
+	# typo and an all-night crawl once this lane is scheduled unattended.
+	export DISCOVERY_ENABLED=true
+	export DISCOVERY_DRY_RUN=false
+	export ENRICHMENT_LIMIT=abc
+	export VERIFY_LIMIT=-5
+	run bash "$RUN_SH"
+	[ "$status" -eq 0 ]
+
+	extract_line="$(grep "extract-fields.ts" "$NPX_CALL_LOG" | head -1)"
+	verify_line="$(grep "verify-fields.ts" "$NPX_CALL_LOG" | head -1)"
+	[[ "$extract_line" == *"--limit=60"* ]] || return 1
+	[[ "$verify_line" == *"--limit=40"* ]] || return 1
+}
+
+# --- retention-prune lane (#238) ---------------------------------------------
+# scripts/retention-prune.ts's own logic (windows, per-table back-up-or-abort)
+# is unit tested separately; these tests cover only the shell wiring of the
+# "PII retention prune" lane in run.sh — that the lane fires on a live run with --apply, is
+# skipped on a dry run, and that its failure is non-fatal but still visibly
+# recorded via FAILURES/exit-status/notification, mirroring the field-
+# extraction lane tests above.
+
+@test "retention-prune.ts is invoked on a live run with --apply" {
+	export DISCOVERY_ENABLED=true
+	export DISCOVERY_DRY_RUN=false
+	run bash "$RUN_SH"
+	[ "$status" -eq 0 ]
+
+	retention_line="$(grep "retention-prune.ts" "$NPX_CALL_LOG" | head -1)"
+	[ -n "$retention_line" ]
+	[[ "$retention_line" == *"--apply"* ]] || return 1
+}
+
+@test "dry-run skips the retention-prune lane entirely" {
+	export DISCOVERY_ENABLED=true
+	export DISCOVERY_DRY_RUN=true
+	run bash "$RUN_SH"
+	[ "$status" -eq 0 ]
+
+	[[ "$output" == *"DISCOVERY_DRY_RUN=true — skipping retention-prune lane"* ]] || return 1
+
+	# Anchor: prove the run actually reached the point where the lane would
+	# fire, same rationale as the field-extraction dry-run test above — without
+	# this, "retention-prune.ts is absent" is vacuous.
+	[ -s "$NPX_CALL_LOG" ]
+	grep -q "check-sources.ts" "$NPX_CALL_LOG"
+	if grep -q "retention-prune.ts" "$NPX_CALL_LOG"; then return 1; fi
+}
+
+@test "a retention-prune failure is non-fatal — later lanes still run" {
+	export DISCOVERY_ENABLED=true
+	export DISCOVERY_DRY_RUN=false
+	# Overrides setup()'s npx fake to add a retention-prune.ts failure case;
+	# every other case is copied verbatim from setup() so the rest of the
+	# run's control flow is unaffected.
+	cat >"$BIN_DIR/npx" <<EOF
+#!/usr/bin/env bash
+echo "npx \$*" >>"$NPX_CALL_LOG"
+case "\$*" in
+*"tsx -e"*)
+	exec "$REAL_NPX" "\$@"
+	;;
+*existing-facilities.ts*)
+	echo ""
+	exit 0
+	;;
+*submit-candidates.ts*)
+	exec "$BIN_DIR/fake-submit" "\$@"
+	;;
+*check-sources.ts*)
+	exit 0
+	;;
+*retention-prune.ts*)
+	exit 1
+	;;
+*)
+	exit 0
+	;;
+esac
+EOF
+	chmod +x "$BIN_DIR/npx"
+
+	run bash "$RUN_SH"
+	[ "$status" -eq 1 ]
+	[[ "$output" == *"WARN: retention prune failed"* ]] || return 1
+	[[ "$output" == *"discovery batch complete"* ]] || return 1
+	# Lanes that run AFTER retention-prune in run.sh (heartbeat write + publish)
+	# still executed despite the failure above them.
+	grep -q "publish-heartbeat.ts" "$NPX_CALL_LOG"
+	[ -f "$LOG_DIR/heartbeat.json" ]
+}
+
+@test "a retention-prune failure appends to FAILURES and dispatches the desktop notification" {
+	export DISCOVERY_ENABLED=true
+	export DISCOVERY_DRY_RUN=false
+	cat >"$BIN_DIR/npx" <<EOF
+#!/usr/bin/env bash
+echo "npx \$*" >>"$NPX_CALL_LOG"
+case "\$*" in
+*"tsx -e"*)
+	exec "$REAL_NPX" "\$@"
+	;;
+*existing-facilities.ts*)
+	echo ""
+	exit 0
+	;;
+*submit-candidates.ts*)
+	exec "$BIN_DIR/fake-submit" "\$@"
+	;;
+*check-sources.ts*)
+	exit 0
+	;;
+*retention-prune.ts*)
+	exit 1
+	;;
+*)
+	exit 0
+	;;
+esac
+EOF
+	chmod +x "$BIN_DIR/npx"
+
+	run bash "$RUN_SH"
+	[ "$status" -eq 1 ]
+	[[ "$output" == *"FAIL: discovery run finished with 1 failure"* ]] || return 1
+	[[ "$output" == *"retention: prune failed"* ]] || return 1
+	[ -s "$NOTIFY_CALL_LOG" ]
+	grep -q "Compute Atlas discovery FAILED" "$NOTIFY_CALL_LOG"
+}
+
+# --- heartbeat-publish lane (#238) --------------------------------------------
+# publish-heartbeat.ts's own logic is unit tested separately; these tests cover
+# only run.sh's shell wiring around its `publish-heartbeat.ts` call — that call
+# sits INSIDE the same "if DISCOVERY_DRY_RUN != true" block that writes heartbeat.json,
+# so a dry run must never reach Neon at all. There is no distinct "skipping
+# heartbeat publish" log line (the guard has no else branch), so the
+# not-invoked tests below assert absence directly rather than a log message.
+
+@test "publish-heartbeat.ts is invoked on a live run" {
+	export DISCOVERY_ENABLED=true
+	export DISCOVERY_DRY_RUN=false
+	run bash "$RUN_SH"
+	[ "$status" -eq 0 ]
+
+	grep -q "publish-heartbeat.ts" "$NPX_CALL_LOG"
+	[ -f "$LOG_DIR/heartbeat.json" ]
+}
+
+@test "dry-run skips the heartbeat-publish lane entirely" {
+	export DISCOVERY_ENABLED=true
+	export DISCOVERY_DRY_RUN=true
+	run bash "$RUN_SH"
+	[ "$status" -eq 0 ]
+
+	# Anchor, same rationale as the retention-prune dry-run test above.
+	[ -s "$NPX_CALL_LOG" ]
+	grep -q "check-sources.ts" "$NPX_CALL_LOG"
+	if grep -q "publish-heartbeat.ts" "$NPX_CALL_LOG"; then return 1; fi
+}
+
+@test "a dry run never writes to Neon — heartbeat.json itself is also never written" {
+	# Stated as its own test, separate from the mechanical "not invoked" test
+	# above, because this is a deliberate design decision whose regression
+	# would be silent: publish-heartbeat.ts has no independent guard of its
+	# own — it is only ever reachable because it sits inside the SAME block
+	# that writes heartbeat.json. A future refactor that gives the publish
+	# call its own condition (e.g. "publish anyway if there were failures")
+	# could satisfy the test above (still not invoked in the common case)
+	# while quietly weakening the guard. Asserting BOTH halves of the shared
+	# guard — the write AND the publish — is what pins the actual safety
+	# property instead of one incidental symptom of it.
+	export DISCOVERY_ENABLED=true
+	export DISCOVERY_DRY_RUN=true
+	run bash "$RUN_SH"
+	[ "$status" -eq 0 ]
+
+	[ ! -f "$LOG_DIR/heartbeat.json" ]
+	if grep -q "publish-heartbeat.ts" "$NPX_CALL_LOG"; then return 1; fi
+}
+
+@test "a publish-heartbeat failure is non-fatal — the run still reaches its final alert/exit logic" {
+	export DISCOVERY_ENABLED=true
+	export DISCOVERY_DRY_RUN=false
+	cat >"$BIN_DIR/npx" <<EOF
+#!/usr/bin/env bash
+echo "npx \$*" >>"$NPX_CALL_LOG"
+case "\$*" in
+*"tsx -e"*)
+	exec "$REAL_NPX" "\$@"
+	;;
+*existing-facilities.ts*)
+	echo ""
+	exit 0
+	;;
+*submit-candidates.ts*)
+	exec "$BIN_DIR/fake-submit" "\$@"
+	;;
+*check-sources.ts*)
+	exit 0
+	;;
+*publish-heartbeat.ts*)
+	exit 1
+	;;
+*)
+	exit 0
+	;;
+esac
+EOF
+	chmod +x "$BIN_DIR/npx"
+
+	run bash "$RUN_SH"
+	[ "$status" -eq 1 ]
+	[[ "$output" == *"WARN: publish-heartbeat failed"* ]] || return 1
+	[[ "$output" == *"FAIL: discovery run finished with"*"failure"* ]] || return 1
+	# heartbeat.json is written BEFORE the publish call in run.sh, so it must
+	# still exist even though the publish itself failed.
+	[ -f "$LOG_DIR/heartbeat.json" ]
+}
+
+@test "a publish-heartbeat failure appends to FAILURES and dispatches the desktop notification" {
+	export DISCOVERY_ENABLED=true
+	export DISCOVERY_DRY_RUN=false
+	cat >"$BIN_DIR/npx" <<EOF
+#!/usr/bin/env bash
+echo "npx \$*" >>"$NPX_CALL_LOG"
+case "\$*" in
+*"tsx -e"*)
+	exec "$REAL_NPX" "\$@"
+	;;
+*existing-facilities.ts*)
+	echo ""
+	exit 0
+	;;
+*submit-candidates.ts*)
+	exec "$BIN_DIR/fake-submit" "\$@"
+	;;
+*check-sources.ts*)
+	exit 0
+	;;
+*publish-heartbeat.ts*)
+	exit 1
+	;;
+*)
+	exit 0
+	;;
+esac
+EOF
+	chmod +x "$BIN_DIR/npx"
+
+	run bash "$RUN_SH"
+	[ "$status" -eq 1 ]
+	[[ "$output" == *"heartbeat: publish failed"* ]] || return 1
+	[ -s "$NOTIFY_CALL_LOG" ]
+	grep -q "Compute Atlas discovery FAILED" "$NOTIFY_CALL_LOG"
+}
+
+# --- long-lived Claude token from the macOS keychain -------------------------
+# The launchd job's refreshable login expired 4 times in 9 days, so run.sh reads
+# a `claude setup-token` token from the keychain and hands it to `claude` ONLY,
+# over a pipe file descriptor (fd 3, named by CLAUDE_CODE_OAUTH_TOKEN_FILE_
+# DESCRIPTOR) rather than the environment. Properties tested separately: the token
+# REACHES claude on fd 3; it is in NO process environment (claude, timeout,
+# caffeinate, the npx helpers); it reaches NO log, heartbeat, call log or xtrace
+# line; and a hung keychain read is bounded.
+TOKEN_SENTINEL="tok-SENTINEL-123"
+# What the env scanners grep for. Deliberately a SUBSTRING of the sentinel: under
+# SHELLOPTS=xtrace a shim traces its own `grep` pattern, and that trace line must
+# not itself contain the full sentinel the sink assertions look for.
+TOKEN_SCAN_PATTERN="SENTINEL-123"
+
+# Copy of $PATH with the named binaries removed. A directory that holds one of
+# them is replaced by a symlink farm of everything else it contains, so the rest
+# of the toolchain (bash, date, node...) keeps resolving. Needed because the
+# binary to hide is usually in /usr/bin (security) or a Homebrew bin dir
+# (timeout), which cannot simply be dropped from PATH.
+_path_without() {
+	local _dir _out="" _i=0 _farm _f _name _hide _skip _dirs
+	IFS=: read -ra _dirs <<<"$PATH"
+	for _dir in "${_dirs[@]}"; do
+		_hide=0
+		for _name in "$@"; do
+			[ -e "$_dir/$_name" ] && _hide=1
+		done
+		if [ "$_hide" -eq 1 ]; then
+			_farm="$TEST_TMP/path-farm-$_i"
+			mkdir -p "$_farm"
+			for _f in "$_dir"/*; do
+				_skip=0
+				for _name in "$@"; do
+					[ "${_f##*/}" = "$_name" ] && _skip=1
+				done
+				[ "$_skip" -eq 1 ] || ln -s "$_f" "$_farm/${_f##*/}"
+			done
+			_dir="$_farm"
+		fi
+		_out="${_out:+$_out:}$_dir"
+		_i=$((_i + 1))
+	done
+	printf '%s' "$_out"
+}
+
+# `run` for these tests. bats keeps its own result channel open on fd 3 and lets
+# `run` children inherit it, which would (a) hand the claude/npx shims a stray fd 3
+# and (b) make "fd 3 is closed" assertions false. Close it in the child only.
+_run_no_fd3() {
+	run bash -c 'exec 3>&-; exec "$@"' _ "$@"
+}
+
+# A `security` shim that "finds" the token. Records its own argv (the token is
+# never in argv) so the test can prove the configured service name was queried.
+_install_security_with_token() {
+	SECURITY_CALL_LOG="$TEST_TMP/security-calls.log"
+	cat >"$BIN_DIR/security" <<SHIM
+#!/usr/bin/env bash
+echo "security \$*" >>"$SECURITY_CALL_LOG"
+echo "$TOKEN_SENTINEL"
+exit 0
+SHIM
+	chmod +x "$BIN_DIR/security"
+}
+
+# A `claude` shim that records everything about how it was handed the token:
+# the bytes on fd 3 (the pipe), the fd-number variable, any token in its ENV, the
+# scrub flag, and a scan of its whole environment for the sentinel. It emits a
+# valid array so the run proceeds through submit/heartbeat as normal.
+_install_claude_recording_token() {
+	FD3_SEEN_FILE="$TEST_TMP/claude-fd3-seen"
+	FDVAR_SEEN_FILE="$TEST_TMP/claude-fdvar-seen"
+	TOKENENV_SEEN_FILE="$TEST_TMP/claude-tokenenv-seen"
+	SCRUB_SEEN_FILE="$TEST_TMP/claude-scrub-seen"
+	ENVSCAN_LOG="$TEST_TMP/envscan.log"
+	cat >"$BIN_DIR/claude" <<SHIM
+#!/usr/bin/env bash
+echo "claude \$*" >> "$CLAUDE_CALL_LOG"
+pwd -P >"$TEST_TMP/claude-cwd-seen"
+if { true <&3; } 2>/dev/null; then cat <&3 >"$FD3_SEEN_FILE"; else echo FD3-CLOSED >"$FD3_SEEN_FILE"; fi
+echo "\${CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR:-UNSET}" >"$FDVAR_SEEN_FILE"
+echo "\${CLAUDE_CODE_OAUTH_TOKEN:-UNSET}" >"$TOKENENV_SEEN_FILE"
+echo "\${CLAUDE_CODE_SUBPROCESS_ENV_SCRUB:-UNSET}" >"$SCRUB_SEEN_FILE"
+echo "\${CLAUDE_CONFIG_DIR:-UNSET}" >"$TEST_TMP/claude-confdir-seen"
+if [ -n "\${CLAUDE_CONFIG_DIR:-}" ] && [ -d "\$CLAUDE_CONFIG_DIR" ]; then
+  ls -ld "\$CLAUDE_CONFIG_DIR" | cut -c1-10 >"$TEST_TMP/claude-confdir-mode"
+else
+  echo NODIR >"$TEST_TMP/claude-confdir-mode"
+fi
+echo "claude \$(env | grep -cF -- '$TOKEN_SCAN_PATTERN' || true)" >>"$ENVSCAN_LOG"
+echo '[{"name":"Token Facility","facilityType":"data_center"}]'
+exit 0
+SHIM
+	chmod +x "$BIN_DIR/claude"
+}
+
+# `caffeinate` and `timeout` shims that scan THEIR environment for the sentinel
+# and then behave as the pass-throughs the suite already uses. They sit between
+# run.sh and claude, so a token delivered via the environment would be in theirs.
+_install_env_scanning_wrappers() {
+	cat >"$BIN_DIR/caffeinate" <<SHIM
+#!/usr/bin/env bash
+echo "caffeinate \$(env | grep -cF -- '$TOKEN_SCAN_PATTERN' || true)" >>"$ENVSCAN_LOG"
+while [[ "\${1:-}" == -* ]]; do shift; done
+exec "\$@"
+SHIM
+	cat >"$BIN_DIR/timeout" <<SHIM
+#!/usr/bin/env bash
+echo "timeout \$(env | grep -cF -- '$TOKEN_SCAN_PATTERN' || true)" >>"$ENVSCAN_LOG"
+shift 3   # -k <kill-after> <duration>
+exec "\$@"
+SHIM
+	chmod +x "$BIN_DIR/caffeinate" "$BIN_DIR/timeout"
+}
+
+# Wrap the stock npx shim: record the token variable, the fd-number variable, the
+# scrub flag and whether fd 3 is open for each helper invocation, plus an env scan,
+# then run the stock behaviour unchanged. Every helper (existing-facilities,
+# submit-candidates, check-sources, extract-fields, publish-heartbeat...) goes
+# through npx, so one recorder covers them all.
+_install_npx_recording_token() {
+	NPX_TOKEN_LOG="$TEST_TMP/npx-token-seen.log"
+	ENVSCAN_LOG="$TEST_TMP/envscan.log"
+	mv "$BIN_DIR/npx" "$BIN_DIR/npx.stock"
+	cat >"$BIN_DIR/npx" <<SHIM
+#!/usr/bin/env bash
+fd3=closed
+if { true <&3; } 2>/dev/null; then fd3=open; fi
+echo "\${CLAUDE_CODE_OAUTH_TOKEN:-UNSET}/\${CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR:-UNSET}/\${CLAUDE_CODE_SUBPROCESS_ENV_SCRUB:-UNSET}/\$fd3" >>"$NPX_TOKEN_LOG"
+echo "\${CLAUDE_CONFIG_DIR:-UNSET}" >>"$TEST_TMP/npx-confdir-seen.log"
+echo "npx \$(env | grep -cF -- '$TOKEN_SCAN_PATTERN' || true)" >>"$ENVSCAN_LOG"
+exec "$BIN_DIR/npx.stock" "\$@"
+SHIM
+	chmod +x "$BIN_DIR/npx"
+}
+
+# `[[ ]]` mid-body does not fail a bats test on bash 3.2, and `! cmd` never trips
+# errexit on any bash, so both are false-green here. These return 1 explicitly.
+_assert_output_has() {
+	grep -qF -- "$1" <<<"$output" || { echo "output lacks: $1" >&2; return 1; }
+}
+_assert_output_lacks() {
+	if grep -qF -- "$1" <<<"$output"; then echo "output unexpectedly has: $1" >&2; return 1; fi
+}
+
+# claude was handed the token the intended way and no other way.
+_assert_claude_got_token_on_fd3() {
+	[ "$(cat "$FD3_SEEN_FILE")" = "$TOKEN_SENTINEL" ]
+	[ "$(cat "$FDVAR_SEEN_FILE")" = "3" ]
+	[ "$(cat "$SCRUB_SEEN_FILE")" = "1" ]
+	[ "$(cat "$TOKENENV_SEEN_FILE")" = "UNSET" ]
+}
+
+# claude got no credential from run.sh at all (the fallback path).
+_assert_claude_got_no_token() {
+	[ "$(cat "$FD3_SEEN_FILE")" = "FD3-CLOSED" ]
+	[ "$(cat "$FDVAR_SEEN_FILE")" = "UNSET" ]
+	[ "$(cat "$SCRUB_SEEN_FILE")" = "UNSET" ]
+	[ "$(cat "$TOKENENV_SEEN_FILE")" = "UNSET" ]
+}
+
+# No scanned process (claude always, plus whichever of caffeinate/timeout/npx the
+# test installed scanners for) had the sentinel anywhere in its environment.
+_assert_envscan_clean() {
+	[ -s "$ENVSCAN_LOG" ]
+	[ "$(grep -vc ' 0$' "$ENVSCAN_LOG" || true)" -eq 0 ]
+}
+
+# Every sink the token must never reach: the run's own output (which includes any
+# xtrace), everything under LOG_DIR (log, heartbeat.json, candidates files) and the
+# shim call logs.
+_assert_token_not_in_sinks() {
+	local _f
+	_assert_output_lacks "$TOKEN_SENTINEL" || return 1
+	[ -s "$LOG_DIR/heartbeat.json" ] || return 1
+	if grep -rqF -- "$TOKEN_SENTINEL" "$LOG_DIR"; then echo "token leaked under LOG_DIR" >&2; return 1; fi
+	for _f in "$CLAUDE_CALL_LOG" "$NPX_CALL_LOG" "$NOTIFY_CALL_LOG"; do
+		if [ -e "$_f" ] && grep -qF -- "$TOKEN_SENTINEL" "$_f"; then echo "token leaked to $_f" >&2; return 1; fi
+	done
+}
+
+@test "a keychain token reaches claude over fd 3 and is in no process environment, log, heartbeat or call log" {
+	export DISCOVERY_ENABLED=true
+	_install_security_with_token
+	_install_claude_recording_token
+	# Force the TIMEOUT_BIN branch so this test does not depend on the host, and
+	# scan the environment of every process between run.sh and claude.
+	_install_env_scanning_wrappers
+
+	_run_no_fd3 bash "$RUN_SH"
+	[ "$status" -eq 0 ]
+
+	_assert_claude_got_token_on_fd3
+	_assert_envscan_clean
+	# The scan covered the whole chain, not just claude.
+	grep -q '^caffeinate 0$' "$ENVSCAN_LOG"
+	grep -q '^timeout 0$' "$ENVSCAN_LOG"
+	grep -q '^claude 0$' "$ENVSCAN_LOG"
+	grep -q -- "-s $DISCOVERY_CLAUDE_TOKEN_SERVICE" "$SECURITY_CALL_LOG"
+	grep -q -- " -w" "$SECURITY_CALL_LOG"
+	_assert_output_has "using long-lived Claude token from keychain item $DISCOVERY_CLAUDE_TOKEN_SERVICE"
+	_assert_output_lacks "no long-lived Claude token"
+	_assert_token_not_in_sinks
+}
+
+@test "the fd-3 token branch still passes --model opus --effort high to claude" {
+	export DISCOVERY_ENABLED=true
+	_install_security_with_token
+	_install_claude_recording_token
+	_run_no_fd3 bash "$RUN_SH"
+	[ "$status" -eq 0 ]
+	_assert_claude_got_token_on_fd3
+	grep -q -- "--model opus --effort high" "$CLAUDE_CALL_LOG"
+}
+
+@test "token present: claude runs under the isolated config dir (exists, mode 700); token absent: CLAUDE_CONFIG_DIR untouched" {
+	export DISCOVERY_ENABLED=true
+	export DISCOVERY_CLAUDE_CONFIG_DIR="$TEST_TMP/isolated-claude-config"
+	_install_security_with_token
+	_install_claude_recording_token
+	_install_npx_recording_token
+
+	_run_no_fd3 bash "$RUN_SH"
+	[ "$status" -eq 0 ]
+	_assert_claude_got_token_on_fd3
+	[ "$(cat "$TEST_TMP/claude-confdir-seen")" = "$DISCOVERY_CLAUDE_CONFIG_DIR" ]
+	[ "$(cat "$TEST_TMP/claude-confdir-mode")" = "drwx------" ]
+	_assert_output_has "isolated config dir $DISCOVERY_CLAUDE_CONFIG_DIR"
+	# Does not leak to later children (npx/tsx helpers).
+	[ -s "$TEST_TMP/npx-confdir-seen.log" ]
+	[ "$(grep -vc '^UNSET$' "$TEST_TMP/npx-confdir-seen.log" || true)" -eq 0 ]
+}
+
+@test "token absent: claude sees no CLAUDE_CONFIG_DIR and no isolated dir is created" {
+	export DISCOVERY_ENABLED=true
+	export DISCOVERY_CLAUDE_CONFIG_DIR="$TEST_TMP/isolated-claude-config"
+	_install_claude_recording_token
+	_run_no_fd3 bash "$RUN_SH"
+	[ "$status" -eq 0 ]
+	_assert_claude_got_no_token
+	[ "$(cat "$TEST_TMP/claude-confdir-seen")" = "UNSET" ]
+	[ ! -e "$DISCOVERY_CLAUDE_CONFIG_DIR" ]
+}
+
+@test "token present but the isolated config dir cannot be created: run fails, no fallback to the stored login" {
+	export DISCOVERY_ENABLED=true
+	unset DISCOVERY_STATES
+	export STATES_PER_RUN=2
+	echo "TX" >"$LOG_DIR/cursor.txt"
+	: >"$TEST_TMP/not-a-dir"
+	export DISCOVERY_CLAUDE_CONFIG_DIR="$TEST_TMP/not-a-dir/config"
+	_install_security_with_token
+	_install_claude_recording_token
+	_run_no_fd3 bash "$RUN_SH"
+	[ "$status" -eq 1 ]
+	_assert_output_has "cannot create isolated Claude config dir"
+	# claude was never started (no fallback to the stored login), and there was no retry.
+	[ ! -s "$CLAUDE_CALL_LOG" ]
+	_assert_output_lacks "retrying once"
+	_assert_output_has "NOT retrying"
+	# Classified as auth: heartbeat, log, and the state is re-queued.
+	_assert_output_has "cause=auth"
+	grep -q '"claudeStatus": "auth"' "$LOG_DIR/heartbeat.json"
+	_assert_output_has "re-queued: cursor rewound OH -> TX (environmental failure: auth); TX VA run again next batch"
+	[ "$(tr -d ' \n' <"$LOG_DIR/cursor.txt")" = "TX" ]
+}
+
+@test "config dir creatable on the first call but not on the retry: still auth, re-queued" {
+	export DISCOVERY_ENABLED=true
+	unset DISCOVERY_STATES
+	export STATES_PER_RUN=2
+	echo "TX" >"$LOG_DIR/cursor.txt"
+	export DISCOVERY_CLAUDE_CONFIG_DIR="$TEST_TMP/cfg-dir"
+	_install_security_with_token
+	# First call: prose (no array -> no_array -> retry). The stub then swaps the
+	# config dir for a plain file so the retry's mkdir fails.
+	cat >"$BIN_DIR/claude" <<EOF
+#!/usr/bin/env bash
+echo "claude \$*" >> "$CLAUDE_CALL_LOG"
+echo "I could not produce JSON this time."
+rm -rf "$DISCOVERY_CLAUDE_CONFIG_DIR"
+: >"$DISCOVERY_CLAUDE_CONFIG_DIR"
+exit 0
+EOF
+	chmod +x "$BIN_DIR/claude"
+	_run_no_fd3 bash "$RUN_SH"
+	[ "$status" -eq 1 ]
+	_assert_output_has "retrying once"
+	_assert_output_has "cannot create isolated Claude config dir"
+	# Only the first attempt reached claude; the retry never started it.
+	[ "$(grep -c '^claude ' "$CLAUDE_CALL_LOG")" -eq 1 ]
+	_assert_output_has "cause=auth"
+	grep -q '"claudeStatus": "auth"' "$LOG_DIR/heartbeat.json"
+	_assert_output_has "re-queued: cursor rewound OH -> TX (environmental failure: auth)"
+	[ "$(tr -d ' \n' <"$LOG_DIR/cursor.txt")" = "TX" ]
+}
+
+@test "the real-world 401 string classifies as auth and does NOT retry" {
+	export DISCOVERY_ENABLED=true
+	CLAUDE_COUNTER_FILE="$TEST_TMP/claude-call-count"
+	echo 0 >"$CLAUDE_COUNTER_FILE"
+	cat >"$BIN_DIR/claude" <<EOF
+#!/usr/bin/env bash
+echo "claude \$*" >> "$CLAUDE_CALL_LOG"
+n="\$(cat "$CLAUDE_COUNTER_FILE")"
+echo "\$((n + 1))" >"$CLAUDE_COUNTER_FILE"
+echo "Failed to authenticate. API Error: 401 OAuth access token is invalid."
+exit 1
+EOF
+	chmod +x "$BIN_DIR/claude"
+
+	run bash "$RUN_SH"
+	[ "$status" -eq 1 ]
+	[ "$(cat "$CLAUDE_COUNTER_FILE")" -eq 1 ]
+	[[ "$output" == *"cause=auth"* ]] || return 1
+	[[ "$output" != *"retrying once"* ]] || return 1
+	grep -q '"claudeStatus": "auth"' "$LOG_DIR/heartbeat.json"
+}
+
+@test "a keychain token also reaches claude over fd 3 on the no-timeout-binary branch" {
+	export DISCOVERY_ENABLED=true
+	_install_security_with_token
+	_install_claude_recording_token
+	NO_TIMEOUT_PATH="$(_path_without timeout gtimeout)"
+	# Precondition: the branch under test really is the uncapped one. Without
+	# this a host that finds `timeout` some other way would pass vacuously.
+	[ -z "$(PATH="$NO_TIMEOUT_PATH" command -v timeout || true)" ]
+	[ -z "$(PATH="$NO_TIMEOUT_PATH" command -v gtimeout || true)" ]
+
+	_run_no_fd3 env PATH="$NO_TIMEOUT_PATH" bash "$RUN_SH"
+	[ "$status" -eq 0 ]
+
+	_assert_output_has "no timeout/gtimeout binary found"
+	_assert_claude_got_token_on_fd3
+	_assert_envscan_clean
+	_assert_token_not_in_sinks
+}
+
+@test "the keychain token is NOT visible to the npx/tsx helper subprocesses" {
+	export DISCOVERY_ENABLED=true
+	_install_security_with_token
+	_install_claude_recording_token
+	_install_npx_recording_token
+
+	_run_no_fd3 bash "$RUN_SH"
+	[ "$status" -eq 0 ]
+
+	# claude DID get the token, so UNSET below is not just "feature off".
+	_assert_claude_got_token_on_fd3
+	# Helpers see no token, no fd-number variable, no scrub flag, and NO fd 3.
+	[ -s "$NPX_TOKEN_LOG" ]
+	[ "$(grep -vc '^UNSET/UNSET/UNSET/closed$' "$NPX_TOKEN_LOG" || true)" -eq 0 ]
+	_assert_envscan_clean
+	grep -q '^npx 0$' "$ENVSCAN_LOG"
+}
+
+@test "no keychain item (security exits 44): claude gets no credential, falls back with a logged note, run proceeds" {
+	export DISCOVERY_ENABLED=true
+	_install_claude_recording_token
+	# setup()'s default security shim already exits 44.
+	_run_no_fd3 bash "$RUN_SH"
+	[ "$status" -eq 0 ]
+
+	_assert_claude_got_no_token
+	_assert_output_has "no long-lived Claude token in keychain item $DISCOVERY_CLAUDE_TOKEN_SERVICE"
+	_assert_output_has "docs/discovery-runbook.md#auth-note"
+	_assert_output_lacks "using long-lived Claude token"
+	[ -s "$LOG_DIR/heartbeat.json" ]
+	grep -q '"claudeStatus": "ok"' "$LOG_DIR/heartbeat.json"
+}
+
+@test "no security binary on PATH: same fallback as a missing keychain item" {
+	export DISCOVERY_ENABLED=true
+	_install_claude_recording_token
+	rm -f "$BIN_DIR/security"
+	NO_SECURITY_PATH="$(_path_without security)"
+	# Precondition: `security` is genuinely unresolvable under the PATH the run
+	# gets, not merely absent from BIN_DIR (macOS ships the real one in /usr/bin).
+	[ -z "$(PATH="$NO_SECURITY_PATH" command -v security || true)" ]
+
+	_run_no_fd3 env PATH="$NO_SECURITY_PATH" bash "$RUN_SH"
+	[ "$status" -eq 0 ]
+
+	_assert_claude_got_no_token
+	_assert_output_has "no long-lived Claude token in keychain item"
+	_assert_output_lacks "using long-lived Claude token"
+}
+
+@test "a hung security call is bounded by the keychain timeout, falls back, and names the timeout" {
+	[ -n "$TIMEOUT_BIN" ] || skip "no timeout/gtimeout binary — the keychain read is uncapped there by design"
+	export DISCOVERY_ENABLED=true
+	export DISCOVERY_KEYCHAIN_TIMEOUT_SECS=1
+	_install_claude_recording_token
+	# A locked keychain / unanswered ACL prompt: `security` just never returns.
+	# `exec` so the sleeper IS this process — timeout's SIGTERM then ends it
+	# directly instead of orphaning a child that holds the $(...) pipe open.
+	cat >"$BIN_DIR/security" <<'SHIM'
+#!/usr/bin/env bash
+exec sleep 30
+SHIM
+	chmod +x "$BIN_DIR/security"
+
+	_t0=$SECONDS
+	_run_no_fd3 bash "$RUN_SH"
+	[ "$status" -eq 0 ]
+
+	# Bounded: nowhere near the shim's 30s. (Without the cap the run only returns
+	# after the full sleep, and takes the "no long-lived" branch instead.)
+	[ $((SECONDS - _t0)) -lt 25 ]
+	_assert_output_has "keychain read for item $DISCOVERY_CLAUDE_TOKEN_SERVICE timed out after 1s"
+	_assert_output_has "falling back to the CLI's stored login"
+	_assert_output_lacks "using long-lived Claude token"
+	_assert_claude_got_no_token
+}
+
+@test "a dry run never consults the keychain" {
+	export DISCOVERY_ENABLED=true
+	export DISCOVERY_DRY_RUN=true
+	_install_security_with_token
+
+	run bash "$RUN_SH"
+	[ "$status" -eq 0 ]
+
+	[ ! -e "$SECURITY_CALL_LOG" ]
+	_assert_output_lacks "long-lived Claude token"
+}
+
+@test "bash -x does not print the keychain token" {
+	export DISCOVERY_ENABLED=true
+	_install_security_with_token
+	_install_claude_recording_token
+
+	_run_no_fd3 bash -x "$RUN_SH"
+	[ "$status" -eq 0 ]
+
+	# xtrace really was on for the script (so absence below is not "nothing traced"):
+	# before the keychain read, and again AFTER each guarded region (the guards
+	# restore it — `log` follows the keychain read, `_t1=` follows the claude call).
+	_assert_output_has "+ KEYCHAIN_RC=0"
+	_assert_output_has "+ log 'using long-lived Claude token"
+	_assert_output_has "+ _t1="
+	# ... and the token still made it to claude, so the guarded paths really ran.
+	_assert_claude_got_token_on_fd3
+	_assert_token_not_in_sinks
+}
+
+@test "an inherited SHELLOPTS=xtrace does not print the keychain token" {
+	export DISCOVERY_ENABLED=true
+	_install_security_with_token
+	_install_claude_recording_token
+
+	_run_no_fd3 env SHELLOPTS=xtrace bash "$RUN_SH"
+	[ "$status" -eq 0 ]
+
+	_assert_output_has "+ KEYCHAIN_RC=0"
+	_assert_output_has "+ log 'using long-lived Claude token"
+	_assert_output_has "+ _t1="
+	_assert_claude_got_token_on_fd3
+	_assert_token_not_in_sinks
+}
+
+@test "POSIX-mode bash 3.2 still parses, delivers the token over fd 3, and leaks it to nothing else" {
+	# Two bash 3.2 POSIX-mode (macOS /bin/sh, or an inherited POSIXLY_CORRECT)
+	# hazards this guards: process substitution is a SYNTAX ERROR there (so run.sh
+	# must not use it for the pipe), and an env-assignment prefix on a shell FUNCTION
+	# persists after the call and exports to every later child. Both only reproduce
+	# on 3.x.
+	POSIX_BASH=/bin/bash
+	[ -x "$POSIX_BASH" ] || skip "no /bin/bash — hazards only reproduce on bash 3.2"
+	_major="$("$POSIX_BASH" -c 'echo "${BASH_VERSINFO[0]}"')"
+	[ "$_major" = "3" ] || skip "bash 3.2 not available (/bin/bash is $_major.x) — hazards only reproduce on 3.2"
+
+	export DISCOVERY_ENABLED=true
+	_install_security_with_token
+	_install_claude_recording_token
+	_install_npx_recording_token
+
+	_run_no_fd3 env POSIXLY_CORRECT=1 "$POSIX_BASH" "$RUN_SH"
+	[ "$status" -eq 0 ]
+
+	# claude still gets the token over fd 3, and the run really ran (heartbeat
+	# written), so the all-UNSET helper records below are not "run.sh bailed early".
+	_assert_claude_got_token_on_fd3
+	[ -s "$LOG_DIR/heartbeat.json" ]
+	[ -s "$NPX_TOKEN_LOG" ]
+	[ "$(grep -vc '^UNSET/UNSET/UNSET/closed$' "$NPX_TOKEN_LOG" || true)" -eq 0 ]
+	_assert_envscan_clean
+	_assert_token_not_in_sinks
+}
+
+# --- STATES_PER_RUN default (3) and the nightly community-leads lane ----------
+# leads-lane.ts is shimmed by the catch-all `*) exit 0` in setup()'s fake npx;
+# these assert run.sh's own invocation of it, not the lane's behavior.
+
+@test "STATES_PER_RUN unset defaults to a 3-state batch and the cursor advances by 3" {
+	export DISCOVERY_ENABLED=true
+	# Live (non-dry) run: dry runs no longer advance the cursor.
+	export DISCOVERY_DRY_RUN=false
+	unset STATES_PER_RUN
+	echo "TX" >"$LOG_DIR/cursor.txt"
+
+	run bash "$RUN_SH"
+	[ "$status" -eq 0 ]
+
+	[[ "$output" == *"states=TX VA OH"* ]] || return 1
+	outfile_count="$(find "$LOG_DIR" -name 'candidates-*.json' | wc -l | tr -d ' ')"
+	[ "$outfile_count" = "3" ]
+	# TX VA OH consumed -> next up is GA
+	cursor_after="$(cat "$LOG_DIR/cursor.txt" | tr -d ' \n')"
+	[ "$cursor_after" = "GA" ]
+}
+
+@test "a live run invokes the leads lane with the default --limit=10" {
+	export DISCOVERY_ENABLED=true
+	export DISCOVERY_DRY_RUN=false
+	unset LEADS_LIMIT
+	run bash "$RUN_SH"
+	[ "$status" -eq 0 ]
+
+	leads_line="$(grep "leads-lane.ts" "$NPX_CALL_LOG" | head -1)"
+	[ -n "$leads_line" ]
+	[[ "$leads_line" == *"--limit=10"* ]] || return 1
+	[[ "$leads_line" == *"--run-id="*"-leads"* ]] || return 1
+	[ -n "$(find "$LOG_DIR" -name 'leads-lane-*-leads.json' -print -quit)" ]
+}
+
+@test "LEADS_LIMIT overrides the leads lane --limit" {
+	export DISCOVERY_ENABLED=true
+	export DISCOVERY_DRY_RUN=false
+	export LEADS_LIMIT=4
+	run bash "$RUN_SH"
+	[ "$status" -eq 0 ]
+
+	leads_line="$(grep "leads-lane.ts" "$NPX_CALL_LOG" | head -1)"
+	[[ "$leads_line" == *"--limit=4"* ]] || return 1
+}
+
+@test "an invalid LEADS_LIMIT warns and falls back to the default 10" {
+	export DISCOVERY_ENABLED=true
+	export DISCOVERY_DRY_RUN=false
+	export LEADS_LIMIT=abc
+	run bash "$RUN_SH"
+	[ "$status" -eq 0 ]
+
+	[[ "$output" == *"LEADS_LIMIT=abc is not a positive integer"* ]] || return 1
+	leads_line="$(grep "leads-lane.ts" "$NPX_CALL_LOG" | head -1)"
+	[[ "$leads_line" == *"--limit=10"* ]] || return 1
+	[[ "$leads_line" != *"abc"* ]] || return 1
+}
+
+@test "DISCOVERY_DRY_RUN=true does not invoke the leads lane" {
+	export DISCOVERY_ENABLED=true
+	export DISCOVERY_DRY_RUN=true
+	run bash "$RUN_SH"
+	[ "$status" -eq 0 ]
+
+	run grep -c "leads-lane.ts" "$NPX_CALL_LOG"
+	[ "$output" = "0" ]
+}
+
+@test "a failing leads lane is reported as a FAIL but later steps still run" {
+	export DISCOVERY_ENABLED=true
+	export DISCOVERY_DRY_RUN=false
+	cat >"$BIN_DIR/npx" <<EOF
+#!/usr/bin/env bash
+echo "npx \$*" >>"$NPX_CALL_LOG"
+case "\$*" in
+*"tsx -e"*)
+	exec "$REAL_NPX" "\$@"
+	;;
+*existing-facilities.ts*)
+	echo ""
+	exit 0
+	;;
+*submit-candidates.ts*)
+	exec "$BIN_DIR/fake-submit" "\$@"
+	;;
+*check-sources.ts*)
+	exit 0
+	;;
+*leads-lane.ts*)
+	exit 1
+	;;
+*)
+	exit 0
+	;;
+esac
+EOF
+	chmod +x "$BIN_DIR/npx"
+
+	run bash "$RUN_SH"
+	[ "$status" -eq 1 ]
+	[[ "$output" == *"FAIL: discovery run finished with 1 failure"* ]] || return 1
+	[[ "$output" == *"leads: lane failed"* ]] || return 1
+	# retention-prune runs AFTER the leads lane; it must not have been skipped
+	grep -q "retention-prune.ts" "$NPX_CALL_LOG"
+	grep -q "Compute Atlas discovery FAILED" "$NOTIFY_CALL_LOG"
+}
+
+@test "a failing source-liveness check is reported as a FAIL but later steps still run" {
+	export DISCOVERY_ENABLED=true
+	export DISCOVERY_DRY_RUN=false
+	cat >"$BIN_DIR/npx" <<EOF
+#!/usr/bin/env bash
+echo "npx \$*" >>"$NPX_CALL_LOG"
+case "\$*" in
+*"tsx -e"*)
+	exec "$REAL_NPX" "\$@"
+	;;
+*existing-facilities.ts*)
+	echo ""
+	exit 0
+	;;
+*submit-candidates.ts*)
+	exec "$BIN_DIR/fake-submit" "\$@"
+	;;
+*check-sources.ts*)
+	exit 1
+	;;
+*)
+	exit 0
+	;;
+esac
+EOF
+	chmod +x "$BIN_DIR/npx"
+
+	run bash "$RUN_SH"
+	[ "$status" -eq 1 ]
+	[[ "$output" == *"FAIL: discovery run finished with 1 failure"* ]] || return 1
+	[[ "$output" == *"liveness: check-sources failed"* ]] || return 1
+	# retention-prune runs AFTER the liveness step; it must not have been skipped
+	grep -q "retention-prune.ts" "$NPX_CALL_LOG"
+	grep -q "Compute Atlas discovery FAILED" "$NOTIFY_CALL_LOG"
+}
+
+# --- strict credential modes (DISCOVERY_REQUIRE_READER / _INTAKE_TOKEN) -------
+# A shim that records the flags as seen by a tsx step proves they are EXPORTED,
+# not just set in run.sh's own shell.
+_env_probe_npx() {
+	cat >"$BIN_DIR/npx" <<PROBE
+#!/usr/bin/env bash
+case "\$*" in
+*check-sources.ts*) echo "reader=\${DISCOVERY_REQUIRE_READER-UNSET} intake=\${DISCOVERY_REQUIRE_INTAKE_TOKEN-UNSET}" >"$TEST_TMP/probe.txt" ;;
+esac
+exit 0
+PROBE
+	chmod +x "$BIN_DIR/npx"
+}
+
+@test "strict credential flags are exported to tsx steps by default" {
+	export DISCOVERY_ENABLED=true DISCOVERY_DRY_RUN=true
+	_env_probe_npx
+	run bash "$RUN_SH"
+	[ "$status" -eq 0 ]
+	[ "$(cat "$TEST_TMP/probe.txt")" = "reader=1 intake=1" ]
+}
+
+@test "an explicit 0 override of the strict flags is respected" {
+	export DISCOVERY_ENABLED=true DISCOVERY_DRY_RUN=true
+	export DISCOVERY_REQUIRE_READER=0 DISCOVERY_REQUIRE_INTAKE_TOKEN=0
+	: >"$DISCOVERY_ENV_FILE"
+	_env_probe_npx
+	run bash "$RUN_SH"
+	[ "$status" -eq 0 ]
+	[ "$(cat "$TEST_TMP/probe.txt")" = "reader=0 intake=0" ]
+	[[ "$output" != *"preflight failed"* ]]
+}
+
+@test "preflight aborts naming DISCOVERY_READ_DATABASE_URL when it is missing" {
+	export DISCOVERY_ENABLED=true DISCOVERY_DRY_RUN=true
+	printf 'API_INTAKE_TOKEN=dummy-intake-value\nDATABASE_URL=dummy-owner-value\n' >"$DISCOVERY_ENV_FILE"
+	run bash "$RUN_SH"
+	[ "$status" -eq 1 ]
+	[[ "$output" == *"strict credential preflight failed: DISCOVERY_READ_DATABASE_URL missing"* ]]
+	[[ "$output" != *"API_INTAKE_TOKEN missing"* ]]
+	[[ "$output" != *"dummy-"* ]]
+	[ ! -s "$CLAUDE_CALL_LOG" ]
+}
+
+@test "preflight aborts naming API_INTAKE_TOKEN when it is empty" {
+	export DISCOVERY_ENABLED=true DISCOVERY_DRY_RUN=true
+	printf 'DISCOVERY_READ_DATABASE_URL=dummy-reader-value\nAPI_INTAKE_TOKEN=\n' >"$DISCOVERY_ENV_FILE"
+	run bash "$RUN_SH"
+	[ "$status" -eq 1 ]
+	[[ "$output" == *"strict credential preflight failed: API_INTAKE_TOKEN missing"* ]]
+	[[ "$output" != *"DISCOVERY_READ_DATABASE_URL missing"* ]]
+	[[ "$output" != *"dummy-"* ]]
+}
+
+@test "preflight names both keys when both are missing and the file is absent" {
+	export DISCOVERY_ENABLED=true DISCOVERY_DRY_RUN=true
+	rm -f "$DISCOVERY_ENV_FILE"
+	run bash "$RUN_SH"
+	[ "$status" -eq 1 ]
+	[[ "$output" == *"DISCOVERY_READ_DATABASE_URL API_INTAKE_TOKEN missing"* ]]
+}
+
+@test "preflight passes with both keys present and never echoes their values" {
+	export DISCOVERY_ENABLED=true DISCOVERY_DRY_RUN=true
+	run bash "$RUN_SH"
+	[ "$status" -eq 0 ]
+	[[ "$output" != *"preflight failed"* ]]
+	[[ "$output" != *"dummy-"* ]]
+}
+
+@test "a non 0/1 strict flag value is refused, not treated as off" {
+	export DISCOVERY_ENABLED=true DISCOVERY_DRY_RUN=true
+	export DISCOVERY_REQUIRE_READER=true
+	run bash "$RUN_SH"
+	[ "$status" -eq 1 ]
+	[[ "$output" == *"DISCOVERY_REQUIRE_READER='true' must be 0 or 1 - refusing to run"* ]]
+	[ ! -s "$CLAUDE_CALL_LOG" ]
+}
+
+@test "DISCOVERY_ENV_FILE is ignored without DISCOVERY_TEST_MODE" {
+	export DISCOVERY_ENABLED=true DISCOVERY_DRY_RUN=true
+	unset DISCOVERY_TEST_MODE
+	# fixture has both keys; the real (absent) worktree .env.local does not
+	if [ -f "$REPO_ROOT/.env.local" ]; then skip "repo has a real .env.local"; fi
+	run bash "$RUN_SH"
+	[ "$status" -eq 1 ]
+	[[ "$output" == *"strict credential preflight failed: DISCOVERY_READ_DATABASE_URL API_INTAKE_TOKEN missing"* ]]
 }

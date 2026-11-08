@@ -1,5 +1,6 @@
 // @vitest-environment node
-import { beforeAll, beforeEach, afterAll, describe, it, expect, vi } from "vitest";
+import { randomUUID } from "node:crypto";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, it, expect, vi } from "vitest";
 import { eq } from "drizzle-orm";
 
 vi.mock("next/cache", () => ({
@@ -9,38 +10,92 @@ vi.mock("next/cache", () => ({
 }));
 vi.mock("@/lib/db/client");
 
+// `after()` throws "called outside a request scope" unless invoked inside a
+// real Next.js request lifecycle, which this suite (calling POST directly)
+// never sets up. Mocked to run the task immediately and capture its promise
+// in `pendingAfter` so tests can deterministically await the deferred
+// notify-write phase. Mirrors app/api/subscribe/route.integration.test.ts's
+// identical mock for its confirm-email deferral.
+let pendingAfter: Promise<unknown> | undefined;
+vi.mock("next/server", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("next/server")>();
+  return {
+    ...actual,
+    after: (task: () => unknown) => {
+      pendingAfter = Promise.resolve().then(task);
+    },
+  };
+});
+
 import * as dbClient from "@/lib/db/client";
 import { makeTestDb, seedFacility, type TestDbHandle } from "@/test/pglite-db";
-import { submissionsTable } from "@/lib/db/schema";
-import { hashIp } from "@/lib/rate-limit";
+import { intakeAttemptsTable, submissionsTable, submissionNotifyRequestsTable } from "@/lib/db/schema";
+import { EMAIL_SEND_CAP_MAX, RATE_LIMIT_MAX, hashIp } from "@/lib/rate-limit";
 import facilitiesRaw from "@/data/facilities.json";
 import type { Facility } from "@/lib/schema";
 
 // Import the route handler AFTER the mocks above so its transitive imports
 // (lib/contribute.ts, lib/rate-limit.ts, lib/data.ts -> lib/db/client.ts)
 // resolve against the mocked module.
+import { isCommunityDiscoveredBy } from "@/lib/community-provenance";
 import { POST } from "./route";
 
-const seedDoc = facilitiesRaw[0] as unknown as Facility; // xai-colossus-memphis-tn
+const seedDoc = facilitiesRaw[0] as unknown as Facility; // 123net-dc1-southfield-mi
+
+// cf-connecting-ip is honoured only alongside a valid edge secret
+// (lib/edge-secret.ts), so these tests present one like Cloudflare would.
+process.env.EDGE_SHARED_SECRET = "test-edge-secret";
+const EDGE_HEADER = { "x-edge-shared-secret": "test-edge-secret" };
 
 function req(body: unknown, headers?: HeadersInit): Request {
   return new Request("http://localhost/api/contribute", {
     method: "POST",
-    headers: { "Content-Type": "application/json", ...headers },
+    headers: { "Content-Type": "application/json", ...EDGE_HEADER, ...headers },
     body: JSON.stringify(body),
   });
 }
 
+async function flushAfter(): Promise<void> {
+  await pendingAfter;
+}
+
 let tdb: TestDbHandle;
+
+/**
+ * Seeds `n` "contribute" attempt rows for a raw IP, pre-hashed the same way the
+ * route does. This is what the limiter counts — seeding `submissions` rows
+ * instead (as these tests used to) no longer affects it at all.
+ */
+async function seedAttempts(ip: string, n: number): Promise<void> {
+  const submitterIpHash = hashIp(ip);
+  for (let i = 0; i < n; i++) {
+    await tdb.db.insert(intakeAttemptsTable).values({ surface: "contribute", submitterIpHash });
+  }
+}
 
 beforeAll(async () => {
   tdb = await makeTestDb();
   vi.mocked(dbClient.getDb).mockReturnValue(tdb.db as never);
   vi.mocked(dbClient.hasDatabaseUrl).mockReturnValue(true);
+  // Corrections read the target facility via getFacilityById -> loadFacilities,
+  // which gates on readsUseDatabase() (see lib/db/client.ts), not
+  // hasDatabaseUrl() directly. Without this, "existing" silently falls back to
+  // the bundled data/facilities.json snapshot instead of the row seeded into
+  // tdb.db below — the correction tests would still pass (seedDoc is an
+  // unmodified copy of its JSON entry) but a seeded field that DIFFERS from
+  // the JSON snapshot would be silently ignored. Same pattern as
+  // app/api/leads/route.integration.test.ts and
+  // app/api/subscribe/route.integration.test.ts.
+  vi.mocked(dbClient.readsUseDatabase).mockReturnValue(true);
 });
 
 beforeEach(async () => {
   await tdb.reset();
+  pendingAfter = undefined;
+});
+
+afterEach(() => {
+  vi.unstubAllEnvs();
 });
 
 afterAll(async () => {
@@ -71,6 +126,9 @@ describe("POST /api/contribute (public, unauthenticated happy path)", () => {
     expect(
       (rows[0].provenance as { discoveredBy?: string }).discoveredBy
     ).toBe("public-contribution");
+    expect(
+      isCommunityDiscoveredBy((rows[0].provenance as { discoveredBy?: string }).discoveredBy)
+    ).toBe(true);
   });
 
   it("honeypot: returns 201 ok but inserts zero submission rows", async () => {
@@ -83,10 +141,60 @@ describe("POST /api/contribute (public, unauthenticated happy path)", () => {
     expect(rows).toHaveLength(0);
   });
 
+  it("honeypot pre-parse: a schema-invalid payload with a filled honeypot still returns 201 and writes nothing", async () => {
+    // Missing required create fields (name, operator, state, lat, lon) and an
+    // invalid sourceUrl — this must never reach Zod validation, because the
+    // honeypot check now runs on the raw body before submitContribution's
+    // schema parse. Pre-fix, this payload would 400 (schema-invalid) instead
+    // of silently 201-ing like a real bot response.
+    const res = await POST(req({ kind: "create", website: "spam", sourceUrl: "not-a-valid-url" }));
+    expect(res.status).toBe(201);
+    const body = await res.json();
+    expect(body.ok).toBe(true);
+
+    const rows = await tdb.db.select().from(submissionsTable);
+    expect(rows).toHaveLength(0);
+  });
+
   it("rate-limits a 6th submission from the same ip within the window", async () => {
     const ip = "203.0.113.7";
+    // Seeds ATTEMPT rows, not `submissions` rows: the limiter counts
+    // `intake_attempts` now, because counting submissions made every
+    // non-inserting path free (see `checkIntakeRateLimit` in lib/rate-limit.ts).
+    await seedAttempts(ip, RATE_LIMIT_MAX);
+
+    const res = await POST(req(validCreateBody, { "x-forwarded-for": ip }));
+    expect(res.status).toBe(429);
+
+    const rows = await tdb.db.select().from(submissionsTable);
+    expect(rows).toHaveLength(0); // the 6th attempt must not have landed
+  });
+
+  it("buckets by cf-connecting-ip, not a spoofed leftmost x-forwarded-for", async () => {
+    const trustedIp = "203.0.113.13";
+    await seedAttempts(trustedIp, RATE_LIMIT_MAX);
+
+    // A different leftmost x-forwarded-for entry on every request is exactly
+    // what defeated the naive leftmost-x-forwarded-for extraction
+    // lib/rate-limit.ts once had, in production (see lib/rate-limit.ts's
+    // extractTrustedClientIp doc comment); cf-connecting-ip must still win.
+    const res = await POST(
+      req(validCreateBody, { "x-forwarded-for": "198.51.100.9", "cf-connecting-ip": trustedIp })
+    );
+    expect(res.status).toBe(429);
+
+    const rows = await tdb.db.select().from(submissionsTable);
+    expect(rows).toHaveLength(0); // the spoofed-XFF attempt must not have landed
+  });
+
+  it("does NOT count pre-existing `submissions` rows — the cap counts attempts, not outcomes", async () => {
+    // The defect this limiter was rewritten to close, from the other side: a
+    // full budget's worth of prior SUBMISSIONS from this IP must no longer
+    // refuse anything, because submissions are outcomes and the attempt rows
+    // that accompanied them have been pruned or never existed.
+    const ip = "203.0.113.99";
     const ipHash = hashIp(ip);
-    for (let i = 0; i < 5; i++) {
+    for (let i = 0; i < RATE_LIMIT_MAX + 3; i++) {
       await tdb.db.insert(submissionsTable).values({
         kind: "create",
         payload: seedDoc,
@@ -95,10 +203,186 @@ describe("POST /api/contribute (public, unauthenticated happy path)", () => {
     }
 
     const res = await POST(req(validCreateBody, { "x-forwarded-for": ip }));
+    expect(res.status).toBe(201);
+  });
+});
+
+describe("POST /api/contribute — attempts are counted, not outcomes (Finding 1)", () => {
+  const ip = "198.51.100.44";
+
+  /** Every attempt row for `ip`, which is what the limiter actually counts. */
+  async function attemptsFor(ipAddr: string) {
+    return tdb.db
+      .select()
+      .from(intakeAttemptsTable)
+      .where(eq(intakeAttemptsTable.submitterIpHash, hashIp(ipAddr)));
+  }
+
+  it("counts a request that trips the honeypot — the path that used to be entirely free", async () => {
+    // THE headline case: `{"website":"x"}` returns 201, writes no submission,
+    // and before this fix cost no budget at all, so a bot that tripped the
+    // honeypot was completely unlimited while one that did not was capped.
+    const res = await POST(req({ ...validCreateBody, website: "spam" }, { "x-forwarded-for": ip }));
+    expect(res.status).toBe(201);
+
+    expect(await tdb.db.select().from(submissionsTable)).toHaveLength(0);
+    const attempts = await attemptsFor(ip);
+    expect(attempts).toHaveLength(1);
+    expect(attempts[0].surface).toBe("contribute");
+  });
+
+  it("counts a Zod-failing request", async () => {
+    const res = await POST(req({ kind: "create", name: 42 }, { "x-forwarded-for": ip }));
+    expect(res.status).toBe(400);
+    expect(await attemptsFor(ip)).toHaveLength(1);
+  });
+
+  it("counts an unparseable body", async () => {
+    const res = await POST(
+      new Request("http://localhost/api/contribute", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-forwarded-for": ip },
+        body: "{not json",
+      })
+    );
+    expect(res.status).toBe(400);
+    expect(await attemptsFor(ip)).toHaveLength(1);
+  });
+
+  it("counts a correction against an unknown facility (the 404 path)", async () => {
+    const res = await POST(
+      req(
+        {
+          kind: "correction",
+          targetFacilityId: "nope-does-not-exist",
+          field: "operator",
+          value: "Someone",
+          sourceUrl: "https://example.com/source",
+        },
+        { "x-forwarded-for": ip }
+      )
+    );
+    expect(res.status).toBe(404);
+    expect(await attemptsFor(ip)).toHaveLength(1);
+  });
+
+  it("counts a successful submission exactly once — an insert costs the same 1 unit as a rejection", async () => {
+    // Equal cost is the point. If an inserting request cost 2 and a
+    // non-inserting one cost 1, the remaining budget would reveal whether the
+    // insert happened — an existence oracle through the generic success.
+    const res = await POST(req(validCreateBody, { "x-forwarded-for": ip }));
+    expect(res.status).toBe(201);
+    expect(await tdb.db.select().from(submissionsTable)).toHaveLength(1);
+    expect(await attemptsFor(ip)).toHaveLength(1);
+  });
+
+  it("does NOT count an already-refused (429) request, so the window can drain", async () => {
+    await seedAttempts(ip, RATE_LIMIT_MAX);
+    const before = await attemptsFor(ip);
+
+    const res = await POST(req(validCreateBody, { "x-forwarded-for": ip }));
     expect(res.status).toBe(429);
 
-    const rows = await tdb.db.select().from(submissionsTable);
-    expect(rows).toHaveLength(5); // the 6th attempt must not have landed
+    // Recording the refusal would mean the rolling window never drains under
+    // sustained traffic: a shared egress IP would be locked out indefinitely
+    // rather than for an hour.
+    expect(await attemptsFor(ip)).toHaveLength(before.length);
+  });
+
+  it("spends exactly one unit per request across mixed paths, so the 6th is refused whatever the first five were", async () => {
+    // Honeypot, invalid JSON, Zod failure, 404 correction, real submission —
+    // five requests that write one submission between them. Under the old
+    // outcome-counting limiter this cost 1 unit total and the 6th sailed
+    // through; it must now be refused.
+    await POST(req({ ...validCreateBody, website: "spam" }, { "x-forwarded-for": ip }));
+    await POST(
+      new Request("http://localhost/api/contribute", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-forwarded-for": ip },
+        body: "{not json",
+      })
+    );
+    await POST(req({ kind: "create", name: 42 }, { "x-forwarded-for": ip }));
+    await POST(
+      req(
+        {
+          kind: "correction",
+          targetFacilityId: "nope",
+          field: "operator",
+          value: "X",
+          sourceUrl: "https://example.com/s",
+        },
+        { "x-forwarded-for": ip }
+      )
+    );
+    await POST(req(validCreateBody, { "x-forwarded-for": ip }));
+
+    expect(await attemptsFor(ip)).toHaveLength(RATE_LIMIT_MAX);
+    const sixth = await POST(req(validCreateBody, { "x-forwarded-for": ip }));
+    expect(sixth.status).toBe(429);
+  });
+
+  it("fails CLOSED with a 503 (not a 429) when the attempt cannot be recorded", async () => {
+    // The unapplied-migration case: if the cap cannot be enforced the request
+    // must be refused, and the refusal must announce itself as an outage rather
+    // than hide inside ordinary rate-limiting.
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    await tdb.client.exec(`ALTER TABLE "intake_attempts" RENAME TO "intake_attempts_hidden"`);
+    try {
+      const res = await POST(req(validCreateBody, { "x-forwarded-for": ip }));
+      expect(res.status).toBe(503);
+      expect(await tdb.db.select().from(submissionsTable)).toHaveLength(0);
+      // SQLSTATE only — never the error object, whose message embeds the bound
+      // IP hash (lib/db-error.ts).
+      const logged = consoleError.mock.calls.map((c) => String(c[0])).join("\n");
+      expect(logged).toContain("sqlstate: 42P01");
+      expect(logged).not.toContain(hashIp(ip));
+    } finally {
+      await tdb.client.exec(`ALTER TABLE "intake_attempts_hidden" RENAME TO "intake_attempts"`);
+      consoleError.mockRestore();
+    }
+  });
+});
+
+describe("POST /api/contribute — honeypot type symmetry (Finding 3)", () => {
+  // The oracle this closes: the raw-body honeypot used to trip only when
+  // `typeof website === "string"`, so `{"website":1, ...invalid}` fell through
+  // to Zod and answered 400 WITH `issues`, while `{"website":"x", ...invalid}`
+  // answered 201. Flipping one field's type told a bot that `website` is the
+  // honeypot and that its other fields were the real problem.
+  const invalidRest = { kind: "create", sourceUrl: "not-a-valid-url" };
+
+  it.each([
+    ["a non-empty string", "spam"],
+    ["a number", 1],
+    ["zero", 0],
+    ["a boolean true", true],
+    ["an object", { a: 1 }],
+    ["a non-empty array", ["x"]],
+  ])("trips on %s, answering the same generic 201 with nothing written", async (_label, website) => {
+    const res = await POST(req({ ...invalidRest, website }));
+    expect(res.status).toBe(201);
+    expect(await res.json()).toEqual({ ok: true });
+    expect(await tdb.db.select().from(submissionsTable)).toHaveLength(0);
+  });
+
+  it.each([
+    ["an empty string (what a real browser submits)", ""],
+    ["whitespace only", "   "],
+    ["null", null],
+    ["false", false],
+    ["an empty array", []],
+  ])("does NOT trip on %s — the request is validated normally", async (_label, website) => {
+    const res = await POST(req({ ...invalidRest, website }));
+    // Reaches validation, so the invalid payload is rejected on its merits.
+    expect(res.status).toBe(400);
+    expect(await tdb.db.select().from(submissionsTable)).toHaveLength(0);
+  });
+
+  it("an empty-string honeypot on an OTHERWISE VALID body still submits — a real contributor is never rejected", async () => {
+    const res = await POST(req({ ...validCreateBody, website: "" }));
+    expect(res.status).toBe(201);
+    expect(await tdb.db.select().from(submissionsTable)).toHaveLength(1);
   });
 
   it("correction: stages a pending update submission targeting an existing facility", async () => {
@@ -123,11 +407,386 @@ describe("POST /api/contribute (public, unauthenticated happy path)", () => {
     expect(rows[0].kind).toBe("update");
     expect(rows[0].targetFacilityId).toBe(seedDoc.id);
     expect((rows[0].payload as { operator?: string }).operator).toBe("New Op");
+    // Writer-side pin: the activity feed's community badge keys off this value.
+    const discoveredBy = (rows[0].provenance as { discoveredBy?: string }).discoveredBy;
+    expect(discoveredBy).toBe("public-correction");
+    expect(isCommunityDiscoveredBy(discoveredBy)).toBe(true);
 
     const submissionsAfter = await tdb.db
       .select()
       .from(submissionsTable)
       .where(eq(submissionsTable.targetFacilityId, seedDoc.id));
     expect(submissionsAfter).toHaveLength(1);
+  });
+
+  it("correction: a nested-object field (water) merges into the existing sub-object instead of replacing it", async () => {
+    // seedDoc's own water has no reportedMgd — extend a local copy (not the
+    // shared fixture) so the preservation assertion below is meaningful.
+    const seedWithReportedMgd: Facility = {
+      ...seedDoc,
+      water: { ...seedDoc.water, reportedMgd: 5.2 },
+    };
+    await seedFacility(tdb.db, seedWithReportedMgd);
+
+    const res = await POST(
+      req({
+        kind: "correction",
+        targetFacilityId: seedWithReportedMgd.id,
+        field: "water",
+        value: "closed_loop",
+        sourceUrl: "https://example.com/correction",
+      })
+    );
+    expect(res.status).toBe(201);
+    const body = await res.json();
+    expect(body.ok).toBe(true);
+
+    const rows = await tdb.db.select().from(submissionsTable);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].status).toBe("pending");
+    expect(rows[0].kind).toBe("update");
+    expect(rows[0].targetFacilityId).toBe(seedWithReportedMgd.id);
+
+    const payload = rows[0].payload as {
+      water?: { coolingType?: string; reportedMgd?: number; notes?: string };
+    };
+    expect(payload.water?.coolingType).toBe("closed_loop");
+    // The point of this test: sibling sub-fields survive the merge.
+    expect(payload.water?.reportedMgd).toBe(5.2);
+    expect(payload.water?.notes).toBe(seedWithReportedMgd.water?.notes);
+  });
+
+  it("correction: an out-of-vocabulary enum value for a nested field (water) is rejected and writes no row", async () => {
+    await seedFacility(tdb.db, seedDoc);
+
+    const res = await POST(
+      req({
+        kind: "correction",
+        targetFacilityId: seedDoc.id,
+        field: "water",
+        value: "definitely-not-a-cooling-type",
+        sourceUrl: "https://example.com/correction",
+      })
+    );
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.ok).toBeUndefined();
+
+    const rows = await tdb.db.select().from(submissionsTable);
+    expect(rows).toHaveLength(0);
+  });
+});
+
+describe("POST /api/contribute — 'email me when reviewed' (SUBMISSION_NOTIFY_ENABLED)", () => {
+  it("flag OFF: a valid notifyEmail is silently ignored — 201, zero notify rows", async () => {
+    const res = await POST(req({ ...validCreateBody, notifyEmail: "contributor@example.com" }));
+    expect(res.status).toBe(201);
+    expect((await res.json()).ok).toBe(true);
+
+    expect(await tdb.db.select().from(submissionsTable)).toHaveLength(1);
+    expect(await tdb.db.select().from(submissionNotifyRequestsTable)).toHaveLength(0);
+  });
+
+  it("flag OFF: a malformed notifyEmail does not change the response — this is the oracle test the field is kept out of contributeInputSchema to prevent", async () => {
+    // Identical body to the flag-ON "malformed notifyEmail" case below (400
+    // there) — proving it's the flag, not the value, that decides the outcome.
+    const res = await POST(req({ ...validCreateBody, notifyEmail: "x" }));
+    expect(res.status).toBe(201);
+    expect((await res.json()).ok).toBe(true);
+
+    expect(await tdb.db.select().from(submissionsTable)).toHaveLength(1);
+    expect(await tdb.db.select().from(submissionNotifyRequestsTable)).toHaveLength(0);
+  });
+
+  it("flag ON: records exactly one row, email lowercased + trimmed", async () => {
+    vi.stubEnv("SUBMISSION_NOTIFY_ENABLED", "true");
+
+    const res = await POST(req({ ...validCreateBody, notifyEmail: "  MiXeD@Example.COM  " }));
+    expect(res.status).toBe(201);
+    expect((await res.json()).ok).toBe(true);
+
+    // Proves the write is actually DEFERRED, not still inline: zero rows the
+    // instant the response resolves, one once the after() task is flushed.
+    // Without this "before" half, this test would pass whether the write
+    // happened inline or deferred — see the mutation-test note at the bottom
+    // of this file.
+    expect(await tdb.db.select().from(submissionNotifyRequestsTable)).toHaveLength(0);
+    await flushAfter();
+
+    const rows = await tdb.db.select().from(submissionNotifyRequestsTable);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].email).toBe("mixed@example.com");
+
+    const submissions = await tdb.db.select().from(submissionsTable);
+    expect(rows[0].submissionId).toBe(submissions[0].id);
+  });
+
+  it("flag ON: notifyEmail never reaches the stored submission payload or provenance", async () => {
+    vi.stubEnv("SUBMISSION_NOTIFY_ENABLED", "true");
+
+    const res = await POST(req({ ...validCreateBody, notifyEmail: "should-not-leak@example.com" }));
+    expect(res.status).toBe(201);
+
+    const submissions = await tdb.db.select().from(submissionsTable);
+    expect(submissions).toHaveLength(1);
+    expect(JSON.stringify(submissions[0].payload)).not.toContain("should-not-leak@example.com");
+    expect(JSON.stringify(submissions[0].provenance)).not.toContain("should-not-leak@example.com");
+  });
+
+  it("flag ON, correction kind: a notify row is written too", async () => {
+    vi.stubEnv("SUBMISSION_NOTIFY_ENABLED", "true");
+    await seedFacility(tdb.db, seedDoc);
+
+    const res = await POST(
+      req({
+        kind: "correction",
+        targetFacilityId: seedDoc.id,
+        field: "operator",
+        value: "New Op",
+        sourceUrl: "https://example.com/correction",
+        notifyEmail: "correction-notify@example.com",
+      })
+    );
+    expect(res.status).toBe(201);
+    await flushAfter();
+
+    const submissions = await tdb.db.select().from(submissionsTable);
+    expect(submissions).toHaveLength(1);
+    const rows = await tdb.db.select().from(submissionNotifyRequestsTable);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].email).toBe("correction-notify@example.com");
+    expect(rows[0].submissionId).toBe(submissions[0].id);
+  });
+
+  it("flag ON, malformed notifyEmail: 400, zero notify rows, and zero submissions created", async () => {
+    vi.stubEnv("SUBMISSION_NOTIFY_ENABLED", "true");
+
+    const res = await POST(req({ ...validCreateBody, notifyEmail: "x" }));
+    expect(res.status).toBe(400);
+    // issue.path must be ["notifyEmail"], not [] — the form's client-side
+    // issuesToFieldMap keys errors by issue.path[0], and a path-less issue
+    // can't attach to the email field (see notifyEmailFieldSchema's comment
+    // in lib/contribute.ts).
+    const body = await res.json();
+    expect(body.issues?.[0]?.path).toEqual(["notifyEmail"]);
+
+    expect(await tdb.db.select().from(submissionsTable)).toHaveLength(0);
+    expect(await tdb.db.select().from(submissionNotifyRequestsTable)).toHaveLength(0);
+  });
+
+  it.each(["a\u0000@example.com", "a\ud800@example.com"])(
+    "flag ON, unstorable notifyEmail %j: 400 on path notifyEmail, zero rows",
+    async (email) => {
+      vi.stubEnv("SUBMISSION_NOTIFY_ENABLED", "true");
+
+      const res = await POST(req({ ...validCreateBody, notifyEmail: email }));
+      expect(res.status).toBe(400);
+      expect((await res.json()).issues?.[0]?.path).toEqual(["notifyEmail"]);
+
+      expect(await tdb.db.select().from(submissionsTable)).toHaveLength(0);
+      expect(await tdb.db.select().from(submissionNotifyRequestsTable)).toHaveLength(0);
+    }
+  );
+
+  it("flag OFF: an unstorable notifyEmail is silently ignored — 201, zero notify rows", async () => {
+    const res = await POST(req({ ...validCreateBody, notifyEmail: "a\u0000@example.com" }));
+    expect(res.status).toBe(201);
+
+    expect(await tdb.db.select().from(submissionNotifyRequestsTable)).toHaveLength(0);
+  });
+
+  it.each(["x\u0000y", "x\ud800y"])(
+    "unstorable character %j in note: 400, nothing stored",
+    async (bad) => {
+      const res = await POST(req({ ...validCreateBody, note: bad }));
+      expect(res.status).toBe(400);
+      expect(await tdb.db.select().from(submissionsTable)).toHaveLength(0);
+    }
+  );
+
+  it("flag ON, honeypot tripped: zero notify rows and zero submissions", async () => {
+    vi.stubEnv("SUBMISSION_NOTIFY_ENABLED", "true");
+
+    const res = await POST(req({ ...validCreateBody, website: "spam", notifyEmail: "bot@example.com" }));
+    expect(res.status).toBe(201);
+    expect((await res.json()).ok).toBe(true);
+
+    expect(await tdb.db.select().from(submissionsTable)).toHaveLength(0);
+    expect(await tdb.db.select().from(submissionNotifyRequestsTable)).toHaveLength(0);
+  });
+
+  it("flag ON: per-address cap — at EMAIL_SEND_CAP_MAX outstanding requests, writes no new row but still succeeds", async () => {
+    vi.stubEnv("SUBMISSION_NOTIFY_ENABLED", "true");
+    const email = "capped@example.com";
+    for (let i = 0; i < EMAIL_SEND_CAP_MAX; i++) {
+      await tdb.db.insert(submissionNotifyRequestsTable).values({ submissionId: randomUUID(), email });
+    }
+
+    const res = await POST(req({ ...validCreateBody, notifyEmail: email }));
+    expect(res.status).toBe(201);
+    expect((await res.json()).ok).toBe(true);
+    // The cap check itself now runs inside the deferred after() task (see
+    // recordNotifyRequestBestEffort), so it must be flushed before asserting
+    // on its outcome.
+    await flushAfter();
+
+    // The submission itself still succeeds — only the notify row is skipped.
+    expect(await tdb.db.select().from(submissionsTable)).toHaveLength(1);
+    const rows = await tdb.db.select().from(submissionNotifyRequestsTable);
+    expect(rows).toHaveLength(EMAIL_SEND_CAP_MAX); // unchanged — no new row added
+  });
+
+  it("flag OFF: the response body is byte-identical to flag ON (no notify key ever leaks into the HTTP response)", async () => {
+    // Sequential, deliberately: `pendingAfter` is one shared module-level
+    // variable, so running these concurrently (e.g. via Promise.all) would
+    // race whichever request's after() call lands second against the first.
+    const offRes = await POST(req({ ...validCreateBody, name: "Flag Off Facility" }));
+    expect(offRes.status).toBe(201);
+    const offText = await offRes.text();
+
+    vi.stubEnv("SUBMISSION_NOTIFY_ENABLED", "true");
+    const onRes = await POST(
+      req({ ...validCreateBody, name: "Flag On Facility", notifyEmail: "leaky-check@example.com" })
+    );
+    expect(onRes.status).toBe(201);
+    const onText = await onRes.text();
+    await flushAfter();
+
+    expect(offText).toBe('{"ok":true}');
+    expect(onText).toBe('{"ok":true}'); // no `notify` key — it's an internal lib<->route signal only
+    expect(onText).toBe(offText); // truly byte-identical, not just structurally equal
+  });
+
+  it("flag OFF: writes zero rows and schedules no deferred task at all", async () => {
+    const res = await POST(req({ ...validCreateBody, notifyEmail: "contributor@example.com" }));
+    expect(res.status).toBe(201);
+
+    // No after() call was ever made for this request — not merely one whose
+    // deferred work turned out to be a no-op.
+    expect(pendingAfter).toBeUndefined();
+    expect(await tdb.db.select().from(submissionNotifyRequestsTable)).toHaveLength(0);
+  });
+
+  it("flag OFF: an over-long notifyEmail value is silently ignored — 201, zero notify rows, zero submissions rows", async () => {
+    const longEmail = "a".repeat(1000) + "@example.com"; // way past any sane email length
+    const res = await POST(req({ ...validCreateBody, notifyEmail: longEmail }));
+    expect(res.status).toBe(201);
+    expect((await res.json()).ok).toBe(true);
+
+    expect(await tdb.db.select().from(submissionsTable)).toHaveLength(1);
+    expect(await tdb.db.select().from(submissionNotifyRequestsTable)).toHaveLength(0);
+  });
+
+  it("flag OFF: notifyEmail as a number is silently ignored — 201, zero notify rows", async () => {
+    const res = await POST(req({ ...validCreateBody, notifyEmail: 123 }));
+    expect(res.status).toBe(201);
+    expect((await res.json()).ok).toBe(true);
+
+    expect(await tdb.db.select().from(submissionsTable)).toHaveLength(1);
+    expect(await tdb.db.select().from(submissionNotifyRequestsTable)).toHaveLength(0);
+  });
+
+  it("flag OFF: notifyEmail as an array is silently ignored — 201, zero notify rows", async () => {
+    const res = await POST(req({ ...validCreateBody, notifyEmail: ["test@example.com"] }));
+    expect(res.status).toBe(201);
+    expect((await res.json()).ok).toBe(true);
+
+    expect(await tdb.db.select().from(submissionsTable)).toHaveLength(1);
+    expect(await tdb.db.select().from(submissionNotifyRequestsTable)).toHaveLength(0);
+  });
+
+  it("flag OFF: notifyEmail as an object is silently ignored — 201, zero notify rows", async () => {
+    const res = await POST(req({ ...validCreateBody, notifyEmail: { email: "test@example.com" } }));
+    expect(res.status).toBe(201);
+    expect((await res.json()).ok).toBe(true);
+
+    expect(await tdb.db.select().from(submissionsTable)).toHaveLength(1);
+    expect(await tdb.db.select().from(submissionNotifyRequestsTable)).toHaveLength(0);
+  });
+
+  it("flag OFF: notifyEmail as null is silently ignored — 201, zero notify rows", async () => {
+    const res = await POST(req({ ...validCreateBody, notifyEmail: null }));
+    expect(res.status).toBe(201);
+    expect((await res.json()).ok).toBe(true);
+
+    expect(await tdb.db.select().from(submissionsTable)).toHaveLength(1);
+    expect(await tdb.db.select().from(submissionNotifyRequestsTable)).toHaveLength(0);
+  });
+
+  it("flag OFF: notifyEmail as a boolean is silently ignored — 201, zero notify rows", async () => {
+    const res = await POST(req({ ...validCreateBody, notifyEmail: true }));
+    expect(res.status).toBe(201);
+    expect((await res.json()).ok).toBe(true);
+
+    expect(await tdb.db.select().from(submissionsTable)).toHaveLength(1);
+    expect(await tdb.db.select().from(submissionNotifyRequestsTable)).toHaveLength(0);
+  });
+
+  it("flag OFF: notifyEmail alongside honeypot is silently ignored — 201, zero rows in both tables", async () => {
+    const res = await POST(
+      req({ ...validCreateBody, website: "spam", notifyEmail: "contributor@example.com" })
+    );
+    expect(res.status).toBe(201);
+    expect((await res.json()).ok).toBe(true);
+
+    expect(await tdb.db.select().from(submissionsTable)).toHaveLength(0);
+    expect(await tdb.db.select().from(submissionNotifyRequestsTable)).toHaveLength(0);
+  });
+
+  it("flag OFF: response body is byte-identical to the no-notifyEmail baseline for all invalid types", async () => {
+    // Capture the baseline: no notifyEmail at all
+    const baselineRes = await POST(req(validCreateBody));
+    const baselineBody = await baselineRes.text();
+
+    // Test multiple invalid-type cases with the exact same response expectation
+    const testCases = [
+      { notifyEmail: 123 },
+      { notifyEmail: ["test@example.com"] },
+      { notifyEmail: null },
+      { notifyEmail: true },
+    ];
+
+    for (const testCase of testCases) {
+      pendingAfter = undefined; // Reset for each iteration
+      const res = await POST(req({ ...validCreateBody, ...testCase }));
+      const body = await res.text();
+      expect(body).toBe(baselineBody);
+      expect(body).toBe('{"ok":true}');
+    }
+  });
+
+  it("flag ON: a throw inside the deferred notify write does not fail the request and logs a code, not the error object", async () => {
+    vi.stubEnv("SUBMISSION_NOTIFY_ENABLED", "true");
+    // Breaks BOTH queries recordNotifyRequestBestEffort can run (the cap-check
+    // SELECT and the insert) with an undefined_table error (42P01) — same
+    // technique as app/api/subscribe/route.integration.test.ts's
+    // `accountingFailures` cases.
+    await tdb.client.exec(
+      `ALTER TABLE "submission_notify_requests" RENAME TO "submission_notify_requests_hidden"`
+    );
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const email = "throws@example.com";
+      const res = await POST(req({ ...validCreateBody, notifyEmail: email }));
+      // The response is already 201 before the deferred task even runs — this
+      // pins that structural guarantee rather than assuming it.
+      expect(res.status).toBe(201);
+      expect((await res.json()).ok).toBe(true);
+
+      await flushAfter();
+
+      const logged = errorSpy.mock.calls.flat().map(String).join(" ");
+      expect(logged).toContain("submission notify request failed");
+      expect(logged).toContain("42P01");
+      expect(logged).not.toContain(email); // a safe code, never the caught error object
+    } finally {
+      // mockRestore() FIRST: it is synchronous and cannot throw, whereas the
+      // DDL restore below can — restoring the spy after it would re-open the
+      // leak this ordering closes (clearMocks does not restore implementations).
+      errorSpy.mockRestore();
+      await tdb.client.exec(
+        `ALTER TABLE "submission_notify_requests_hidden" RENAME TO "submission_notify_requests"`
+      );
+    }
   });
 });

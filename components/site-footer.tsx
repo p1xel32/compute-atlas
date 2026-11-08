@@ -1,10 +1,25 @@
 import Link from "next/link";
 
 import { siteConfig } from "@/lib/site";
+import { Wordmark } from "@/components/wordmark";
+
+const EXPLORE_LINKS = [
+  { label: "States", href: "/states" },
+  { label: "By status", href: "/status" },
+  { label: "By metro", href: "/metros" },
+  { label: "Power", href: "/power" },
+  { label: "Opposition", href: "/opposition" },
+] as const;
+
+const NAV_LINK_CLASS =
+  "inline-flex min-h-11 items-center rounded-sm underline-offset-4 transition-colors motion-reduce:transition-none hover:text-foreground hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring";
+
+const EXTERNAL_NAV_LINK_CLASS =
+  "inline-flex min-h-11 items-center gap-1 rounded-sm underline-offset-4 transition-colors motion-reduce:transition-none hover:text-foreground hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring";
 
 export function SiteFooter() {
   return (
-    <footer className="print:hidden relative border-t border-border">
+    <footer data-site-footer className="print:hidden relative border-t border-border">
       {/* Faint graticule wash — atlas margin texture */}
       <div
         aria-hidden="true"
@@ -12,80 +27,97 @@ export function SiteFooter() {
       />
 
       <div data-footer-inner className="relative mx-auto max-w-7xl px-4 py-10 sm:px-6">
-        <div className="grid gap-8 sm:grid-cols-2 lg:grid-cols-[1.6fr_1fr]">
+        <div className="grid grid-cols-1 gap-8 sm:grid-cols-2 lg:grid-cols-3">
           {/* Colophon — identity, mission, attribution */}
-          <div className="space-y-3">
-            <div className="flex items-center gap-1.5">
-              <svg
-                aria-hidden="true"
-                viewBox="0 0 24 24"
-                fill="none"
-                className="size-[18px] shrink-0 text-primary"
-              >
-                <rect x="4" y="4" width="16" height="16" rx="2" stroke="currentColor" strokeWidth="1.8" />
-                <line x1="12" y1="4" x2="12" y2="20" stroke="currentColor" strokeWidth="1.8" />
-                <line x1="4" y1="12" x2="20" y2="12" stroke="currentColor" strokeWidth="1.8" />
-                <circle cx="12" cy="12" r="2.4" fill="currentColor" />
-              </svg>
-              <span className="font-display text-lg font-semibold leading-none tracking-tight text-foreground">
-                {siteConfig.name}
-              </span>
-            </div>
+          <div className="sm:col-span-2 lg:col-span-1 space-y-3">
+            <Link
+              href="/"
+              aria-label={`${siteConfig.name}: ${siteConfig.tagline}, home`}
+              className="inline-flex flex-col items-start gap-0 rounded-sm focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"
+            >
+              <Wordmark showTagline />
+            </Link>
             <p className="max-w-xs text-sm leading-relaxed text-muted-foreground">
-              An open, source-cited survey of the U.S. compute buildout —
-              data centers, AI campuses, and crypto-mining — and its civic
-              footprint. Not affiliated with any corporation or government
-              agency.
+              A source-cited survey of the U.S. compute buildout —
+              data centers, AI campuses, crypto-mining, and the power built to
+              feed them — and its civic footprint. Not affiliated with any
+              corporation or government agency.
             </p>
             <p className="font-mono text-[11px] uppercase tracking-widest text-muted-foreground">
               An independent project by Edward Kubiak
             </p>
-            <div className="flex flex-col items-start gap-1">
-              <Link href="/contribute"
-                 aria-label="Contribute a facility or correction"
-                 className="inline-flex min-h-11 items-center gap-1 font-mono text-[11px] uppercase tracking-widest text-muted-foreground underline-offset-4 transition-colors hover:text-foreground hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 rounded-sm">
-                Contribute a facility <span aria-hidden="true">→</span>
-              </Link>
-              <Link href="/activity"
-                 className="inline-flex min-h-11 items-center gap-1 font-mono text-[11px] uppercase tracking-widest text-muted-foreground underline-offset-4 transition-colors hover:text-foreground hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 rounded-sm">
-                Recent activity <span aria-hidden="true">→</span>
-              </Link>
-              <a href={siteConfig.sponsorUrl} target="_blank" rel="noreferrer noopener"
-                 aria-label="Sponsor Compute Atlas on GitHub Sponsors (opens in new tab)"
-                 className="inline-flex min-h-11 items-center gap-1 font-mono text-[11px] uppercase tracking-widest text-muted-foreground underline-offset-4 transition-colors hover:text-foreground hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 rounded-sm">
-                Sponsor this project <span aria-hidden="true">↗</span>
-              </a>
-            </div>
           </div>
 
-          {/* Sources & license */}
+          {/* Explore — data lenses */}
           <div className="space-y-2">
             <p className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
-              Sources &amp; license
+              Explore
+            </p>
+            <ul className="space-y-1 text-sm text-muted-foreground">
+              {EXPLORE_LINKS.map(({ label, href }) => (
+                <li key={href}>
+                  <Link href={href} className={NAV_LINK_CLASS}>
+                    {label}
+                  </Link>
+                </li>
+              ))}
+              <li>
+                <Link href="/explore" className={EXTERNAL_NAV_LINK_CLASS}>
+                  All lenses <span aria-hidden="true">→</span>
+                </Link>
+              </li>
+            </ul>
+          </div>
+
+          {/* Data & project */}
+          <div className="space-y-2">
+            <p className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
+              Data &amp; project
             </p>
             <ul className="space-y-1 text-sm text-muted-foreground">
               <li>
-                <Link
-                  href="/about"
-                  className="inline-flex min-h-11 items-center rounded-sm underline-offset-4 transition-colors hover:text-foreground hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
-                >
-                  Data &amp; methodology
+                <Link href="/about" className={NAV_LINK_CLASS}>
+                  About the project
+                </Link>
+              </li>
+              <li>
+                <Link href="/methodology" className={NAV_LINK_CLASS}>
+                  Methodology
+                </Link>
+              </li>
+              <li>
+                <Link href="/data" className={NAV_LINK_CLASS}>
+                  Cite
+                </Link>
+              </li>
+              <li>
+                <Link href="/contact" className={NAV_LINK_CLASS}>
+                  Contact
                 </Link>
               </li>
               <li>
                 <Link
-                  href="/api"
-                  className="inline-flex min-h-11 items-center rounded-sm underline-offset-4 transition-colors hover:text-foreground hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+                  href="/contribute"
+                  aria-label="Contribute a facility or correction"
+                  className={EXTERNAL_NAV_LINK_CLASS}
                 >
-                  API
+                  Contribute a facility <span aria-hidden="true">→</span>
                 </Link>
               </li>
-              <li className="leading-relaxed">
-                Map data &copy;{" "}
-                <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noreferrer noopener"
-                   aria-label="OpenStreetMap copyright and license (opens in new tab)"
-                   className="underline underline-offset-4 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 rounded-sm">OpenStreetMap</a>{" "}
-                contributors
+              <li>
+                <Link href="/activity" className={EXTERNAL_NAV_LINK_CLASS}>
+                  Recent activity <span aria-hidden="true">→</span>
+                </Link>
+              </li>
+              <li>
+                <Link href="/contributors" className={NAV_LINK_CLASS}>
+                  Contributors
+                </Link>
+              </li>
+              <li>
+                <Link href="/support" className={NAV_LINK_CLASS}>
+                  Support the atlas <span aria-hidden="true">→</span>
+                </Link>
               </li>
               <li>
                 <a
@@ -93,20 +125,57 @@ export function SiteFooter() {
                   target="_blank"
                   rel="noreferrer noopener"
                   aria-label="View source on GitHub (opens in new tab)"
-                  className="inline-flex min-h-11 items-center gap-1 rounded-sm underline-offset-4 transition-colors hover:text-foreground hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+                  className={EXTERNAL_NAV_LINK_CLASS}
                 >
                   Source on GitHub
                   <span aria-hidden="true">↗</span>
                 </a>
               </li>
+              <li>
+                <a
+                  href={siteConfig.blueskyUrl}
+                  target="_blank"
+                  rel="noreferrer noopener"
+                  aria-label="Compute Atlas on Bluesky (opens in new tab)"
+                  className={EXTERNAL_NAV_LINK_CLASS}
+                >
+                  Bluesky
+                  <span aria-hidden="true">↗</span>
+                </a>
+              </li>
+              <li>
+                <a
+                  href={siteConfig.newsletterUrl}
+                  target="_blank"
+                  rel="noreferrer noopener"
+                  aria-label="Newsletter on Buttondown (opens in new tab)"
+                  className={EXTERNAL_NAV_LINK_CLASS}
+                >
+                  Newsletter
+                  <span aria-hidden="true">↗</span>
+                </a>
+              </li>
+              <li className="leading-relaxed">
+                Map data &copy;{" "}
+                <a
+                  href="https://www.openstreetmap.org/copyright"
+                  target="_blank"
+                  rel="noreferrer noopener"
+                  aria-label="OpenStreetMap copyright and license (opens in new tab)"
+                  className="underline underline-offset-4 hover:text-foreground focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring rounded-sm"
+                >
+                  OpenStreetMap
+                </a>{" "}
+                contributors
+              </li>
             </ul>
           </div>
         </div>
 
-        {/* Edition margin line */}
+        {/* Margin line */}
         <div className="mt-8 flex flex-col gap-2 border-t border-border pt-5 sm:flex-row sm:items-center sm:justify-between">
           <p className="font-mono text-[10px] uppercase tracking-[0.18em] text-muted-foreground">
-            {siteConfig.name} · Edition 2026
+            {siteConfig.name}
           </p>
           <p
             aria-label="Coordinates: 39.5 degrees north, 98.5 degrees west"

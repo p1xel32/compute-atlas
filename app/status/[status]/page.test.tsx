@@ -13,7 +13,26 @@ vi.mock("@/lib/data", () => ({
   getFacilitiesByStatus: mockGetFacilitiesByStatus,
 }));
 
-import { generateMetadata } from "./page";
+// next/link renders to <a> — mock to avoid Next.js router-context dependency
+// in jsdom (CollectionPage's facility cards render Link internally).
+vi.mock("next/link", () => ({
+  default: ({
+    href,
+    children,
+    className,
+  }: {
+    href: string;
+    children: React.ReactNode;
+    className?: string;
+  }) => (
+    <a href={href} className={className}>
+      {children}
+    </a>
+  ),
+}));
+
+import { render, screen, within } from "@testing-library/react";
+import StatusPage, { generateMetadata } from "./page";
 
 beforeEach(() => {
   mockGetFacilitiesByStatus.mockReset();
@@ -30,7 +49,7 @@ function makeFacility(overrides: Partial<Facility> = {}): Facility {
     location: { lat: 40, lon: -90, city: "Springfield", state: "IL", precision: "exact" },
     statusHistory: [],
     sources: [
-      { url: "https://example.com", label: "Example source", retrievedAt: "2025-01", kind: "press" },
+      { url: "https://example.com", label: "Example source", retrievedAt: "2025-01-01", kind: "press" },
     ],
     lastUpdated: "2026-01-01",
     ...overrides,
@@ -100,5 +119,86 @@ describe("generateMetadata (status)", () => {
 
     expect(metadata).toEqual({ title: "Status not found" });
     expect(mockGetFacilitiesByStatus).not.toHaveBeenCalled();
+  });
+});
+
+describe("StatusPage — DC-aware fact line", () => {
+  it("phrases the fact line as '1 state and DC' when the status's facilities span only VA and DC", async () => {
+    mockGetFacilitiesByStatus.mockResolvedValue([
+      makeFacility({ id: "a", location: { lat: 38, lon: -77, state: "VA", precision: "exact" } }),
+      makeFacility({ id: "b", location: { lat: 38.9, lon: -77, state: "DC", precision: "exact" } }),
+    ]);
+
+    const page = await StatusPage({ params: Promise.resolve({ status: "proposed" }) });
+    render(page);
+
+    // Mutation coverage: reverting to the bare `${stateCount} state(s)`
+    // template (dropping containsDc/statesPhrase) renders "2 states" instead.
+    expect(screen.getByText(/spanning 1 state and DC\./)).toBeInTheDocument();
+    expect(screen.queryByText(/spanning 2 states\./)).not.toBeInTheDocument();
+  });
+
+  it("phrases the fact line as a bare state count when no facility is in DC", async () => {
+    mockGetFacilitiesByStatus.mockResolvedValue([
+      makeFacility({ id: "a", location: { lat: 38, lon: -77, state: "VA", precision: "exact" } }),
+      makeFacility({ id: "b", location: { lat: 40, lon: -90, state: "IL", precision: "exact" } }),
+    ]);
+
+    const page = await StatusPage({ params: Promise.resolve({ status: "proposed" }) });
+    render(page);
+
+    expect(screen.getByText(/spanning 2 states\./)).toBeInTheDocument();
+  });
+});
+
+/**
+ * The stat-row tile for a label. Scoped to the label span (uppercase,
+ * wide-tracked) so a bare figure that also appears on a facility card or in
+ * the intro prose cannot satisfy the assertion by accident.
+ */
+function statTile(label: string): HTMLElement {
+  const matches = screen
+    .getAllByText(label)
+    .filter((el) => el.tagName === "SPAN" && el.classList.contains("tracking-widest"));
+  if (matches.length !== 1) {
+    throw new Error(`expected exactly one stat tile labeled "${label}", found ${matches.length}`);
+  }
+  const tile = matches[0].closest("div");
+  if (!tile) throw new Error(`no tile wrapping label "${label}"`);
+  return tile;
+}
+
+describe("StatusPage — capacity stat", () => {
+  const FACILITIES = [
+    makeFacility({ id: "a", capacityMw: { operational: 600, planned: 100 } }),
+    makeFacility({ id: "b", capacityMw: { operational: 900, planned: 1500 } }),
+    makeFacility({ id: "c" }),
+  ];
+
+  it("operational: shows the summed operational capacity under 'Operational capacity'", async () => {
+    mockGetFacilitiesByStatus.mockResolvedValue(FACILITIES);
+
+    render(await StatusPage({ params: Promise.resolve({ status: "operational" }) }));
+
+    expect(within(statTile("Sites")).getByText("3")).toBeInTheDocument();
+    expect(within(statTile("Operational capacity")).getByText("1.5 GW")).toBeInTheDocument();
+  });
+
+  it("proposed: shows the summed planned capacity under 'Planned capacity'", async () => {
+    mockGetFacilitiesByStatus.mockResolvedValue(FACILITIES);
+
+    render(await StatusPage({ params: Promise.resolve({ status: "proposed" }) }));
+
+    expect(within(statTile("Planned capacity")).getByText("1.6 GW")).toBeInTheDocument();
+  });
+
+  it("cancelled: shows the summed planned capacity under the cancelled label", async () => {
+    mockGetFacilitiesByStatus.mockResolvedValue(FACILITIES);
+
+    render(await StatusPage({ params: Promise.resolve({ status: "cancelled" }) }));
+
+    expect(
+      within(statTile("Planned capacity (cancelled)")).getByText("1.6 GW")
+    ).toBeInTheDocument();
   });
 });

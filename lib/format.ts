@@ -1,11 +1,11 @@
 import { STATUS_META, type Status } from "@/lib/status";
-import { aiClassificationEnum, type Facility } from "@/lib/schema";
+import type { Facility } from "@/lib/schema";
 
 /**
  * Returns the maximum of operational/planned capacity in MW, or undefined if
  * the facility has no capacity data.
  */
-export function getFacilityMaxMw(f: Facility): number | undefined {
+export function getFacilityMaxMw(f: Pick<Facility, "capacityMw">): number | undefined {
   const operational = f.capacityMw?.operational;
   const planned = f.capacityMw?.planned;
   if (operational !== undefined && planned !== undefined) {
@@ -15,12 +15,41 @@ export function getFacilityMaxMw(f: Facility): number | undefined {
 }
 
 /**
+ * Count of facilities that disclose a capacity figure, restricted to
+ * non-cancelled facilities. Shared "N of M disclose capacity" denominator
+ * used by /power, /crypto, and /stats. The non-cancelled restriction matters
+ * whenever the caller's own operational/planned MW sums (e.g.
+ * getGenerationStats, getCryptoMiningStats) also exclude cancelled
+ * facilities — without it, a cancelled record that happens to disclose a
+ * figure could inflate this count relative to the population those sums
+ * actually cover, making a "disclosed for N of M" sentence false.
+ */
+export function countDisclosedCapacity(facilities: Facility[]): number {
+  return facilities.filter(
+    (f) => f.status !== "cancelled" && getFacilityMaxMw(f) !== undefined
+  ).length;
+}
+
+/**
+ * Comparator for `Array.prototype.sort`: orders facilities by disclosed
+ * capacity (the larger of operational/planned, via `getFacilityMaxMw`)
+ * descending, undisclosed capacity sorting last, ties broken alphabetically
+ * by name. Shared by /power and /crypto's "all projects/facilities" lists.
+ */
+export function sortByMaxMwDesc(a: Facility, b: Facility): number {
+  return (
+    (getFacilityMaxMw(b) ?? -1) - (getFacilityMaxMw(a) ?? -1) ||
+    a.name.localeCompare(b.name)
+  );
+}
+
+/**
  * Returns a human-readable capacity string:
  * - "150 MW"              when operational capacity is present
  * - "1,200 MW planned"    when only planned capacity is present
  * - "—"                   when no capacity data is available
  */
-export function formatCapacity(f: Facility): string {
+export function formatCapacity(f: Pick<Facility, "capacityMw">): string {
   const operational = f.capacityMw?.operational;
   const planned = f.capacityMw?.planned;
   if (operational !== undefined) {
@@ -36,7 +65,7 @@ export function formatCapacity(f: Facility): string {
  * Returns a location string in the form "City, ST" or just "ST" when city is
  * absent.
  */
-export function formatLocation(f: Facility): string {
+export function formatLocation(f: { location: { city?: string; state: string } }): string {
   const { city, state } = f.location;
   if (city) {
     return `${city}, ${state}`;
@@ -51,6 +80,83 @@ export function formatStatusLabel(s: Status): string {
   return STATUS_META[s].label;
 }
 
+/**
+ * Trailing legal-entity suffixes stripped when comparing an operator name
+ * against a facility name for redundancy (see `isOperatorRedundant` below).
+ * Anchored to the end of the string, preceded by a comma and/or whitespace,
+ * with an optional trailing period — case-insensitive.
+ */
+const LEGAL_SUFFIX_RE =
+  /[,\s]+(?:l\.?l\.?c\.?|llp|lp|inc\.?|incorporated|corp\.?|corporation|ltd\.?|limited|co\.?|company|holdings|group|plc)$/i;
+
+/**
+ * Strips trailing legal-entity suffixes (", Inc.", " LLC", " Holdings", ...)
+ * from an organization name, looping until none remain — so a compound like
+ * "Foo Holdings, LLC" fully reduces to "Foo" in one call. Mirrors the
+ * suffix-normalization shape of `normalizeCounty` in lib/metros.ts, applied
+ * to company names instead of county names.
+ */
+export function stripLegalSuffix(name: string): string {
+  let current = name.trim();
+  for (;;) {
+    const stripped = current.replace(LEGAL_SUFFIX_RE, "").trim();
+    if (stripped === current) return current;
+    current = stripped;
+  }
+}
+
+/**
+ * True when a facility's name already conveys its operator, or vice versa
+ * (e.g. name "Google Council Bluffs", operator "Google") — both sides are
+ * run through `stripLegalSuffix` first so a trailing "Inc."/"LLC"/etc. can't
+ * defeat the match (e.g. name "CleanSpark Dalton Bitcoin Mining Facility",
+ * operator "CleanSpark, Inc."). Used to omit a redundant operator segment
+ * from generated titles.
+ */
+export function isOperatorRedundant(name: string, operator: string): boolean {
+  const nameLower = stripLegalSuffix(name).toLowerCase();
+  const operatorLower = stripLegalSuffix(operator).toLowerCase();
+  return nameLower.includes(operatorLower) || operatorLower.includes(nameLower);
+}
+
+/**
+ * Per-type keywords that, if present in a facility's own name, already
+ * convey its facilityType (e.g. name "... Bitcoin Mining Facility" conveys
+ * crypto_mining) — deliberately a short, high-precision list rather than an
+ * exhaustive one. Matched as case-insensitive substrings in `nameConveysType`.
+ */
+/** Escape a literal string for safe interpolation into a RegExp. */
+function escapeRegExp(literal: string): string {
+  return literal.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+const TYPE_KEYWORDS: Record<Facility["facilityType"], string[]> = {
+  data_center: ["data center", "datacenter", "data centre"],
+  crypto_mining: ["mining", "miner"],
+  power_generation: ["solar", "wind", "power plant", "power station", "generating station"],
+};
+
+/**
+ * True when a facility's own name already conveys its facilityType — signals
+ * a title generator can omit the redundant type-label segment. Used by
+ * app/facilities/[slug]/page.tsx's generateMetadata.
+ */
+export function nameConveysType(
+  name: string,
+  facilityType: Facility["facilityType"]
+): boolean {
+  const nameLower = name.toLowerCase();
+  // Match the keyword as a whole word, tolerating a plural "s" — a bare
+  // substring test suppresses the type label on names that merely CONTAIN a
+  // keyword inside a longer word ("Windsor"/"Winding" both contain "wind",
+  // "Minerva" contains "miner", "Solaris" contains "solar"). The trailing
+  // `s?` is what keeps "Data Centers" matching, which is why a plain \b
+  // word-boundary test is not enough here.
+  return TYPE_KEYWORDS[facilityType].some((keyword) =>
+    new RegExp(`${escapeRegExp(keyword)}s?(?![a-z])`).test(nameLower)
+  );
+}
+
 /** Human-readable labels for the aiClassification enum. */
 export const AI_CLASSIFICATION_LABELS: Record<string, string> = {
   confirmed: "AI-specific",
@@ -63,15 +169,10 @@ export const AI_CLASSIFICATION_LABELS: Record<string, string> = {
  * contexts where the page already establishes the AI framing (/ai, /stats,
  * /states/[state], the admin form). Per-facility contexts use
  * {@link AI_CLASSIFICATION_LABELS} above, which is self-describing ("AI-specific").
+ * Derived from `AI_CLASSIFICATION_ENTRIES` in `lib/ai-classification.ts` — re-exported
+ * here so existing imports from `@/lib/format` keep working unchanged.
  */
-export const AI_CLASSIFICATION_CONFIDENCE_LABELS: Record<
-  (typeof aiClassificationEnum.options)[number],
-  string
-> = {
-  confirmed: "Confirmed",
-  likely: "Likely",
-  mixed_use: "Mixed use",
-};
+export { AI_CLASSIFICATION_CONFIDENCE_LABELS } from "@/lib/ai-classification";
 
 /** Human-readable labels for the confidence enum. */
 export const CONFIDENCE_LABELS: Record<string, string> = {
@@ -96,4 +197,42 @@ export function formatUsdCompact(n: number): string {
     // compact value is a whole number, so "$3.5B"/"$2.9M" are unaffected.
     trailingZeroDisplay: "stripIfInteger",
   }).format(n);
+}
+
+/**
+ * Formats a ratio as "X.X : 1", guarding the zero-denominator case with an
+ * em dash instead of dividing by zero (which would otherwise render
+ * "Infinity : 1" or "NaN : 1"). Shared by /power's fossil-vs-non-fossil
+ * buildout ratio and the homepage cost ledger's mirror of the same figure.
+ */
+export function formatRatio(numerator: number, denominator: number): string {
+  if (denominator === 0) return "—";
+  return `${(numerator / denominator).toFixed(1)} : 1`;
+}
+
+/** Formats megawatts as MW, or GW once the figure rounds to 1,000 MW or more. */
+export function formatPower(mw: number): string {
+  // Round before the threshold so 999.6 reads "1.0 GW", never "1000 MW".
+  const wholeMw = Math.round(mw);
+  if (wholeMw >= 1000) {
+    // Integer rounding: toFixed(1) rounds on the binary value, so 1.45 (1.4499...) read "1.4".
+    return `${(Math.round(mw / 100) / 10).toFixed(1)} GW`;
+  }
+  return `${wholeMw} MW`;
+}
+
+/** Formats a million-gallons-per-day water figure. */
+export function formatMgd(mgd: number): string {
+  return `${mgd.toFixed(1)} MGD`;
+}
+
+/**
+ * Formats a permitted annual emissions tonnage (short tons per year, "tpy")
+ * from an air permit. A permit can legitimately state a 0.0 limit for a
+ * pollutant a unit is prohibited from emitting, so 0 must render as
+ * "0 tons/yr", never as an em dash or empty string — collapsing it to
+ * "absent" would misreport a real regulatory fact.
+ */
+export function formatTonsPerYear(tpy: number): string {
+  return `${tpy.toLocaleString()} tons/yr`;
 }

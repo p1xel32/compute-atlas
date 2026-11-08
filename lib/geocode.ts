@@ -1,5 +1,53 @@
 const NOMINATIM_URL = "https://nominatim.openstreetmap.org/search";
 
+export interface ParsedCoordinates {
+  lat: number;
+  lon: number;
+}
+
+const SIGNED_DECIMAL_RE = /^[+-]?\d+(?:\.\d+)?$/;
+
+/**
+ * Parses a combined "lat, lon" string — the format Google Maps puts on the
+ * clipboard when you right-click a spot and choose the coordinates — into
+ * numeric latitude/longitude. Pure and synchronous: no network call, so it's
+ * unit-testable with zero mocking (see geocodeUS below for the network half).
+ *
+ * Tolerates the variants people actually paste: extra whitespace, no space
+ * after the comma, surrounding parentheses, and a trailing degree symbol on
+ * either number (e.g. "(39.51°, -98.53°)"). Returns `null` — never throws —
+ * for anything that doesn't resolve to two numbers within valid coordinate
+ * ranges (lat -90..90, lon -180..180).
+ *
+ * Every valid US longitude is NEGATIVE. Do not "helpfully" coerce sign here —
+ * a parser that drops the minus would place a facility in China.
+ */
+export function parseCoordinateString(input: string): ParsedCoordinates | null {
+  const trimmed = input.trim();
+  if (!trimmed) return null;
+
+  // Strip one layer of surrounding parentheses: "(39.51, -98.53)".
+  const unwrapped =
+    trimmed.startsWith("(") && trimmed.endsWith(")")
+      ? trimmed.slice(1, -1).trim()
+      : trimmed;
+
+  const parts = unwrapped.split(",");
+  if (parts.length !== 2) return null;
+
+  const [rawLat, rawLon] = parts.map((p) => p.trim().replace(/°/g, "").trim());
+  if (!rawLat || !rawLon) return null;
+  if (!SIGNED_DECIMAL_RE.test(rawLat) || !SIGNED_DECIMAL_RE.test(rawLon)) return null;
+
+  const lat = Number(rawLat);
+  const lon = Number(rawLon);
+  if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
+  if (lat < -90 || lat > 90) return null;
+  if (lon < -180 || lon > 180) return null;
+
+  return { lat, lon };
+}
+
 export interface GeocodeResult {
   lon: number;
   lat: number;
@@ -25,7 +73,8 @@ interface NominatimItem {
  */
 export async function geocodeUS(
   query: string,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  opts?: { userAgent?: string }
 ): Promise<GeocodeResult[]> {
   const trimmed = query.trim();
   if (!trimmed) return [];
@@ -40,10 +89,14 @@ export async function geocodeUS(
 
   // Nominatim usage policy is satisfied by the browser automatically supplying
   // Referer/Origin headers. User-Agent is a forbidden header for browser fetch
-  // and is silently dropped — do NOT attempt to set it here.
+  // and is silently dropped, so browser callers omit `opts.userAgent`. Node
+  // callers MUST pass one: Nominatim answers 403 to Node's default fetch
+  // User-Agent (measured 2026-10-09).
+  const headers: Record<string, string> = { Accept: "application/json" };
+  if (opts?.userAgent) headers["User-Agent"] = opts.userAgent;
   const res = await fetch(`${NOMINATIM_URL}?${params.toString()}`, {
     signal,
-    headers: { Accept: "application/json" },
+    headers,
   });
 
   if (!res.ok) {

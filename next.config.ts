@@ -1,7 +1,640 @@
 import type { NextConfig } from "next";
 
+import { CSP_REPORT_PATH } from "./lib/csp-report";
+
+/**
+ * Content-Security-Policy — ENFORCING as of 2026-09-07 (issue #236). It was
+ * report-only from 2026-09-04 while the evidence was gathered.
+ *
+ * What the flip rests on. The original criterion was "a week of clean
+ * browser consoles", which turned out to be unfalsifiable: with no report
+ * endpoint, a silent console for a page nobody opened looked exactly like a
+ * genuinely clean one. It was replaced by two mechanical sweeps, and BOTH
+ * were required, because each is blind to what the other sees:
+ *   - `e2e/csp.spec.ts` against a real production build — covers the
+ *     gesture-only surfaces (`/map` satellite mode, the geocoder) that a
+ *     bare page load never reaches, and carries a canary test proving the
+ *     violation listener actually fires. 5/5 clean, 2026-09-07.
+ *   - A production sweep of 10 route families against www.compute-atlas.com
+ *     — the only thing that can see subresources the Cloudflare proxy
+ *     injects and the app never declares. That sweep is how
+ *     `static.cloudflareinsights.com` was found (PR #254); zero violations
+ *     on 2026-09-07 after it merged.
+ * `/map` was the last real blocker and is fixed at the source: PR #253
+ * switched to MapLibre's CSP-safe build, so nothing here needs
+ * `'unsafe-eval'`.
+ *
+ * ⚠️ `script-src` still carries 'unsafe-inline' for Next.js's bootstrap
+ * script, so an enforcing `script-src` is weaker than it looks. Enforcing is
+ * still a real gain — `object-src 'none'`, `base-uri`, `frame-ancestors` and
+ * `form-action` are now actually enforced rather than merely reported.
+ * Nonce-based tightening is a separate, larger job; do not let it block or
+ * un-do this.
+ *
+ * Every non-'self' origin below is evidenced by a real subresource this app
+ * loads (checked 2026-09-04) — not a speculative allowance:
+ *   - https://tiles.openfreemap.org — vector tiles, glyphs, and sprite for
+ *     the basemap style (public/basemap/parchment.json is fetched
+ *     same-origin, but its `tiles`/`glyphs`/`sprite` fields point here;
+ *     see lib/map.ts's BASEMAP_STYLE_URL comment).
+ *   - https://services.arcgisonline.com — Esri World Imagery satellite
+ *     raster tiles (lib/map.ts SATELLITE_TILE_URL).
+ *   - https://nominatim.openstreetmap.org — the map's location-search
+ *     geocoder (lib/geocode.ts), called via fetch().
+ *   - https://static.cloudflareinsights.com — Cloudflare Web Analytics'
+ *     beacon.min.js, injected by the Cloudflare proxy in front of production.
+ *     It does NOT exist in a local build, so no local check can see it: it was
+ *     found by running the e2e/csp.spec.ts listener against PRODUCTION on
+ *     2026-09-07, where it was the ONLY violation, on 7 of 10 route families
+ *     swept (/, /map, /table, /facilities/*, /admin/login, /learn/*,
+ *     /contribute). That asymmetry is the point — a local harness is necessary
+ *     but not sufficient for this header, because the proxy adds subresources
+ *     the app never declares.
+ *
+ * `frame-ancestors` is NOT in this shared list — it is supplied per scope by
+ * `buildCsp` below. See that function for why leaving it here would have
+ * been a silent security regression.
+ */
+const CSP_COMMON_DIRECTIVES = [
+  "default-src 'self'",
+  "script-src 'self' 'unsafe-inline' https://static.cloudflareinsights.com",
+  "style-src 'self' 'unsafe-inline'",
+  "img-src 'self' data: blob: https://tiles.openfreemap.org https://services.arcgisonline.com",
+  "connect-src 'self' https://tiles.openfreemap.org https://services.arcgisonline.com https://nominatim.openstreetmap.org",
+  "worker-src 'self' blob:",
+  "child-src blob:",
+  // ⚠️ `frame-src` is stated EXPLICITLY and must stay that way. Its fallback
+  // chain is `child-src` FIRST, and only then `default-src` — so with
+  // `child-src blob:` above and no entry here, framing resolved to `blob:`
+  // alone: same-origin iframes blocked, blob: iframes allowed, which is the
+  // inverse of the intent and of what `default-src 'self'` would suggest to
+  // a reader. Verified in a browser against this build, not inferred:
+  // appending a `/table` iframe reported `frame-src -> /table`.
+  //
+  // `'none'` rather than `'self'` because nothing in the app frames anything
+  // (zero frame-src violations across both the production sweep and
+  // e2e/csp.spec.ts, under a policy with this same fallback), so `'self'`
+  // would be an unevidenced allowance — and this list only carries origins a
+  // real subresource needs. Anything that legitimately needs to iframe later
+  // will fail against a directive that says so, instead of against an
+  // invisible fallback.
+  "frame-src 'none'",
+  "font-src 'self'",
+  "object-src 'none'",
+  "base-uri 'self'",
+  "form-action 'self'",
+];
+
+/**
+ * Builds the policy for one scope, differing only in `frame-ancestors`.
+ *
+ * ⚠️ This split is load-bearing, and the reason is easy to miss. Per the CSP
+ * spec, a browser that honours an *enforcing* `frame-ancestors` MUST IGNORE
+ * `X-Frame-Options` entirely on that response. `/admin/*` sets
+ * `X-Frame-Options: DENY` (stricter than the site-wide SAMEORIGIN) — so
+ * shipping one enforcing policy with `frame-ancestors 'self'` everywhere
+ * would have quietly *downgraded* admin framing protection from DENY to
+ * same-origin, as a side effect of a change nominally about tightening
+ * security. Under report-only the same directive was inert, which is exactly
+ * why this could not have been observed before the flip. `'none'` for admin
+ * preserves DENY's meaning in the header that now actually wins.
+ *
+ * `report-uri` goes last. It is the deprecated-but-universally-supported
+ * form, chosen over `report-to`/`Reporting-Endpoints` on purpose: the
+ * Reporting API batches delivery (tens of seconds), which cannot be asserted
+ * on in `e2e/csp.spec.ts` without a slow, flaky wait — and an unverifiable
+ * report channel is precisely the failure this issue already burned two
+ * sessions on. `app/api/csp-report/route.ts` already parses both wire
+ * formats, so adopting `Reporting-Endpoints` later is a header-only change.
+ */
+function buildCsp(frameAncestors: "'self'" | "'none'" | "*"): string {
+  return [
+    ...CSP_COMMON_DIRECTIVES,
+    `frame-ancestors ${frameAncestors}`,
+    `report-uri ${CSP_REPORT_PATH}`,
+  ].join("; ");
+}
+
+const CSP_SITE_WIDE = buildCsp("'self'");
+const CSP_ADMIN = buildCsp("'none'");
+
+/**
+ * `/embed/*` (Ed approved 2026-09-11) exists so third-party sites — a
+ * newsroom, a partner page — can iframe an Atlas view. That is the opposite
+ * problem from `/admin`: instead of narrowing who may frame the page, this
+ * scope has to allow ANY origin, because the embed's whole audience is
+ * "sites we don't know about in advance". An allowlist would defeat the
+ * point of an embed. See the `/embed/:path*` header rule below for the
+ * `X-Frame-Options` interaction this creates.
+ */
+const CSP_EMBED = buildCsp("*");
+
+/**
+ * `Permissions-Policy` — every powerful browser feature this app does not use,
+ * denied to the document AND to anything it embeds (an empty allowlist `()`
+ * means "no origin, not even self").
+ *
+ * ⚠️ `geolocation=()` is a real assertion, not a default: it is correct ONLY
+ * while nothing in the app asks for the visitor's position. Verified
+ * 2026-09-27 — zero matches for `geolocation` / `getCurrentPosition` /
+ * MapLibre's `GeolocateControl` across `app/`, `components/`, `lib/` and
+ * `public/basemap/`. The map's location search is
+ * `https://nominatim.openstreetmap.org` (`lib/geocode.ts`), a text geocoder
+ * that never touches the Geolocation API. If a "locate me" control is ever
+ * added to the map, this must become `geolocation=(self)` — the control would
+ * otherwise fail silently, since a denied permission rejects rather than
+ * prompting.
+ *
+ * The list is deliberately short: only features with a plausible abuse story
+ * for a page that embeds third-party map tiles. It is not an exhaustive
+ * enumeration of the spec's feature registry, which would go stale on every
+ * new browser feature and imply a completeness this header cannot have.
+ *
+ * ⛔ TWO SIBLING HEADERS ARE DELIBERATELY ABSENT, and both omissions are load
+ * bearing:
+ *   - `Cross-Origin-Embedder-Policy: require-corp` would break the basemap.
+ *     MapLibre fetches vector tiles/glyphs/sprites from
+ *     https://tiles.openfreemap.org and satellite rasters from
+ *     https://services.arcgisonline.com (see the CSP allowlist above); neither
+ *     sends `Cross-Origin-Resource-Policy`, so COEP would block both and the
+ *     map would render empty.
+ *   - `Cross-Origin-Resource-Policy: same-origin` on the baseline rule would
+ *     break the dataset's reuse story, which is a product commitment rather
+ *     than an oversight: `/data/*.geojson` is CC-BY-4.0 and meant to be
+ *     hotlinked, `/embed/*` exists to be iframed by sites we don't know in
+ *     advance (see CSP_EMBED), and the public read API advertises
+ *     `Access-Control-Allow-Origin: *`. A path-scoped CORP that excluded
+ *     `/data` and `/embed` was considered and rejected: CORP only takes effect
+ *     in an embedder that sets COEP, which — per the bullet above — this site
+ *     deliberately never will, so it would buy no protection here while
+ *     leaving a trap where every future public path has to remember to opt
+ *     out.
+ */
+const PERMISSIONS_POLICY = [
+  "camera=()",
+  "microphone=()",
+  "geolocation=()",
+  "payment=()",
+  "usb=()",
+  "magnetometer=()",
+  "gyroscope=()",
+  "accelerometer=()",
+].join(", ");
+
+/**
+ * Baseline security headers applied to every route, including the enforcing
+ * CSP above. `X-Frame-Options` is kept alongside `frame-ancestors` for
+ * browsers that predate CSP Level 2 framing control; where both are
+ * understood, `frame-ancestors` wins.
+ *
+ * ⚠️ A change here reaches production only on a CODE deploy.
+ * `scripts/vercel-ignore-build.sh` skips any deployment whose diff touches
+ * only `data/`, `docs/`, `.github/` or `*.md` — production included — so a
+ * header edit batched onto a data wave would sit unshipped. Confirm the
+ * deployment actually built before treating a header as live.
+ */
+const BASELINE_SECURITY_HEADERS = [
+  { key: "X-Frame-Options", value: "SAMEORIGIN" },
+  { key: "Referrer-Policy", value: "strict-origin-when-cross-origin" },
+  { key: "X-Content-Type-Options", value: "nosniff" },
+  { key: "Strict-Transport-Security", value: "max-age=63072000; includeSubDomains; preload" },
+  { key: "Permissions-Policy", value: PERMISSIONS_POLICY },
+  /**
+   * `Cross-Origin-Opener-Policy: same-origin` severs `window.opener` for any
+   * cross-origin document this site opens or is opened by, which closes the
+   * tabnabbing / opener-reference class outright rather than relying on every
+   * `target="_blank"` link carrying `rel="noopener"`.
+   *
+   * Safe here because nothing depends on an opener handle: zero matches for
+   * `window.open`, `window.opener` or `postMessage` across `app/`,
+   * `components/` and `lib/` (checked 2026-09-27) — every external link is a
+   * plain anchor, which COOP does not affect beyond dropping a handle no code
+   * reads. It also does not interact with `/embed/*`: COOP applies to
+   * top-level browsing contexts only and is ignored inside an iframe, so
+   * `frame-ancestors *` there is untouched.
+   */
+  { key: "Cross-Origin-Opener-Policy", value: "same-origin" },
+  { key: "Content-Security-Policy", value: CSP_SITE_WIDE },
+];
+
+/**
+ * Permanent redirects for facility slugs that no longer exist.
+ *
+ * A retired facility id would otherwise 404 forever on a URL Google had
+ * already indexed. `db:sync` never deletes, so a retirement is always a
+ * deliberate out-of-band act — which makes this list short and hand-curated
+ * rather than generated.
+ *
+ * Point each retired slug at the successor a reader most likely wanted. Where
+ * a record was split into several, that is a judgement call: prefer the
+ * successor that inherits the original's primary location.
+ */
+const RETIRED_FACILITY_REDIRECTS = [
+  {
+    // Retired 2026-08-27. This record claimed to cover three Amazon campuses,
+    // but its own cited source (KSLA, 2026-02-24) states the Resilient Tech
+    // Park site "is not part of Monday's $12 billion investment". It was split
+    // into aws-blanchard-caddo-parish-la, aws-benton-bossier-parish-la and
+    // aws-resilient-technology-park-shreveport-la. Blanchard is the successor
+    // carrying the original's Caddo Parish location.
+    source: "/facilities/amazon-northwest-louisiana",
+    destination: "/facilities/aws-blanchard-caddo-parish-la",
+    permanent: true,
+  },
+  {
+    // Retired 2026-09-27 as a duplicate of the same site. This record and
+    // galaxy-helios-dickens-county-tx both describe Galaxy Digital's Helios
+    // campus in Afton, Dickens County, TX — the same Phase I delivery (133 MW
+    // critical IT load to CoreWeave) and the same $1.4B debt facility, cited
+    // independently by each. dickens-county-tx is the successor: it holds
+    // the search equity (3 clicks / 292 impressions vs. 0 / 39 over the same
+    // 90-day window) and the fuller source set. Before retirement, this
+    // record's capacityMw.operational (200), status (operational),
+    // location.precision (approximate), Argo Blockchain origin history, and
+    // 4 sources were merged into the survivor.
+    source: "/facilities/galaxy-helios-dickens-tx",
+    destination: "/facilities/galaxy-helios-dickens-county-tx",
+    permanent: true,
+  },
+  {
+    // Retired 2026-10-16 as a duplicate of the same site. This record and
+    // stargate-abilene-tx both described the Crusoe-built OpenAI / Oracle
+    // campus on Lancium's Clean Campus in Abilene, TX (Crusoe's March 2025
+    // release names "the Lancium Clean Campus in Abilene" as the site), so
+    // the campus was counted twice. stargate-abilene-tx is the successor:
+    // Google had it indexed at the 2026-09-26 inspection
+    // (ops/index-census/index-census.json). Before retirement, this record's Lancium-era
+    // history (the December 2021 Clean Compute Campus announcement) and its
+    // five sources were merged into the survivor, and
+    // crusoe-abilene-onsite-generation-tx's poweredFacilityIds was repointed.
+    source: "/facilities/lancium-crusoe-abilene-tx",
+    destination: "/facilities/stargate-abilene-tx",
+    permanent: true,
+  },
+  {
+    // Retired 2026-10-21: xai-southaven-ms duplicated
+    // xai-macrohardrr-southaven-ms. Both described the same xAI data center
+    // in Southaven, MS, which the Mississippi Governor's release names
+    // MACROHARDRR. Before retirement its sources and status history were
+    // merged into the survivor, which now carries status under_construction
+    // ("is retrofitting", per that release); the duplicate's Neon row was
+    // deleted on 2026-10-21 after a backup.
+    source: "/facilities/xai-southaven-ms",
+    destination: "/facilities/xai-macrohardrr-southaven-ms",
+    permanent: true,
+  },
+  {
+    // Retired 2026-10-28: renamed. colospace-bedford-nh became
+    // firstlight-bedford-nh ("FirstLight Bedford Data Center (formerly
+    // ColoSpace)"), matching firstlight-rockland-ma: FirstLight Fiber acquired
+    // ColoSpace in 2019, and Baxtel lists "FirstLight Bedford" at the same
+    // address, 8 Commerce Drive. The record was re-added under the new id with
+    // the same facts via db:sync, and the old Neon row was deleted on
+    // 2026-10-28 after a snapshot. It had no watchers.
+    source: "/facilities/colospace-bedford-nh",
+    destination: "/facilities/firstlight-bedford-nh",
+    permanent: true,
+  },
+];
+
+/**
+ * Permanent redirects for operator hub slugs that no longer exist.
+ *
+ * Measured 2026-09-08 via Google Search Console: 34 URLs earned impressions
+ * in the last 90 days but are absent from the current sitemap. 32 of them are
+ * operator hubs (`/operators/[slug]`) returning a hard 404, verified with
+ * curl. Operator slugs are derived from a facility's `operator` string via
+ * `operatorSlug()` (`lib/operator-slug.ts`), so any curation edit to that
+ * string — normalizing a name, dropping a landowner/JV aside, correcting an
+ * end-customer attribution — silently orphans the previously-indexed hub.
+ * Facilities already had a retirement map (`RETIRED_FACILITY_REDIRECTS`
+ * above); operators had none until now.
+ *
+ * Facility counts noted per entry are the live count on the destination hub
+ * as of 2026-10-30 (re-measured; first recorded 2026-09-08), to help a future
+ * reader sanity-check drift. They go stale with every data wave.
+ */
+const RETIRED_OPERATOR_REDIRECTS = [
+  {
+    source:
+      "/operators/aligned-data-centers-in-partnership-with-u-s-paper-mill-llc-u-s-medical-glove-company",
+    destination: "/operators/aligned", // 1
+    permanent: true,
+  },
+  {
+    source: "/operators/amazon-web-services-via-birchwood-power-partners",
+    destination: "/operators/amazon-web-services", // 59
+    permanent: true,
+  },
+  {
+    source: "/operators/amazon-web-services-with-reb-investment-company-llc-as-landowner",
+    destination: "/operators/amazon-web-services", // 59
+    permanent: true,
+  },
+  {
+    source: "/operators/beale-infrastructure-aws-confirmed-end-customer",
+    destination: "/operators/beale-infrastructure", // 6
+    permanent: true,
+  },
+  {
+    source: "/operators/beale-infrastructure-end-user-unnamed",
+    destination: "/operators/beale-infrastructure", // 6
+    permanent: true,
+  },
+  {
+    source: "/operators/bitdeer-technologies-group",
+    destination: "/operators/bitdeer", // 7
+    permanent: true,
+  },
+  {
+    source: "/operators/bitdeer-via-subsidiary-whitetail-creek-llc",
+    destination: "/operators/bitdeer", // 7
+    permanent: true,
+  },
+  {
+    source: "/operators/cambrin-llc",
+    destination: "/operators/panattoni", // 3
+    permanent: true,
+  },
+  {
+    source:
+      "/operators/capacity-llc-vantage-data-centers-named-as-prospective-developer",
+    destination: "/operators/capacity-llc", // 1
+    permanent: true,
+  },
+  {
+    source: "/operators/cipher-mining",
+    destination: "/operators/cipher-digital", // 9
+    permanent: true,
+  },
+  {
+    source: "/operators/core-scientific-coreweave-is-anchor-customer",
+    destination: "/operators/core-scientific", // 10
+    permanent: true,
+  },
+  {
+    source:
+      "/operators/core-scientific-site-owner-coreweave-dalton-ii-llc-sublessee-operator",
+    destination: "/operators/core-scientific", // 10
+    permanent: true,
+  },
+  {
+    // CoreSite is an American Tower company, but the subject of the hub is
+    // CoreSite (16 facilities on 2026-09-08) — American Tower itself only had
+    // 2 — so "coresite", not "american-tower", is the correct successor.
+    source: "/operators/coresite-american-tower",
+    destination: "/operators/coresite", // 28
+    permanent: true,
+  },
+  {
+    source: "/operators/crusoe-energy-lancium-clean-campus",
+    destination: "/operators/crusoe", // 6
+    permanent: true,
+  },
+  {
+    source: "/operators/crusoe-with-blue-energy",
+    destination: "/operators/crusoe", // 6
+    permanent: true,
+  },
+  {
+    source: "/operators/cyrusone-in-exclusive-negotiations-with-the-us-army",
+    destination: "/operators/cyrusone", // 33
+    permanent: true,
+  },
+  {
+    source: "/operators/galaxy-digital-holdings",
+    destination: "/operators/galaxy-digital", // 2
+    permanent: true,
+  },
+  {
+    source: "/operators/google-montauk-innovations-llc",
+    destination: "/operators/google", // 57
+    permanent: true,
+  },
+  {
+    source: "/operators/google-with-intersect-power",
+    destination: "/operators/google", // 57
+    permanent: true,
+  },
+  {
+    source: "/operators/meta-greater-kudu-llc",
+    destination: "/operators/meta", // 28
+    permanent: true,
+  },
+  {
+    source: "/operators/metrobloks-lincoln-property-company",
+    destination: "/operators/metrobloks", // 5
+    permanent: true,
+  },
+  {
+    // The successor record, new-day-ports-technology-campus-piketon-oh, has a
+    // `notes` field stating it was "formerly tracked under the
+    // pre-announcement Ohio entity New Day Data Centers LLC"; its operator is
+    // now "SB Energy". sb-energy currently has one facility, so it is
+    // excluded from the sitemap by a separate change, but the route stays
+    // live and crawlable — the redirect target remains valid.
+    source: "/operators/new-day-data-centers-llc-w-doe-softbank-sb-energy",
+    destination: "/operators/sb-energy", // 2
+    permanent: true,
+  },
+  {
+    source: "/operators/ntt",
+    destination: "/operators/ntt-global-data-centers", // 17
+    permanent: true,
+  },
+  {
+    source: "/operators/ntt-global-data-centers-americas",
+    destination: "/operators/ntt-global-data-centers", // 17
+    permanent: true,
+  },
+  {
+    source: "/operators/pacifico-energy-data-center-tenant-unidentified",
+    destination: "/operators/pacifico-energy", // 3
+    permanent: true,
+  },
+  {
+    source: "/operators/panattoni-development-co",
+    destination: "/operators/panattoni", // 3
+    permanent: true,
+  },
+  {
+    source: "/operators/powerhouse-data-centers-arep",
+    destination: "/operators/powerhouse-data-centers", // 12
+    permanent: true,
+  },
+  {
+    source:
+      "/operators/powerhouse-data-centers-jv-with-chirisa-technology-parks-and-blue-owl-real-estate",
+    destination: "/operators/powerhouse-data-centers", // 12
+    permanent: true,
+  },
+  {
+    source: "/operators/powerhouse-data-centers-pennsylvania-data-center-partners",
+    destination: "/operators/powerhouse-data-centers", // 12
+    permanent: true,
+  },
+  {
+    source: "/operators/qts",
+    destination: "/operators/qts-data-centers", // 40
+    permanent: true,
+  },
+  {
+    source: "/operators/qts-blackstone",
+    destination: "/operators/qts-data-centers", // 40
+    permanent: true,
+  },
+  {
+    source: "/operators/qts-data-centers-blackstone",
+    destination: "/operators/qts-data-centers", // 40
+    permanent: true,
+  },
+  {
+    source: "/operators/sentinel-data-centers-jgt2-redevelopment",
+    destination: "/operators/sentinel-data-centers", // 3
+    permanent: true,
+  },
+  {
+    source: "/operators/tierpoint-llc",
+    destination: "/operators/tierpoint", // 32
+    permanent: true,
+  },
+  {
+    source: "/operators/vantage",
+    destination: "/operators/vantage-data-centers", // 21
+    permanent: true,
+  },
+  {
+    source: "/operators/vantage-data-centers-for-openai-oracle",
+    destination: "/operators/vantage-data-centers", // 21
+    permanent: true,
+  },
+];
+
 const nextConfig: NextConfig = {
-  /* config options here */
+  /**
+   * `/methodology` (app/methodology/page.tsx, via lib/methodology.ts) reads
+   * `docs/methodology.md` off disk at module-evaluation time. The page has
+   * no `revalidate`/dynamic data so Next prerenders it fully at `next build`
+   * (where the repo is always fully checked out) — this entry is a
+   * belt-and-suspenders guard so the file is still traced into the
+   * serverless bundle if that page ever becomes dynamic, rather than relying
+   * solely on `@vercel/nft`'s heuristic static analysis of the `fs` call.
+   */
+  outputFileTracingIncludes: {
+    "/methodology": ["./docs/methodology.md"],
+  },
+
+  async redirects() {
+    return [...RETIRED_FACILITY_REDIRECTS, ...RETIRED_OPERATOR_REDIRECTS];
+  },
+
+  async headers() {
+    return [
+      {
+        source: "/:path*",
+        headers: BASELINE_SECURITY_HEADERS,
+      },
+      {
+        // Admin surfaces get the stricter DENY (no framing at all) rather
+        // than SAMEORIGIN — Next.js applies this after the broader match
+        // above, so it wins for this key on /admin/* paths.
+        //
+        // The CSP is re-stated here for the same reason, and it is not
+        // redundant: an enforcing `frame-ancestors` makes browsers ignore
+        // `X-Frame-Options` outright, so without this override the DENY
+        // above would be dead letter and admin pages would inherit the
+        // site-wide `frame-ancestors 'self'`. See `buildCsp`. Header rules
+        // replace by key rather than merging, so this value must be the
+        // WHOLE policy, not just the differing directive.
+        source: "/admin/:path*",
+        headers: [
+          { key: "X-Frame-Options", value: "DENY" },
+          { key: "Content-Security-Policy", value: CSP_ADMIN },
+        ],
+      },
+      {
+        // The public embed surface (app/embed/**, a parallel change — this
+        // rule only needs to know the path shape). Ed approved
+        // `frame-ancestors *` scoped to `/embed/*` only, 2026-09-11: the
+        // whole point of an embed is that any site can iframe it, so an
+        // origin allowlist would defeat the feature. See CSP_EMBED above.
+        //
+        // The baseline `/:path*` rule still applies `X-Frame-Options:
+        // SAMEORIGIN` to this path, and that cannot be deleted — Next.js
+        // header rules replace BY KEY, not merge (same fact the /admin rule
+        // above relies on), and there is no standards-track "allow any
+        // origin" value for X-Frame-Options (`ALLOWALL` is a non-standard,
+        // unimplemented extension — not used here). This is the same
+        // mechanism as the /admin split, pointed the other way: per the CSP
+        // spec (see buildCsp's comment), a browser that honours an
+        // ENFORCING `frame-ancestors` ignores `X-Frame-Options` entirely on
+        // that response — so `frame-ancestors *` below makes the inherited
+        // SAMEORIGIN a dead letter in any browser implementing CSP Level 2.
+        // Residual, stated honestly: a browser that predates CSP Level 2
+        // framing control would still honour SAMEORIGIN and refuse
+        // third-party framing here, contrary to intent. There is no fix for
+        // that residual that doesn't mean inventing a non-standard XFO
+        // value, so it is left as a known gap rather than papered over.
+        //
+        // As with /admin, this must restate the WHOLE policy, not just the
+        // differing directive.
+        source: "/embed/:path*",
+        headers: [{ key: "Content-Security-Policy", value: CSP_EMBED }],
+      },
+      {
+        // Static map data and basemap style. Regenerated only by
+        // `npm run build:mapdata`, so a 1-day edge TTL is safe and a long
+        // stale-while-revalidate keeps the CDN serving during a refresh.
+        // Next's default for `public/` is `max-age=0, must-revalidate`,
+        // which left 8.3 MB of geojson uncacheable at both Vercel and
+        // Cloudflare (measured `cf-cache-status: DYNAMIC`, 2026-08-21).
+        //
+        // `:path+` (one or more segments), NOT `:path*` (zero or more).
+        // `app/data/page.tsx` is a real HTML route at bare `/data`, and
+        // `:path*` also matches the empty remainder — so the asset rule was
+        // shadowing that page with a day-long edge cache plus a 7-day
+        // stale-while-revalidate tail, well past anything a redeploy or ISR
+        // revalidation could dislodge. It served a stale record count on
+        // prod for a full day before being caught (2026-09-05). `:path+`
+        // still matches `/data/water.geojson` etc.; it just requires at
+        // least one path segment, so the bare route is excluded. See
+        // next.config.test.ts's "asset-cache headers don't shadow app
+        // routes" block — do not simplify this back to `:path*`.
+        source: "/data/:path+",
+        headers: [
+          {
+            key: "Cache-Control",
+            value: "public, max-age=3600, s-maxage=86400, stale-while-revalidate=604800",
+          },
+        ],
+      },
+      {
+        // No `app/basemap/` route exists, so `:path*` vs `:path+` is
+        // currently moot here — kept as `:path+` anyway for consistency
+        // with the `/data` rule above, since both serve the same kind of
+        // build-generated static asset and should read the same way.
+        source: "/basemap/:path+",
+        headers: [
+          {
+            key: "Cache-Control",
+            value: "public, max-age=3600, s-maxage=86400, stale-while-revalidate=604800",
+          },
+        ],
+      },
+      {
+        // Vendored font files never change content under a fixed name.
+        // `app/fonts/` also doesn't exist, so `:path*` is harmless here too;
+        // left as `:path*` (not widened to `:path+` like the two rules
+        // above) because this header value is unique to fonts rather than
+        // shared with another static-asset rule, so there's no matching
+        // pattern to stay consistent with.
+        source: "/fonts/:path*",
+        headers: [
+          { key: "Cache-Control", value: "public, max-age=31536000, immutable" },
+        ],
+      },
+    ];
+  },
 };
 
 export default nextConfig;

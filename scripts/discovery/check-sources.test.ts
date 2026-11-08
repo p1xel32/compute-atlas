@@ -1,6 +1,7 @@
 import { describe, it, expect, vi } from "vitest";
 
-import { checkSources, isBlockedHost, type SourceCheckDeps } from "./check-sources";
+import { checkSources, type SourceCheckDeps } from "./check-sources";
+import { isBlockedHost } from "./net-guard";
 import type { Facility } from "../../lib/schema";
 
 function makeFacility(overrides: Partial<Facility> = {}, urls: string[] = ["https://example.com/a"]): Facility {
@@ -25,7 +26,10 @@ function makeFacility(overrides: Partial<Facility> = {}, urls: string[] = ["http
 }
 
 function makeFetch(
-  handler: (url: string, init?: RequestInit) => Promise<{ ok: boolean; status: number }> | never,
+  handler: (
+    url: string,
+    init?: RequestInit,
+  ) => Promise<{ ok: boolean; status: number; headers?: Record<string, string> }> | never,
 ) {
   return vi.fn<typeof fetch>(async (input, init) => {
     const url = typeof input === "string" ? input : input.toString();
@@ -33,8 +37,18 @@ function makeFetch(
     return {
       ok: result.ok,
       status: result.status,
+      headers: new Headers(result.headers ?? {}),
     } as Response;
   });
+}
+
+function publicResolver() {
+  return {
+    resolve4: vi.fn(async () => ["93.184.215.14"]),
+    resolve6: vi.fn(async (): Promise<string[]> => {
+      throw new Error("no AAAA");
+    }),
+  };
 }
 
 function baseDeps(overrides: Partial<SourceCheckDeps> = {}): SourceCheckDeps {
@@ -42,6 +56,9 @@ function baseDeps(overrides: Partial<SourceCheckDeps> = {}): SourceCheckDeps {
     fetchImpl: makeFetch(async () => ({ ok: true, status: 200 })),
     concurrency: 5,
     timeoutMs: 10000,
+    sleepImpl: async () => {},
+    // Never hit real DNS in tests.
+    resolveDeps: publicResolver(),
     ...overrides,
   };
 }
@@ -58,11 +75,69 @@ describe("checkSources", () => {
     expect(typeof results[0].checkedAt).toBe("string");
   });
 
-  it("classifies a 4xx/5xx response as dead", async () => {
+  it("classifies a 404 response as gone", async () => {
     const deps = baseDeps({ fetchImpl: makeFetch(async () => ({ ok: false, status: 404 })) });
     const results = await checkSources([makeFacility()], deps);
-    expect(results[0].classification).toBe("dead");
+    expect(results[0].classification).toBe("gone");
     expect(results[0].httpStatus).toBe(404);
+  });
+
+  it("classifies a 403 response as bot_blocked (not dead)", async () => {
+    const deps = baseDeps({ fetchImpl: makeFetch(async () => ({ ok: false, status: 403 })) });
+    const results = await checkSources([makeFacility()], deps);
+    expect(results[0].classification).toBe("bot_blocked");
+    expect(results[0].httpStatus).toBe(403);
+  });
+
+  it("classifies a 400 response as client_error", async () => {
+    const deps = baseDeps({ fetchImpl: makeFetch(async () => ({ ok: false, status: 400 })) });
+    const results = await checkSources([makeFacility()], deps);
+    expect(results[0].classification).toBe("client_error");
+    expect(results[0].httpStatus).toBe(400);
+  });
+
+  it("classifies a 500 response as server_error after retry exhaustion", async () => {
+    const deps = baseDeps({ fetchImpl: makeFetch(async () => ({ ok: false, status: 500 })) });
+    const results = await checkSources([makeFacility()], deps);
+    expect(results[0].classification).toBe("server_error");
+    expect(results[0].httpStatus).toBe(500);
+  });
+
+  it("retries a 429 honoring Retry-After, then classifies throttled after exhaustion", async () => {
+    let calls = 0;
+    const fetchImpl = makeFetch(async () => {
+      calls++;
+      return { ok: false, status: 429, headers: { "retry-after": "1" } };
+    });
+    const sleeps: number[] = [];
+    const deps = baseDeps({
+      fetchImpl,
+      maxRetries: 2,
+      sleepImpl: async (ms: number) => {
+        sleeps.push(ms);
+      },
+    });
+    const results = await checkSources([makeFacility()], deps);
+    expect(results[0].classification).toBe("throttled");
+    expect(results[0].httpStatus).toBe(429);
+    expect(sleeps).toEqual([1000, 1000]);
+    // 1 initial HEAD + 2 retries = 3 total attempts.
+    expect(calls).toBe(3);
+  });
+
+  it("retries a 429 with no Retry-After header using exponential backoff", async () => {
+    const fetchImpl = makeFetch(async () => ({ ok: false, status: 429 }));
+    const sleeps: number[] = [];
+    const deps = baseDeps({
+      fetchImpl,
+      maxRetries: 2,
+      sleepImpl: async (ms: number) => {
+        sleeps.push(ms);
+      },
+    });
+    const results = await checkSources([makeFacility()], deps);
+    expect(results[0].classification).toBe("throttled");
+    expect(sleeps).toEqual([500, 1000]);
   });
 
   it("classifies a 3xx response as redirected", async () => {
@@ -108,6 +183,83 @@ describe("checkSources", () => {
     expect(calls).toEqual(["HEAD", "GET"]);
     expect(results[0].classification).toBe("ok");
     expect(results[0].httpStatus).toBe(200);
+  });
+
+  it("falls back to GET when HEAD 404s, and trusts the GET result", async () => {
+    // Regression: measured 2026-09-14, 24 of 59 live-dataset URLs reported
+    // `gone` answered 404 to HEAD and 200 to GET (deq.virginia.gov,
+    // constellationenergy.com, civicplus DocumentCenter hosts). Believing the
+    // HEAD status made ~41% of this tool's headline number wrong.
+    const calls: string[] = [];
+    const fetchImpl = vi.fn<typeof fetch>(async (_input, init) => {
+      const method = init?.method ?? "GET";
+      calls.push(method);
+      if (method === "HEAD") {
+        return { ok: false, status: 404 } as Response;
+      }
+      return { ok: true, status: 200 } as Response;
+    });
+    const deps = baseDeps({ fetchImpl });
+    const results = await checkSources([makeFacility()], deps);
+    expect(calls).toEqual(["HEAD", "GET"]);
+    expect(results[0].classification).toBe("ok");
+    expect(results[0].httpStatus).toBe(200);
+  });
+
+  it("still reports gone when BOTH HEAD and GET 404", async () => {
+    const calls: string[] = [];
+    const fetchImpl = vi.fn<typeof fetch>(async (_input, init) => {
+      calls.push(init?.method ?? "GET");
+      return { ok: false, status: 404 } as Response;
+    });
+    const deps = baseDeps({ fetchImpl });
+    const results = await checkSources([makeFacility()], deps);
+    expect(calls).toEqual(["HEAD", "GET"]);
+    expect(results[0].classification).toBe("gone");
+    expect(results[0].httpStatus).toBe(404);
+  });
+
+  it("falls back to GET when HEAD is bot-blocked with 403", async () => {
+    const fetchImpl = vi.fn<typeof fetch>(async (_input, init) => {
+      if ((init?.method ?? "GET") === "HEAD") {
+        return { ok: false, status: 403 } as Response;
+      }
+      return { ok: true, status: 200 } as Response;
+    });
+    const deps = baseDeps({ fetchImpl });
+    const results = await checkSources([makeFacility()], deps);
+    expect(results[0].classification).toBe("ok");
+  });
+
+  it("does NOT re-fetch a redirect with GET", async () => {
+    // A 3xx is an answer, not a HEAD refusal — re-fetching would both waste a
+    // request and destroy the `redirected` classification.
+    const calls: string[] = [];
+    const fetchImpl = vi.fn<typeof fetch>(async (_input, init) => {
+      calls.push(init?.method ?? "GET");
+      return { ok: false, status: 301 } as Response;
+    });
+    const deps = baseDeps({ fetchImpl });
+    const results = await checkSources([makeFacility()], deps);
+    expect(calls).toEqual(["HEAD"]);
+    expect(results[0].classification).toBe("redirected");
+  });
+
+  it("dispatches requests with a browser-like User-Agent header", async () => {
+    const fetchImpl = vi.fn<typeof fetch>(async () => ({ ok: true, status: 200 }) as Response);
+    const deps = baseDeps({ fetchImpl });
+    await checkSources([makeFacility()], deps);
+    const [, init] = fetchImpl.mock.calls[0];
+    const headers = init?.headers as Record<string, string>;
+    expect(headers["User-Agent"]).toMatch(/Mozilla/);
+  });
+
+  it("populates sourceIndex per source within a facility", async () => {
+    const fetchImpl = vi.fn<typeof fetch>(async () => ({ ok: true, status: 200 }) as Response);
+    const facility = makeFacility({}, ["https://example.com/1", "https://example.com/2", "https://example.com/3"]);
+    const deps = baseDeps({ fetchImpl });
+    const results = await checkSources([facility], deps);
+    expect(results.map((r) => r.sourceIndex)).toEqual([0, 1, 2]);
   });
 
   it("rejects non-http(s) URLs without dispatching fetch", async () => {
@@ -218,8 +370,8 @@ describe("checkSources", () => {
       const results = await checkSources([facility], deps);
 
       expect(calledUrls).toEqual(["https://example.com/legit"]);
-      const blocked = results.find((r) => r.url.includes("169.254"));
-      const ok = results.find((r) => r.url.includes("example.com"));
+      const blocked = results.find((r) => r.url === "http://169.254.169.254/latest/meta-data/");
+      const ok = results.find((r) => r.url === "https://example.com/legit");
       expect(blocked?.classification).toBe("blocked");
       expect(ok?.classification).toBe("ok");
     });
@@ -243,5 +395,68 @@ describe("checkSources", () => {
       expect(results[0].classification).toBe("blocked");
       expect(results[0].httpStatus).toBeNull();
     });
+  });
+});
+
+describe("checkSources DNS guard", () => {
+  it("blocks a hostname resolving to a loopback address without probing", async () => {
+    const fetchImpl = makeFetch(async () => ({ ok: true, status: 200 }));
+    const resolveDeps = { ...publicResolver(), resolve4: vi.fn(async () => ["127.0.0.1"]) };
+    const results = await checkSources([makeFacility({}, ["http://127.0.0.1.nip.io/"])], baseDeps({ fetchImpl, resolveDeps }));
+    expect(results[0].classification).toBe("blocked");
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it("falls through to the probe when DNS fails (ENOTFOUND is not blocked)", async () => {
+    const fetchImpl = makeFetch(async () => ({ ok: false, status: 404 }));
+    const enotfound = async (): Promise<string[]> => {
+      throw Object.assign(new Error("queryA ENOTFOUND dead.example"), { code: "ENOTFOUND" });
+    };
+    const results = await checkSources(
+      [makeFacility({}, ["https://dead.example/a"])],
+      baseDeps({ fetchImpl, resolveDeps: { resolve4: enotfound, resolve6: enotfound } }),
+    );
+    expect(fetchImpl).toHaveBeenCalled();
+    expect(results[0].classification).toBe("gone");
+  });
+
+  it("probes a hostname resolving to a public address", async () => {
+    const fetchImpl = makeFetch(async () => ({ ok: true, status: 200 }));
+    const results = await checkSources([makeFacility()], baseDeps({ fetchImpl }));
+    expect(results[0].classification).toBe("ok");
+    expect(fetchImpl).toHaveBeenCalled();
+  });
+
+  it("resolves each hostname once across sources", async () => {
+    const resolveDeps = publicResolver();
+    await checkSources(
+      [makeFacility({}, ["https://example.com/a", "https://example.com/b", "https://example.com/c"])],
+      baseDeps({ resolveDeps }),
+    );
+    expect(resolveDeps.resolve4).toHaveBeenCalledTimes(1);
+    expect(resolveDeps.resolve6).toHaveBeenCalledTimes(1);
+  });
+
+  it("fails open when the resolver never settles (bounded by timeoutMs)", async () => {
+    const fetchImpl = makeFetch(async () => ({ ok: true, status: 200 }));
+    const hang = () => new Promise<string[]>(() => {});
+    const results = await checkSources(
+      [makeFacility()],
+      baseDeps({ fetchImpl, timeoutMs: 20, resolveDeps: { resolve4: hang, resolve6: hang } }),
+    );
+    expect(results[0].classification).toBe("ok");
+    expect(fetchImpl).toHaveBeenCalled();
+  });
+
+  it("falls through to the probe when the resolver throws synchronously", async () => {
+    const fetchImpl = makeFetch(async () => ({ ok: true, status: 200 }));
+    const boom = (): Promise<string[]> => {
+      throw new Error("sync boom");
+    };
+    const results = await checkSources(
+      [makeFacility()],
+      baseDeps({ fetchImpl, resolveDeps: { resolve4: boom, resolve6: boom } }),
+    );
+    expect(results[0].classification).toBe("ok");
   });
 });

@@ -1,9 +1,10 @@
 import type { ReactNode } from "react";
 
-import { listSubmissions } from "@/lib/submissions";
+import { listSubmissionsWithWatchers } from "@/lib/submissions";
 import { REVIEW_STATUSES } from "@/lib/submissions";
 import { SubmissionList } from "@/app/admin/submissions/submission-list";
 import { SubmissionDetail } from "@/app/admin/submissions/submission-detail";
+import { RefreshTotalsButton } from "@/app/admin/submissions/refresh-totals-button";
 
 const DEFAULT_STATUS: (typeof REVIEW_STATUSES)[number] = "pending";
 
@@ -21,7 +22,7 @@ export default async function AdminSubmissionsPage({
 }) {
   const { status: rawStatus } = await searchParams;
   const status = normalizeStatus(rawStatus);
-  const submissions = await listSubmissions(status);
+  const submissions = await listSubmissionsWithWatchers(status);
 
   // SubmissionDetail is an async Server Component. submission-list.tsx is a
   // "use client" file and cannot import-and-invoke it directly, so each row's
@@ -34,11 +35,14 @@ export default async function AdminSubmissionsPage({
 
   return (
     <div className="flex flex-col gap-6">
-      <div>
-        <h1 className="font-heading text-xl font-semibold">Submissions</h1>
-        <p className="text-sm text-muted-foreground">
-          Review discovered and submitted facility candidates before they go live.
-        </p>
+      <div className="flex flex-wrap items-start justify-between gap-4">
+        <div>
+          <h1 className="font-heading text-xl font-semibold">Submissions</h1>
+          <p className="text-sm text-muted-foreground">
+            Review discovered and submitted facility candidates before they go live.
+          </p>
+        </div>
+        <RefreshTotalsButton />
       </div>
       <SubmissionList
         submissions={submissions}

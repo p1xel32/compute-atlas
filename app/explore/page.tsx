@@ -1,16 +1,17 @@
 import Link from "next/link";
 import type { Metadata } from "next";
 
-import { getStates, getOperators } from "@/lib/data";
+import { getStates, getOperators, getCounties } from "@/lib/data";
+import { statesPhrase } from "@/lib/us-states";
 import { Breadcrumb } from "@/components/breadcrumb";
 import { GraticuleSurvey } from "@/components/home/graticule-survey";
 
-export const revalidate = 3600;
+export const revalidate = 86400;
 
 export const metadata: Metadata = {
   title: "Explore US data centers",
   description:
-    "Browse the atlas by lens — states, power generation, community opposition, operators, and the public API.",
+    "Browse the atlas by lens — geography, lifecycle stage, power and facility type, community reception, operators, rankings, and the glossary. Source-cited.",
   alternates: { canonical: "/explore" },
 };
 
@@ -32,6 +33,12 @@ const LENSES = [
     href: "/metros",
     description:
       "Curated metro areas driving the buildout — county clusters, each with a live, source-cited facility count.",
+  },
+  {
+    label: "Counties",
+    href: "/counties",
+    description:
+      "Every county with a tracked site, grouped by state — the level permits are filed and hearings are held at.",
   },
   {
     label: "Power",
@@ -64,6 +71,12 @@ const LENSES = [
       "Every company running tracked capacity, ranked by build-out.",
   },
   {
+    label: "Stakeholders",
+    href: "/stakeholders",
+    description:
+      "Named people with a documented, source-cited stake in a specific tracked facility — founders, owners, investors, executives, and public officials.",
+  },
+  {
     label: "Rankings",
     href: "/rankings",
     description:
@@ -76,10 +89,10 @@ const LENSES = [
       "Plain-language explainers behind the dataset — data center water and power use, what counts as an AI facility, and why communities push back.",
   },
   {
-    label: "API",
-    href: "/api",
+    label: "Help fill the gaps",
+    href: "/gaps",
     description:
-      "The public JSON API behind the dataset — read, write, and submission endpoints, fully documented.",
+      "Where the dataset needs help, ranked by what a permit or utility filing can actually resolve — with concrete leads on where to look.",
   },
 ] as const;
 
@@ -88,12 +101,14 @@ const LENSES = [
  * component. Replaces the former header dropdown with a dedicated page.
  */
 export default async function ExplorePage() {
-  const stateCount = (await getStates()).length;
+  const stateCodes = await getStates();
   const operatorCount = (await getOperators()).length;
+  const countyCount = (await getCounties()).length;
 
   const stats: Partial<Record<(typeof LENSES)[number]["label"], string>> = {
-    States: `${stateCount} states`,
+    States: statesPhrase(stateCodes),
     Operators: `${operatorCount} operators`,
+    Counties: `${countyCount} counties`,
   };
 
   return (
@@ -103,9 +118,6 @@ export default async function ExplorePage() {
     >
       <Breadcrumb items={[{ label: "Map", href: "/map" }, { label: "Explore" }]} />
 
-      {/* ------------------------------------------------------------------ */}
-      {/* Masthead                                                            */}
-      {/* ------------------------------------------------------------------ */}
       <header className="relative">
         <GraticuleSurvey className="pointer-events-none absolute inset-0 [mask-image:linear-gradient(to_bottom,transparent,black_20%,black_80%,transparent)]" />
         <div className="relative space-y-4 pb-2">
@@ -116,17 +128,16 @@ export default async function ExplorePage() {
             Explore
           </h1>
           <p className="max-w-2xl text-base text-muted-foreground">
-            The same dataset, sliced five ways — by geography, by power
-            source, by community reception, by who&rsquo;s building it, and
-            through the API directly.
+            {LENSES.length}{" "}
+            lenses on the same source-cited dataset — by
+            geography, lifecycle stage, power and facility type, community
+            reception, and who&rsquo;s building it, plus rankings and the
+            glossary.
           </p>
         </div>
         <div className="border-t border-border" />
       </header>
 
-      {/* ------------------------------------------------------------------ */}
-      {/* Lens grid                                                           */}
-      {/* ------------------------------------------------------------------ */}
       <section aria-labelledby="explore-list-heading" className="space-y-4">
         <h2 id="explore-list-heading" className="sr-only">
           Explore by lens
@@ -136,7 +147,7 @@ export default async function ExplorePage() {
             <li key={href}>
               <Link
                 href={href}
-                className="flex min-h-11 flex-col gap-1.5 rounded-sm border border-border px-4 py-4 transition-colors hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+                className="flex min-h-11 flex-col gap-1.5 rounded-sm border border-border px-4 py-4 transition-colors hover:bg-muted/50 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"
               >
                 <span className="flex items-baseline justify-between gap-2">
                   <span className="font-display text-lg text-foreground">

@@ -3,12 +3,12 @@
 import { forwardRef } from "react";
 import { getStatusMeta, getStatusColor } from "@/lib/status";
 import { buildMarkerLabel } from "@/lib/map";
-import type { Facility } from "@/lib/schema";
+import type { MapPoint } from "@/lib/facility-slim";
 
 interface FacilityMarkerProps {
-  facility: Facility;
+  facility: MapPoint;
   isSelected: boolean;
-  onSelect: (facility: Facility) => void;
+  onSelect: (facility: MapPoint) => void;
 }
 
 /**
@@ -19,7 +19,11 @@ interface FacilityMarkerProps {
  * - aria-label describes the facility (name, operator, location, status, capacity)
  * - aria-pressed conveys selected state
  * - Icon is aria-hidden (status is communicated by both shape AND color)
- * - Fixed 28×28 px target meets WCAG 2.2 SC 2.5.8 (≥24×24 px); visible :focus-visible ring
+ * - Fixed 28×28 px target is a DELIBERATE exception to the project's 44×44 px
+ *   touch-target rule: WCAG 2.2 SC 2.5.8 sets a 24×24 px minimum (not 44px),
+ *   and a larger target would visually overlap on dense/clustered marker
+ *   layouts. 28px satisfies 2.5.8 while preserving marker density; visible
+ *   :focus-visible ring
  * - Hover scale animation is suppressed via `motion-safe:` variant
  * - facilityType is also communicated by shape: circle for data_center,
  *   rounded-square for crypto_mining, sharp square for power_generation —
@@ -56,7 +60,7 @@ export const FacilityMarker = forwardRef<HTMLButtonElement, FacilityMarkerProps>
           "border shadow-sm",
           "bg-background/90",
           isSelected ? "border-current ring-2 ring-current/30" : "border-current/40",
-          "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1",
+          "focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-ring",
           "motion-safe:hover:scale-110 motion-safe:transition-transform",
         ]
           .filter(Boolean)

@@ -1,11 +1,28 @@
+import { revalidateTag } from "next/cache";
 import { z } from "zod";
-import { eq, desc } from "drizzle-orm";
+import { and, desc, eq, inArray, sql } from "drizzle-orm";
 
+import { redactedErrorCode } from "@/lib/db-error";
 import { getDb } from "@/lib/db/client";
-import { submissionsTable, type SubmissionRow } from "@/lib/db/schema";
-import { createFacility, updateFacility, writeStatusUpdate, type WriteResult } from "@/lib/facility-write";
+import { submissionsTable, subscriptionsTable, type SubmissionRow } from "@/lib/db/schema";
+import { sendSubmissionReviewedEmail } from "@/lib/email";
+import {
+  createFacility,
+  updateFacility,
+  writeStatusUpdate,
+  writeEnrichmentUpdate,
+  type WriteResult,
+} from "@/lib/facility-write";
 import { notifySubscribersOfChange } from "@/lib/notify";
+import { checkSubmissionNotifySendCap, recordSubmissionNotifySend } from "@/lib/rate-limit";
 import type { Facility } from "@/lib/schema";
+import { isSuppressed, mayEmail } from "@/lib/suppressions";
+import {
+  deleteSubmissionNotifyRequest,
+  getSubmissionNotifyRequest,
+  submissionNotifyEnabled,
+} from "@/lib/submission-notify";
+import { WATCH_TARGET } from "@/lib/watch-target-types";
 
 const provenanceSchema = z.object({
   sources: z.array(z.string()).min(1), // ≥1 source — nothing stages uncited
@@ -29,17 +46,17 @@ const provenanceSchema = z.object({
 /**
  * Envelope-only validation at submit time — this is a human-in-the-loop
  * queue, so the pipeline may stage imperfect candidates. Full `facilitySchema`
- * validation happens at approve time via the Phase 3 write primitives.
+ * validation happens at approve time via the write primitives.
  */
 export const submissionInputSchema = z
   .object({
-    kind: z.enum(["create", "update", "status_update"]),
+    kind: z.enum(["create", "update", "status_update", "enrichment_update"]),
     targetFacilityId: z.string().optional(),
-    payload: z.record(z.string(), z.unknown()), // full doc for create, partial patch/intent for update/status_update
+    payload: z.record(z.string(), z.unknown()), // full doc for create, partial patch/intent for update/status_update/enrichment_update
     provenance: provenanceSchema,
   })
-  .refine((s) => (s.kind !== "update" && s.kind !== "status_update") || !!s.targetFacilityId, {
-    message: "targetFacilityId is required for update and status_update submissions",
+  .refine((s) => s.kind === "create" || !!s.targetFacilityId, {
+    message: "targetFacilityId is required for update, status_update, and enrichment_update submissions",
     path: ["targetFacilityId"],
   });
 
@@ -50,7 +67,7 @@ export type SubmissionResult =
   | { ok: false; status: number; error: string; issues?: unknown };
 
 export type SubmissionActionResult =
-  | { ok: true; submission: SubmissionRow; facility: Facility }
+  | { ok: true; submission: SubmissionRow; facility: Facility; historyRecorded?: boolean }
   | { ok: false; status: number; error: string; issues?: unknown };
 
 export type SubmissionRejectResult =
@@ -88,7 +105,136 @@ export async function listSubmissions(status?: string): Promise<SubmissionRow[]>
 }
 
 /**
- * Promotes a pending submission to a live facility via the Phase 3 write
+ * Confirmed facility-watcher counts, keyed by facility id, in one grouped query.
+ * Facilities with no watchers are absent from the result (read them as 0).
+ *
+ * The three conditions are exactly the ones `notifySubscribersOfChange` and
+ * `notifySubscribersOfChanges` (lib/notify.ts) select their recipients with —
+ * status `confirmed`, targetType `facility`, targetId = the facility — so this
+ * is the number of people a change to that facility will email. Change them
+ * together; lib/watcher-count-parity.integration.test.ts fails if they drift.
+ * Returns only counts, never an address or token.
+ */
+export async function confirmedWatcherCounts(
+  facilityIds: string[]
+): Promise<Record<string, number>> {
+  const ids = [...new Set(facilityIds)];
+  if (ids.length === 0) return {};
+
+  const db = getDb();
+  const rows = await db
+    .select({ targetId: subscriptionsTable.targetId, watchers: sql<number>`count(*)::int` })
+    .from(subscriptionsTable)
+    .where(
+      and(
+        eq(subscriptionsTable.status, "confirmed"),
+        eq(subscriptionsTable.targetType, WATCH_TARGET.facility),
+        inArray(subscriptionsTable.targetId, ids)
+      )
+    )
+    .groupBy(subscriptionsTable.targetId);
+
+  const counts: Record<string, number> = {};
+  for (const r of rows) {
+    if (r.targetId !== null) counts[r.targetId] = Number(r.watchers);
+  }
+  return counts;
+}
+
+/**
+ * The facility id approving this submission WRITES — the id `approveSubmission`
+ * hands to `notifySubscribersOfChange`, and so the id whose watchers get mailed.
+ * For a `create` that is `payload.id`, NOT `targetFacilityId`: subscriptions
+ * carry no FK to facilities and nothing prunes a confirmed row when a facility
+ * is retired, so a `create` reusing a retired slug mails that slug's surviving
+ * watchers. Anything else is the row's `targetFacilityId`. Only a non-empty
+ * string counts; a missing or malformed id is `null` (nothing to count).
+ */
+function approvedFacilityId(row: {
+  kind: string;
+  targetFacilityId: string | null;
+  payload: unknown;
+}): string | null {
+  if (row.kind === "create") {
+    const id = (row.payload as Record<string, unknown> | null)?.id;
+    return typeof id === "string" && id !== "" ? id : null;
+  }
+  return row.targetFacilityId || null;
+}
+
+/**
+ * How many confirmed watchers approving this submission would email right now,
+ * keyed on the id the approval writes (see `approvedFacilityId`). 0 for a row
+ * that is not `pending` (the approve call rejects it with its own 404/409
+ * before it mails anyone), for an unknown id, and for a row with no usable id.
+ * Used by the approve route's server-side gate; the admin UI calls
+ * `approveSubmission` directly and is deliberately not behind it.
+ */
+export async function approvalWatcherCount(submissionId: string): Promise<number> {
+  const db = getDb();
+  const [row] = await db
+    .select({
+      kind: submissionsTable.kind,
+      status: submissionsTable.status,
+      targetFacilityId: submissionsTable.targetFacilityId,
+      payload: submissionsTable.payload,
+    })
+    .from(submissionsTable)
+    .where(eq(submissionsTable.id, submissionId));
+  if (!row || row.status !== "pending") return 0;
+
+  const facilityId = approvedFacilityId(row);
+  if (!facilityId) return 0;
+  const counts = await confirmedWatcherCounts([facilityId]);
+  return counts[facilityId] ?? 0;
+}
+
+export type SubmissionWithWatchers = SubmissionRow & { watcherCount: number };
+
+/**
+ * `listSubmissions` plus, per row, how many confirmed watchers an approval
+ * would email — keyed on the id the approval writes (see `approvedFacilityId`),
+ * so a `create` that reuses a watched id reports its watchers too.
+ */
+export async function listSubmissionsWithWatchers(
+  status?: string
+): Promise<SubmissionWithWatchers[]> {
+  const rows = await listSubmissions(status);
+  const facilityIds = rows.map(approvedFacilityId);
+  const counts = await confirmedWatcherCounts(facilityIds.filter((id): id is string => id !== null));
+
+  return rows.map((r, i) => {
+    const facilityId = facilityIds[i];
+    return { ...r, watcherCount: facilityId ? (counts[facilityId] ?? 0) : 0 };
+  });
+}
+
+/**
+ * Busts the global `"facilities"` tag ONCE each time an
+ * approval or rejection leaves the pending queue empty. A single write
+ * deliberately busts only its scoped tags (`tagsForFacility`) because per-write
+ * `"facilities"` busts were the 2026-07-22 ISR-write-blowout; aggregate, hub
+ * and listing pages sit on a 24h timer, so without this a drained queue would
+ * leave them stale until the timer or the next `db:sync`. One bust per queue drain is
+ * bounded. Best-effort: a count or bust failure must never fail a review, and
+ * logs a SQLSTATE only (DrizzleQueryError.message embeds bound params).
+ */
+async function bustAggregatesIfQueueDrained(db: ReturnType<typeof getDb>): Promise<void> {
+  try {
+    const [{ n }] = await db
+      .select({ n: sql<number>`count(*)` })
+      .from(submissionsTable)
+      .where(eq(submissionsTable.status, "pending"));
+    if (Number(n) === 0) {
+      revalidateTag("facilities", "max");
+    }
+  } catch (err) {
+    console.error(`queue-drain cache bust failed (sqlstate: ${redactedErrorCode(err)})`);
+  }
+}
+
+/**
+ * Promotes a pending submission to a live facility via the write
  * primitives, then marks the submission `approved`. If the primitive rejects
  * (e.g. schema-invalid payload), the submission is left `pending` so it can
  * be fixed and retried rather than silently lost.
@@ -115,7 +261,9 @@ export async function approveSubmission(
       ? await createFacility(row.payload, id)
       : row.kind === "status_update"
         ? await writeStatusUpdate(row.targetFacilityId!, row.payload, id)
-        : await updateFacility(row.targetFacilityId!, row.payload, id);
+        : row.kind === "enrichment_update"
+          ? await writeEnrichmentUpdate(row.targetFacilityId!, row.payload, id)
+          : await updateFacility(row.targetFacilityId!, row.payload, id);
 
   if (!writeResult.ok) {
     return writeResult;
@@ -127,22 +275,41 @@ export async function approveSubmission(
     .where(eq(submissionsTable.id, id))
     .returning();
 
-  // Best-effort — notifySubscribersOfChange never throws, but this extra
-  // try/catch is belt-and-suspenders: a notification failure must never turn
-  // a successful approval into an error response.
+  // Best-effort — neither notifySubscribersOfChange nor
+  // notifySubmitterOfReview throws (each handles/logs its own errors
+  // internally), but this extra try/catch is belt-and-suspenders: a
+  // notification failure must never turn a successful approval into an
+  // error response. Logs a code via redactedErrorCode(err), never the caught error
+  // object itself, in case that no-throw contract is ever violated:
+  // notifySubmitterOfReview's statements bind the submitter's email address
+  // (or its salted hash), and DrizzleQueryError.message embeds bound params
+  // (see lib/db-error.ts).
   try {
     const changeLabel =
       row.kind === "create"
         ? "added to the atlas"
         : row.kind === "status_update"
           ? "status updated"
-          : "record updated";
+          : row.kind === "enrichment_update"
+            ? "details enriched"
+            : "record updated";
     await notifySubscribersOfChange(writeResult.facility, changeLabel);
+    await notifySubmitterOfReview(id, "approved", {
+      name: writeResult.facility.name,
+      id: writeResult.facility.id,
+    });
   } catch (err) {
-    console.error("subscriber notification failed", err);
+    console.error(`subscriber notification failed (sqlstate: ${redactedErrorCode(err)})`);
   }
 
-  return { ok: true, submission: updated, facility: writeResult.facility };
+  await bustAggregatesIfQueueDrained(db);
+
+  return {
+    ok: true,
+    submission: updated,
+    facility: writeResult.facility,
+    historyRecorded: writeResult.historyRecorded,
+  };
 }
 
 /** Rejects a pending submission with a required, non-empty reason. */
@@ -170,5 +337,173 @@ export async function rejectSubmission(
     .where(eq(submissionsTable.id, id))
     .returning();
 
+  // Best-effort — matches approveSubmission's identical discipline above:
+  // notifySubmitterOfReview never throws (it handles/logs its own errors
+  // internally), but this extra try/catch is belt-and-suspenders so a
+  // notification failure never turns a successful rejection into an error
+  // response.
+  try {
+    await notifySubmitterOfReview(id, "rejected", facilityLabelForRejection(row));
+  } catch (err) {
+    console.error(`submitter notification failed (sqlstate: ${redactedErrorCode(err)})`);
+  }
+
+  await bustAggregatesIfQueueDrained(db);
+
   return { ok: true, submission: updated };
+}
+
+/**
+ * Best-effort "email me when reviewed" send + cleanup, called from both
+ * approveSubmission and rejectSubmission after the status update. This file
+ * owns the send/delete DECISION; lib/submission-notify.ts stays deliberately
+ * CRUD-only (see its module doc comment) and exposes just the flag check
+ * plus get/delete primitives.
+ *
+ * If no notify request exists for this submission — the overwhelmingly
+ * common case, since nobody asked — this is a silent no-op: no send, no
+ * delete, no log noise.
+ *
+ * When a request DOES exist, the row is deleted unconditionally once this
+ * function reaches that point: whether the flag is on or off, whether the
+ * address is over its per-address send cap (`checkSubmissionNotifySendCap`,
+ * lib/rate-limit.ts), and whether or not the send succeeded. A skipped or
+ * failed send means the contributor is never told — that is the CHOSEN
+ * tradeoff over retaining an address that has no further scheduled use (this
+ * is a one-shot request by design; see lib/submission-notify.ts's module doc
+ * comment). Deliberately NOT the intuitive pairing: "skip the send" does NOT
+ * mean "keep the row for a later retry" — retaining it would defeat the
+ * one-shot design and hand the address a scheduled future retry it never
+ * asked for. `sendSubmissionReviewedEmail` itself never throws (it bottoms
+ * out in lib/email.ts's `sendViaResend`, which returns `{sent:false}` rather
+ * than throwing on a Resend error) — the try/catch around it here is
+ * belt-and-suspenders, since "the send failed" is really signaled by a falsy
+ * `sent`, not an exception; deletion does not depend on that value either
+ * way.
+ *
+ * SEND-CAP GATING (closes a HIGH security finding — see
+ * `submissionNotifySendsTable`'s doc comment in lib/db/schema.ts for the
+ * attack this closes): the attempt is recorded via
+ * `recordSubmissionNotifySend` BEFORE `sendSubmissionReviewedEmail` is even
+ * attempted, and the record must itself succeed before the send is
+ * attempted — a failing send, or a failing record, must still cost the
+ * target address's budget rather than let it be retried for free (mirrors PR
+ * #288's "attempts, not outcomes" fix for `subscribe_attempts`). Both the cap
+ * check and the record step fail CLOSED (skip the send) on error rather than
+ * open, because proceeding to send on either failure is exactly the
+ * unrecorded-mail path this fix exists to close.
+ *
+ * Never lets anything throw out of the review path, and never logs a caught
+ * error object: every statement below — the lookup, the send-cap check, the
+ * send-record, the send, and the delete — has the submitter's email address
+ * (or its salted hash) bound into it, and DrizzleQueryError.message embeds
+ * bound params (see lib/submission-notify.ts's module doc comment for the
+ * prior incident this mirrors with an IP hash — and note it was not only the
+ * one statement expected to fail that leaked; every one is individually
+ * guarded here for that reason). The over-cap path in particular logs
+ * nothing at all — "over cap" is not an error, and it must not produce a log
+ * line naming an address.
+ */
+async function notifySubmitterOfReview(
+  submissionId: string,
+  decision: "approved" | "rejected",
+  facility?: { name: string; id?: string }
+): Promise<void> {
+  let notifyRequest: { email: string } | null;
+  try {
+    notifyRequest = await getSubmissionNotifyRequest(submissionId);
+  } catch (err) {
+    console.error(`notifySubmitterOfReview: lookup failed (sqlstate: ${redactedErrorCode(err)})`);
+    return;
+  }
+  if (!notifyRequest) return;
+
+  // "Stop all email" is literal: a globally stopped address (or one whose
+  // lookup failed, "unknown") gets no review email either. Checked BEFORE the
+  // send cap so a skipped send spends none of it, and logged with no address.
+  // The request row is still deleted below, exactly as for any other skip.
+  let mayNotify = submissionNotifyEnabled();
+  if (mayNotify) {
+    try {
+      if (!mayEmail(await isSuppressed(getDb(), notifyRequest.email, { kind: "global" }))) {
+        mayNotify = false;
+        console.warn(
+          "notifySubmitterOfReview: skipped (address suppressed or suppression lookup failed)"
+        );
+      }
+    } catch (err) {
+      // `isSuppressed` itself never throws, but `getDb()` can (no database
+      // URL): a throw here must not skip the request-row delete below.
+      mayNotify = false;
+      console.error(`notifySubmitterOfReview: suppression gate failed (sqlstate: ${redactedErrorCode(err)})`);
+    }
+  }
+
+  if (mayNotify) {
+    let underSendCap = false;
+    try {
+      underSendCap = (await checkSubmissionNotifySendCap(notifyRequest.email)).ok;
+    } catch (err) {
+      console.error(`notifySubmitterOfReview: send-cap check failed (sqlstate: ${redactedErrorCode(err)})`);
+      // Fail closed — an unverifiable cap must not be treated as "under".
+    }
+
+    if (underSendCap) {
+      let recorded = false;
+      try {
+        await recordSubmissionNotifySend(notifyRequest.email);
+        recorded = true;
+      } catch (err) {
+        console.error(`notifySubmitterOfReview: record send failed (sqlstate: ${redactedErrorCode(err)})`);
+        // Fail closed — an unrecorded attempt must not be allowed to send;
+        // that is exactly the unrecorded-mail path this fix exists to close.
+      }
+
+      if (recorded) {
+        try {
+          await sendSubmissionReviewedEmail({
+            email: notifyRequest.email,
+            decision,
+            facilityName: facility?.name ?? "your submission",
+            // The rejection path structurally carries no `id` — see
+            // facilityLabelForRejection — so this ternary can't be changed to
+            // leak a bogus /facilities/<submission-uuid> link even if the
+            // `decision === "approved"` guard were ever removed.
+            facilitySlug: decision === "approved" ? facility?.id : undefined,
+          });
+        } catch (err) {
+          console.error(`notifySubmitterOfReview: send failed (sqlstate: ${redactedErrorCode(err)})`);
+        }
+      }
+    }
+    // Over cap: no send is attempted, and deliberately no log line — see
+    // this function's doc comment above.
+  }
+
+  // Unconditional — see "SEND-CAP GATING" above for why "skip the send" must
+  // never imply "keep the row."
+  try {
+    await deleteSubmissionNotifyRequest(submissionId);
+  } catch (err) {
+    console.error(`notifySubmitterOfReview: delete failed (sqlstate: ${redactedErrorCode(err)})`);
+  }
+}
+
+/**
+ * rejectSubmission never runs a write primitive, so — unlike
+ * approveSubmission's `writeResult.facility` — there is no live Facility to
+ * read a name from. For a `create`-kind rejection, the submitter's own
+ * proposed `payload.name` is an honest label: it's literally what they
+ * typed, not something invented. For the update/status_update/
+ * enrichment_update kinds there is only `targetFacilityId` (an id, not a
+ * name) to go on, and stitching a display name out of an id would be a
+ * fabricated label rather than a derived one — so those kinds return
+ * undefined here, and notifySubmitterOfReview's `facilityName ?? "your
+ * submission"` fallback supplies the neutral phrase instead.
+ */
+function facilityLabelForRejection(row: SubmissionRow): { name: string } | undefined {
+  if (row.kind !== "create") return undefined;
+  const payload = row.payload as Record<string, unknown> | null;
+  const name = payload && typeof payload.name === "string" ? payload.name.trim() : "";
+  return name ? { name } : undefined;
 }

@@ -1,0 +1,374 @@
+// @vitest-environment node
+import { beforeAll, beforeEach, afterAll, describe, it, expect, vi } from "vitest";
+
+vi.mock("next/cache", () => ({
+  revalidateTag: vi.fn(),
+  revalidatePath: vi.fn(),
+  unstable_cache: (fn: unknown) => fn,
+}));
+vi.mock("@/lib/db/client");
+
+import * as dbClient from "@/lib/db/client";
+import { makeTestDb, type TestDbHandle } from "@/test/pglite-db";
+import {
+  INTAKE_SURFACES,
+  intakeAttemptsTable,
+  subscribeAttemptsTable,
+  submissionNotifySendsTable,
+  subscriptionsTable,
+} from "@/lib/db/schema";
+
+import {
+  checkIntakeRateLimit,
+  reserveAdminLoginAttempt,
+  releaseAdminLoginAttempt,
+  ADMIN_LOGIN_BUDGET,
+  checkSubscribeRateLimit,
+  recordIntakeAttempt,
+  recordSubscribeAttempt,
+  checkSubmissionNotifySendCap,
+  recordSubmissionNotifySend,
+  hashNotifyEmail,
+  SUBMISSION_NOTIFY_SEND_CAP_MAX,
+  SUBMISSION_NOTIFY_SEND_WINDOW_MS,
+  RATE_LIMIT_MAX,
+  RATE_LIMIT_WINDOW_MS,
+} from "@/lib/rate-limit";
+
+let tdb: TestDbHandle;
+
+const IP_HASH = "hash-under-test";
+const OTHER_IP_HASH = "hash-someone-else";
+
+beforeAll(async () => {
+  tdb = await makeTestDb();
+  vi.mocked(dbClient.getDb).mockReturnValue(tdb.db as never);
+  vi.mocked(dbClient.hasDatabaseUrl).mockReturnValue(true);
+});
+
+beforeEach(async () => {
+  await tdb.reset();
+});
+
+afterAll(async () => {
+  await tdb.client.close();
+});
+
+/** Inserts `n` attempt rows for `ipHash`, all stamped `ageMs` in the past. */
+async function seedAttempts(ipHash: string, n: number, ageMs = 0): Promise<void> {
+  const createdAt = new Date(Date.now() - ageMs);
+  for (let i = 0; i < n; i++) {
+    await tdb.db.insert(subscribeAttemptsTable).values({ submitterIpHash: ipHash, createdAt });
+  }
+}
+
+describe("recordSubscribeAttempt", () => {
+  it("writes exactly one row per call, carrying only the ip hash", async () => {
+    await recordSubscribeAttempt(IP_HASH);
+
+    const rows = await tdb.db.select().from(subscribeAttemptsTable);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].submitterIpHash).toBe(IP_HASH);
+    expect(rows[0].createdAt).toBeInstanceOf(Date);
+    // The row's shape is part of the contract: an attempt must reveal nothing
+    // about which branch the request took, so there is no email/target/outcome.
+    expect(Object.keys(rows[0]).sort()).toEqual(["createdAt", "id", "submitterIpHash"]);
+  });
+
+  it("does not swallow a write failure — it must fail closed so the route can refuse", async () => {
+    // A schema-level violation the driver rejects: NOT NULL on submitter_ip_hash.
+    await expect(recordSubscribeAttempt(null as unknown as string)).rejects.toThrow();
+  });
+});
+
+describe("checkSubscribeRateLimit", () => {
+  it("allows while prior attempts are below the max and blocks at the max", async () => {
+    expect((await checkSubscribeRateLimit(IP_HASH)).ok).toBe(true);
+
+    await seedAttempts(IP_HASH, RATE_LIMIT_MAX - 1);
+    expect((await checkSubscribeRateLimit(IP_HASH)).ok).toBe(true);
+
+    await seedAttempts(IP_HASH, 1);
+    expect((await checkSubscribeRateLimit(IP_HASH)).ok).toBe(false);
+  });
+
+  it("counts a row just inside the window and ignores one just outside it", async () => {
+    // One minute inside the window — counted.
+    await seedAttempts(IP_HASH, RATE_LIMIT_MAX, RATE_LIMIT_WINDOW_MS - 60_000);
+    expect((await checkSubscribeRateLimit(IP_HASH)).ok).toBe(false);
+
+    await tdb.reset();
+
+    // One minute outside the window — expired, so the budget is untouched.
+    await seedAttempts(IP_HASH, RATE_LIMIT_MAX, RATE_LIMIT_WINDOW_MS + 60_000);
+    expect((await checkSubscribeRateLimit(IP_HASH)).ok).toBe(true);
+  });
+
+  it("buckets per ip hash — another ip's attempts never consume this one's budget", async () => {
+    await seedAttempts(OTHER_IP_HASH, RATE_LIMIT_MAX * 2);
+    expect((await checkSubscribeRateLimit(IP_HASH)).ok).toBe(true);
+    expect((await checkSubscribeRateLimit(OTHER_IP_HASH)).ok).toBe(false);
+  });
+
+  it("counts attempts, NOT successful subscriptions — this is the defect it was rewritten to fix", async () => {
+    // The old implementation counted `subscriptions` rows, so requests that
+    // never inserted were free. Subscriptions alone must now move nothing.
+    for (let i = 0; i < RATE_LIMIT_MAX * 2; i++) {
+      await tdb.db.insert(subscriptionsTable).values({
+        email: `user${i}@example.com`,
+        targetType: "facility",
+        targetId: `facility-${i}`,
+        status: "pending",
+        confirmToken: `tok-${i}`,
+        unsubscribeToken: `unsub-${i}`,
+      });
+    }
+    expect((await checkSubscribeRateLimit(IP_HASH)).ok).toBe(true);
+
+    // Attempts alone are what close the budget.
+    await seedAttempts(IP_HASH, RATE_LIMIT_MAX);
+    expect((await checkSubscribeRateLimit(IP_HASH)).ok).toBe(false);
+  });
+});
+
+// --- intake_attempts: the same "attempts, not outcomes" fix, carried across to
+// the other four public write surfaces (Finding 1, security audit 2026-09-27).
+
+/** Inserts `n` attempt rows for (`surface`, `ipHash`), all stamped `ageMs` in the past. */
+async function seedIntakeAttempts(
+  surface: (typeof INTAKE_SURFACES)[number],
+  ipHash: string,
+  n: number,
+  ageMs = 0
+): Promise<void> {
+  const createdAt = new Date(Date.now() - ageMs);
+  for (let i = 0; i < n; i++) {
+    await tdb.db.insert(intakeAttemptsTable).values({ surface, submitterIpHash: ipHash, createdAt });
+  }
+}
+
+describe("recordIntakeAttempt", () => {
+  it("writes exactly one row per call, carrying only the surface and the ip hash", async () => {
+    await recordIntakeAttempt("contribute", IP_HASH);
+
+    const rows = await tdb.db.select().from(intakeAttemptsTable);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].surface).toBe("contribute");
+    expect(rows[0].submitterIpHash).toBe(IP_HASH);
+    expect(rows[0].createdAt).toBeInstanceOf(Date);
+    // The row's shape is part of the contract: an attempt must reveal nothing
+    // about which branch the request took once inside its endpoint, so there is
+    // no email/payload/outcome. `surface` is not a leak — the caller chose the
+    // endpoint.
+    expect(Object.keys(rows[0]).sort()).toEqual([
+      "createdAt",
+      "id",
+      "submitterIpHash",
+      "surface",
+    ]);
+  });
+
+  it("does not swallow a write failure — it must fail closed so the route can refuse", async () => {
+    // A schema-level violation the driver rejects: NOT NULL on submitter_ip_hash.
+    await expect(recordIntakeAttempt("contribute", null as unknown as string)).rejects.toThrow();
+  });
+
+  it.each(INTAKE_SURFACES)("records surface %s", async (surface) => {
+    await recordIntakeAttempt(surface, IP_HASH);
+    const rows = await tdb.db.select().from(intakeAttemptsTable);
+    expect(rows[0].surface).toBe(surface);
+  });
+});
+
+describe("admin-login budget (reserve-then-count)", () => {
+  async function rowCount(ipHash: string): Promise<number> {
+    const rows = await tdb.db.select().from(intakeAttemptsTable);
+    return rows.filter((r) => r.surface === "admin-login" && r.submitterIpHash === ipHash).length;
+  }
+
+  it("admits 5 reservations, refuses the 6th, scoped to the IP", async () => {
+    for (let i = 0; i < 5; i++) expect((await reserveAdminLoginAttempt(IP_HASH)).ok).toBe(true);
+    expect((await reserveAdminLoginAttempt(IP_HASH)).ok).toBe(false);
+    expect((await reserveAdminLoginAttempt(OTHER_IP_HASH)).ok).toBe(true);
+  });
+
+  // On one connection every concurrent INSERT lands before any COUNT, so a
+  // simultaneous burst from a cold start sees the whole burst and is refused
+  // entirely (over-refusal, never over-admission). To make the assertions
+  // meaningful the first reservation is made alone (it must be admitted), then
+  // the burst runs against it: total admitted is >= 1 and never > max.
+  it("never over-admits under concurrency, and still admits the earlier request", async () => {
+    const first = await reserveAdminLoginAttempt(IP_HASH);
+    expect(first.ok).toBe(true);
+    const burst = await Promise.all(
+      Array.from({ length: 20 }, () => reserveAdminLoginAttempt(IP_HASH))
+    );
+    const admitted = 1 + burst.filter((r) => r.ok).length;
+    expect(admitted).toBeGreaterThanOrEqual(1);
+    expect(admitted).toBeLessThanOrEqual(ADMIN_LOGIN_BUDGET.max);
+  });
+
+  it("a refused reservation does not stay in the window; a released one is removed", async () => {
+    const admitted = [];
+    for (let i = 0; i < 5; i++) admitted.push(await reserveAdminLoginAttempt(IP_HASH));
+    expect((await reserveAdminLoginAttempt(IP_HASH)).ok).toBe(false);
+    expect(await rowCount(IP_HASH)).toBe(5);
+    await releaseAdminLoginAttempt(admitted[0].id); // successful login
+    expect(await rowCount(IP_HASH)).toBe(4);
+    expect((await reserveAdminLoginAttempt(IP_HASH)).ok).toBe(true);
+  });
+
+  it("uses a 15-minute window, not the hourly one", async () => {
+    await seedIntakeAttempts("admin-login", IP_HASH, 5, ADMIN_LOGIN_BUDGET.windowMs + 60_000);
+    expect((await reserveAdminLoginAttempt(IP_HASH)).ok).toBe(true);
+    await tdb.reset();
+    await seedIntakeAttempts("admin-login", IP_HASH, 5, ADMIN_LOGIN_BUDGET.windowMs - 60_000);
+    expect((await reserveAdminLoginAttempt(IP_HASH)).ok).toBe(false);
+  });
+
+  it("does not share budget with other surfaces", async () => {
+    await seedIntakeAttempts("contact", IP_HASH, 5);
+    expect((await reserveAdminLoginAttempt(IP_HASH)).ok).toBe(true);
+    await seedIntakeAttempts("admin-login", IP_HASH, 5);
+    expect((await checkIntakeRateLimit("contact", IP_HASH)).ok).toBe(false);
+    expect((await checkIntakeRateLimit("leads", IP_HASH)).ok).toBe(true);
+  });
+});
+
+describe("checkIntakeRateLimit", () => {
+  it("allows while prior attempts are below the max and blocks at the max", async () => {
+    expect((await checkIntakeRateLimit("contribute", IP_HASH)).ok).toBe(true);
+
+    await seedIntakeAttempts("contribute", IP_HASH, RATE_LIMIT_MAX - 1);
+    expect((await checkIntakeRateLimit("contribute", IP_HASH)).ok).toBe(true);
+
+    await seedIntakeAttempts("contribute", IP_HASH, 1);
+    expect((await checkIntakeRateLimit("contribute", IP_HASH)).ok).toBe(false);
+  });
+
+  it("counts a row just inside the window and ignores one just outside it", async () => {
+    await seedIntakeAttempts("contribute", IP_HASH, RATE_LIMIT_MAX, RATE_LIMIT_WINDOW_MS - 60_000);
+    expect((await checkIntakeRateLimit("contribute", IP_HASH)).ok).toBe(false);
+
+    await tdb.reset();
+
+    await seedIntakeAttempts("contribute", IP_HASH, RATE_LIMIT_MAX, RATE_LIMIT_WINDOW_MS + 60_000);
+    expect((await checkIntakeRateLimit("contribute", IP_HASH)).ok).toBe(true);
+  });
+
+  it("buckets per ip hash — another ip's attempts never consume this one's budget", async () => {
+    await seedIntakeAttempts("contribute", OTHER_IP_HASH, RATE_LIMIT_MAX * 2);
+    expect((await checkIntakeRateLimit("contribute", IP_HASH)).ok).toBe(true);
+    expect((await checkIntakeRateLimit("contribute", OTHER_IP_HASH)).ok).toBe(false);
+  });
+
+  it("buckets per SURFACE — a burst against one surface never starves another", async () => {
+    // The isolation the four separate outcome tables used to provide, now
+    // carried by the `surface` predicate. Exhaust one surface for one IP...
+    await seedIntakeAttempts("contact", IP_HASH, RATE_LIMIT_MAX * 2);
+    expect((await checkIntakeRateLimit("contact", IP_HASH)).ok).toBe(false);
+    // ...and every other surface for that same IP must be untouched.
+    for (const surface of INTAKE_SURFACES.filter((s) => s !== "contact")) {
+      expect((await checkIntakeRateLimit(surface, IP_HASH)).ok).toBe(true);
+    }
+  });
+
+  it("does not leak across surfaces when both are partly spent", async () => {
+    await seedIntakeAttempts("leads", IP_HASH, RATE_LIMIT_MAX - 1);
+    await seedIntakeAttempts("contribute", IP_HASH, RATE_LIMIT_MAX - 1);
+    // 8 rows for this IP in total, but neither surface is at its own max.
+    expect((await tdb.db.select().from(intakeAttemptsTable)).length).toBe((RATE_LIMIT_MAX - 1) * 2);
+    expect((await checkIntakeRateLimit("leads", IP_HASH)).ok).toBe(true);
+    expect((await checkIntakeRateLimit("contribute", IP_HASH)).ok).toBe(true);
+  });
+
+  it("throws rather than reporting ok when the table is missing — the routes answer 503", async () => {
+    // The unapplied-migration case (SQLSTATE 42P01, the 2026-09-03 incident
+    // behind scripts/check-schema-drift.ts). A limiter that returned `{ok:true}`
+    // here would fail OPEN and silently stop capping.
+    await tdb.client.exec(`ALTER TABLE "intake_attempts" RENAME TO "intake_attempts_hidden"`);
+    try {
+      await expect(checkIntakeRateLimit("contribute", IP_HASH)).rejects.toThrow();
+    } finally {
+      await tdb.client.exec(`ALTER TABLE "intake_attempts_hidden" RENAME TO "intake_attempts"`);
+    }
+  });
+});
+
+// C1b Unit D: the persistent send-attempt counter that replaces
+// checkSubmissionNotifyCap for actually bounding mail volume — see
+// submissionNotifySendsTable's doc comment in lib/db/schema.ts for the
+// attack this closes (that cap's rows are deleted at review time, resetting
+// to zero; this table's rows are not).
+const NOTIFY_EMAIL = "under-test@example.com";
+const OTHER_NOTIFY_EMAIL = "someone-else@example.com";
+
+/** Inserts `n` already-hashed send rows for `email`, all stamped `ageMs` in the past. */
+async function seedSends(email: string, n: number, ageMs = 0): Promise<void> {
+  const createdAt = new Date(Date.now() - ageMs);
+  const emailHash = hashNotifyEmail(email);
+  for (let i = 0; i < n; i++) {
+    await tdb.db.insert(submissionNotifySendsTable).values({ emailHash, createdAt });
+  }
+}
+
+describe("recordSubmissionNotifySend", () => {
+  it("writes exactly one row per call, carrying only the salted hash", async () => {
+    await recordSubmissionNotifySend(NOTIFY_EMAIL);
+
+    const rows = await tdb.db.select().from(submissionNotifySendsTable);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].emailHash).toBe(hashNotifyEmail(NOTIFY_EMAIL));
+    // The raw address is never stored — same discipline as every other
+    // per-address counter in this file.
+    expect(rows[0].emailHash).not.toBe(NOTIFY_EMAIL);
+    expect(Object.keys(rows[0]).sort()).toEqual(["createdAt", "emailHash", "id"]);
+  });
+});
+
+describe("checkSubmissionNotifySendCap", () => {
+  it("allows while prior sends are below the max and blocks at the max", async () => {
+    expect((await checkSubmissionNotifySendCap(NOTIFY_EMAIL)).ok).toBe(true);
+
+    await seedSends(NOTIFY_EMAIL, SUBMISSION_NOTIFY_SEND_CAP_MAX - 1);
+    expect((await checkSubmissionNotifySendCap(NOTIFY_EMAIL)).ok).toBe(true);
+
+    await seedSends(NOTIFY_EMAIL, 1);
+    expect((await checkSubmissionNotifySendCap(NOTIFY_EMAIL)).ok).toBe(false);
+  });
+
+  // Pinned against a literal, not derived from the constant under test — a
+  // fixture written as `seedSends(EMAIL, SUBMISSION_NOTIFY_SEND_CAP_MAX)`
+  // would move in lockstep with the constant and stay green even if the
+  // threshold were raised.
+  it("SUBMISSION_NOTIFY_SEND_CAP_MAX is 5", () => {
+    expect(SUBMISSION_NOTIFY_SEND_CAP_MAX).toBe(5);
+  });
+
+  it("counts a row just inside the 30-day window and ignores one just outside it", async () => {
+    // One hour inside the window — counted.
+    await seedSends(NOTIFY_EMAIL, SUBMISSION_NOTIFY_SEND_CAP_MAX, SUBMISSION_NOTIFY_SEND_WINDOW_MS - 60 * 60 * 1000);
+    expect((await checkSubmissionNotifySendCap(NOTIFY_EMAIL)).ok).toBe(false);
+
+    await tdb.reset();
+
+    // One hour outside the window — expired, so the budget is untouched.
+    await seedSends(NOTIFY_EMAIL, SUBMISSION_NOTIFY_SEND_CAP_MAX, SUBMISSION_NOTIFY_SEND_WINDOW_MS + 60 * 60 * 1000);
+    expect((await checkSubmissionNotifySendCap(NOTIFY_EMAIL)).ok).toBe(true);
+  });
+
+  it("buckets per address hash — another address's sends never consume this one's budget", async () => {
+    await seedSends(OTHER_NOTIFY_EMAIL, SUBMISSION_NOTIFY_SEND_CAP_MAX * 2);
+    expect((await checkSubmissionNotifySendCap(NOTIFY_EMAIL)).ok).toBe(true);
+    expect((await checkSubmissionNotifySendCap(OTHER_NOTIFY_EMAIL)).ok).toBe(false);
+  });
+});
+
+// The actual defect this table exists to fix — checkSubmissionNotifyCap's
+// rows are deleted the moment a submission is reviewed, resetting THAT cap to
+// zero — is exercised end-to-end (through notifySubmitterOfReview, deleting a
+// real submission_notify_requests row) in
+// lib/submissions.integration.test.ts, not here: this file has no submission
+// to review, so a same-file version of that test could only ever assert
+// "nothing touched this table," which would pass identically whether or not
+// the fix existed.

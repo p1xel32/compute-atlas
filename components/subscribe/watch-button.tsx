@@ -1,21 +1,39 @@
 "use client";
 
 import { useEffect, useId, useRef, useState } from "react";
+import { Eye } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { cn } from "@/lib/utils";
+import { cn, QUIET_ACTION_CLASS } from "@/lib/utils";
+import type { WatchTargetType } from "@/lib/watch-target-types";
 
-export type WatchTargetType = "facility" | "state" | "all";
+export type { WatchTargetType };
 
 export interface WatchButtonProps {
   targetType: WatchTargetType;
-  /** Facility id or 2-letter state code. Omitted for targetType "all". */
-  targetId?: string;
-  /** Trigger button copy, e.g. "Watch this facility" / "Watch Texas" / "Watch all updates". */
+  /** Facility id, or (for targetType="state") a 2-letter state code, or (for "county"/"metro") the hub slug. */
+  targetId: string;
+  /** Trigger button copy, e.g. "Watch this facility". */
   label: string;
+  /**
+   * Overrides the default per-change description shown once the form
+   * expands ("Get an email when this changes..."). Callers whose cadence
+   * differs from immediate per-change delivery — e.g. a monthly state
+   * digest — MUST pass this, so the copy states that cadence explicitly
+   * rather than implying instant alerts it doesn't send.
+   */
+  description?: string;
   className?: string;
+  /**
+   * Renders the collapsed trigger as a quiet text-scale control instead of
+   * a bordered `<Button>` — used by the facility masthead's compact CTA
+   * strip (app/facilities/[slug]/page.tsx). Default false. The expanded
+   * email-capture form (and its submit button) is unaffected by this prop —
+   * it's a form action, not a trigger, and always stays a real button.
+   */
+  quiet?: boolean;
 }
 
 interface SubscribePayload {
@@ -81,7 +99,14 @@ type Outcome = "idle" | "success";
  * address was already subscribed, so every 201 shows the same "check your
  * email" copy (see lib/subscribe.ts).
  */
-export function WatchButton({ targetType, targetId, label, className }: WatchButtonProps) {
+export function WatchButton({
+  targetType,
+  targetId,
+  label,
+  description,
+  className,
+  quiet = false,
+}: WatchButtonProps) {
   const [revealed, setRevealed] = useState(false);
   const [email, setEmail] = useState("");
   const [website, setWebsite] = useState("");
@@ -96,7 +121,7 @@ export function WatchButton({ targetType, targetId, label, className }: WatchBut
 
   // Move focus into the form when it reveals: the trigger button that held
   // focus unmounts, so without this a keyboard/screen-reader user is stranded
-  // on <body>. (frontend-qa, s65.)
+  // on <body>. (Raised in accessibility review.)
   useEffect(() => {
     if (revealed) {
       emailInputRef.current?.focus();
@@ -128,7 +153,17 @@ export function WatchButton({ targetType, targetId, label, className }: WatchBut
         // no body / non-JSON response — fall through to generic messaging below
       }
 
-      if ((res.status === 400 || res.status === 429) && json && typeof json === "object") {
+      // 400 (validation), 429 (rate limit) and 503 (accounting outage) each ship
+      // a specific, reader-facing `error` from the server. 503 is here because
+      // the handler goes out of its way to make an outage self-announcing rather
+      // than hide it inside a 429 — discarding that for "Something went wrong"
+      // at the client would undo the distinction. Any other status has no
+      // message worth trusting, so it falls through to the generic line below.
+      if (
+        (res.status === 400 || res.status === 429 || res.status === 503) &&
+        json &&
+        typeof json === "object"
+      ) {
         setFormError((json as { error?: string }).error ?? "Something went wrong. Please try again.");
         return;
       }
@@ -142,6 +177,22 @@ export function WatchButton({ targetType, targetId, label, className }: WatchBut
   }
 
   if (!revealed) {
+    if (quiet) {
+      return (
+        <button
+          type="button"
+          className={cn(
+            QUIET_ACTION_CLASS,
+            "inline-flex items-center gap-1.5 min-h-11",
+            className
+          )}
+          onClick={() => setRevealed(true)}
+        >
+          <Eye className="size-3.5" aria-hidden="true" />
+          {label}
+        </button>
+      );
+    }
     return (
       <Button
         type="button"
@@ -164,7 +215,7 @@ export function WatchButton({ targetType, targetId, label, className }: WatchBut
         >
           <HoneypotField id={honeypotId} value={website} onChange={setWebsite} />
           <p className="text-sm text-muted-foreground">
-            Get an email when this changes. One click to unsubscribe, anytime.
+            {description ?? "Get an email when this changes. One click to unsubscribe, anytime."}
           </p>
           <div className="flex flex-col gap-1.5 sm:flex-row sm:items-end">
             <div className="flex flex-1 flex-col gap-1.5">
@@ -182,7 +233,14 @@ export function WatchButton({ targetType, targetId, label, className }: WatchBut
                 onChange={(e) => setEmail(e.target.value)}
               />
             </div>
-            <Button type="submit" disabled={submitting} className="min-h-11">
+            {/* No min-h-11 here, deliberately — Input (components/ui/input.tsx)
+                is h-8 (32px); forcing this button to 44px stood it 12px
+                taller than the field it submits under sm:items-end. Default
+                Button size (h-8) matches the Input exactly. 32px still
+                clears WCAG 2.2 SC 2.5.8's 24x24px minimum, and this control
+                sits inside a form the user has already deliberately
+                opened. */}
+            <Button type="submit" disabled={submitting}>
               {submitting ? "Watching…" : "Watch"}
             </Button>
           </div>

@@ -1,9 +1,8 @@
-import { describe, it, expect, vi, beforeAll, afterEach } from "vitest";
-import { render, screen, fireEvent } from "@testing-library/react";
+import { describe, it, expect, vi, beforeAll, beforeEach, afterEach, type Mock } from "vitest";
+import { render, screen, fireEvent, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { CommandPalette } from "./command-palette";
-import { getAllFacilities } from "@/lib/data";
-import { buildSearchIndex } from "@/lib/search";
+import { CommandPalette, SEARCH_DEBOUNCE_MS } from "./command-palette";
+import { buildNavSearchIndex } from "@/lib/search-index";
 import type { SearchEntry } from "@/lib/search";
 import type { Facility } from "@/lib/schema";
 
@@ -31,13 +30,139 @@ const NAV_LINKS = [
   { label: "Table", href: "/table" },
 ] as const;
 
-let knownFacility: Facility;
-let searchIndex: SearchEntry[];
+/**
+ * The mocked `/api/nav-index` serves the NAV index — operators and states,
+ * no facilities — because that is exactly what the route serves in
+ * production (`buildNavSearchIndex`, see app/api/nav-index/route.ts). An
+ * earlier version of this file built the FULL index instead, so every
+ * facility-result assertion passed against a prop shape production no longer
+ * produces, and the shipping configuration had zero component-level coverage:
+ * nothing here mocked `/api/search` at all. Facilities now reach the palette
+ * only through the debounced fetch, so they are asserted through that path.
+ */
+let navIndex: SearchEntry[];
+
+/** An operator entry from the real nav index whose label is unambiguous. */
+let knownOperator: SearchEntry;
+/** A state entry from the real nav index whose label is unambiguous. */
+let knownState: SearchEntry;
+
+/**
+ * The facility fixture is synthetic, not drawn from the dataset: facilities
+ * arrive only via the mocked `/api/search` response, so the test controls it
+ * outright. That also retires the old data-derived fixture picker — a facility
+ * chosen out of `getAllFacilities()` changed underneath these tests whenever a
+ * data wave landed (2026-08-15: a wave moved "1623 Farnam", whose name equals
+ * its operator, into position 0 and `findByRole` threw "found multiple
+ * elements"). "Zzyzx" is chosen to fuzzy-match nothing in the real operator/
+ * state index, so any option bearing it can only have come from the fetch.
+ */
+const DB_FACILITY: Facility = {
+  id: "zzyzx-data-campus",
+  name: "Zzyzx Data Campus",
+  operator: "Zzyzx Holdings",
+  status: "operational",
+  confidence: "confirmed",
+  facilityType: "data_center",
+  location: { lat: 39.0, lon: -77.0, state: "VA", city: "Ashburn" },
+} as Facility;
 
 beforeAll(async () => {
-  knownFacility = (await getAllFacilities())[0];
-  searchIndex = await buildSearchIndex();
+  navIndex = await buildNavSearchIndex();
+
+  // Pick entries whose label is not a substring of any other entry's label:
+  // the assertions below look options up by a regex built from the label, and
+  // an unanchored regex would match a longer option too ("Virginia" is a
+  // substring of "West Virginia"). Fail loudly rather than falling back to
+  // `[0]` — a silent fallback reintroduces exactly that ambiguity, and the
+  // failure would then point at an assertion instead of at the fixture.
+  const labelIsUnique = (entry: SearchEntry) =>
+    navIndex.filter((other) =>
+      other.label.toLowerCase().includes(entry.label.toLowerCase())
+    ).length === 1;
+
+  const operator = navIndex.find((e) => e.type === "operator" && labelIsUnique(e));
+  const state = navIndex.find((e) => e.type === "state" && labelIsUnique(e));
+  if (!operator || !state) {
+    throw new Error(
+      "command-palette.test: no operator and/or state entry has a label unique across the nav index — the fixture assumptions no longer hold"
+    );
+  }
+  knownOperator = operator;
+  knownState = state;
 });
+
+/**
+ * Labels are DATA, not patterns — operator names in this dataset contain regex
+ * metacharacters (parentheses, dots, slashes). Interpolating one straight into
+ * `new RegExp()` silently changes what is matched: "Foo (Bar)" would build
+ * /Foo (Bar)/i, which matches "Foo Bar" and NOT the literal label.
+ */
+const nameMatcher = (name: string) =>
+  new RegExp(name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+
+/**
+ * `role="option"` sits on the `<li>`, but the click handler that navigates is
+ * on the `<button>` inside it — clicking the `li` bubbles upward and never
+ * reaches that handler. The previous version of this file clicked the `li` and
+ * still passed, because `pushMock` was module-scoped and never cleared, so it
+ * was asserting the PRIOR test's Enter navigation. Clearing the mock per test
+ * (see `beforeEach`) exposed that; this resolves the real click target.
+ */
+const clickTarget = (option: HTMLElement) => within(option).getByRole("button");
+
+// ---------------------------------------------------------------------------
+// /api/search harness
+// ---------------------------------------------------------------------------
+
+/** Minimal stand-in for the bits of `Response` the palette actually reads. */
+function jsonResponse(body: unknown, init: { ok?: boolean; status?: number } = {}) {
+  return {
+    ok: init.ok ?? true,
+    status: init.status ?? 200,
+    json: async () => body,
+  };
+}
+
+/** `/api/search` calls only. */
+let fetchMock: Mock;
+/** `/api/nav-index` calls only. */
+let navFetchMock: Mock;
+
+beforeEach(() => {
+  pushMock.mockClear();
+  // Default: /api/search answers with no facilities. Every test that cares
+  // overrides this. Without a default, an unmocked `fetch` would attempt a
+  // real request to a relative URL under jsdom — noise, and a different code
+  // path from the one under test.
+  fetchMock = vi.fn(async () => jsonResponse({ facilities: [] }));
+  navFetchMock = vi.fn(async () => jsonResponse({ entries: navIndex }));
+  vi.stubGlobal("fetch", (input: string, init?: RequestInit) =>
+    String(input).startsWith("/api/nav-index") ? navFetchMock(input, init) : fetchMock(input, init)
+  );
+});
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
+
+/**
+ * These tests drive the 200 ms debounce (command-palette.tsx) with REAL timers
+ * and let `findBy*` poll it out. Fake timers are deliberately avoided:
+ * `user-event` schedules its own real `setTimeout` per keystroke, and fighting
+ * that is what got misdiagnosed here once before as an "ordering flake". The
+ * default `findBy*` timeout (1000 ms) comfortably clears a 200 ms debounce, so
+ * no test needs a raised timeout — if one starts to, that is a real regression
+ * in the debounce, not a knob to turn.
+ */
+function renderPalette() {
+  return render(<CommandPalette navLinks={NAV_LINKS} />);
+}
+
+async function openPalette(user: ReturnType<typeof userEvent.setup>) {
+  await user.click(screen.getByRole("button", { name: /search/i }));
+  return screen.findByRole("combobox");
+}
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -45,62 +170,284 @@ beforeAll(async () => {
 
 describe("CommandPalette — trigger", () => {
   it("renders a trigger button with an accessible search name", () => {
-    render(<CommandPalette index={searchIndex} navLinks={NAV_LINKS} />);
-    expect(
-      screen.getByRole("button", { name: /search/i })
-    ).toBeInTheDocument();
+    renderPalette();
+    expect(screen.getByRole("button", { name: /search/i })).toBeInTheDocument();
+  });
+
+  it("on non-Mac, names the trigger exactly 'Search Ctrl K' with whitespace between the visible spans", () => {
+    const platform = vi.spyOn(navigator, "platform", "get").mockReturnValue("Linux x86_64");
+    renderPalette();
+    const trigger = screen.getByRole("button", { name: "Search Ctrl K" });
+    platform.mockRestore();
+    // WCAG 2.5.3 / axe: the label span and <kbd> are flex siblings; the text node
+    // gives axe's visible-text check a word boundary ("Search Ctrl K", not "SearchCtrl K").
+    expect(trigger.textContent).toMatch(/Search\sCtrl K/);
+    expect(trigger).toHaveAttribute("aria-keyshortcuts", "Meta+K Control+K");
+  });
+
+  it("on Mac, names the trigger 'Search ⌘K' with whitespace between the visible spans", () => {
+    const platform = vi.spyOn(navigator, "platform", "get").mockReturnValue("MacIntel");
+    renderPalette();
+    const trigger = screen.getByRole("button", { name: "Search ⌘K" });
+    platform.mockRestore();
+    expect(trigger.textContent).toMatch(/Search\s⌘K/);
   });
 });
 
-describe("CommandPalette — open + search", () => {
+describe("CommandPalette — open", () => {
   it("clicking the trigger opens the dialog and shows the search combobox", async () => {
     const user = userEvent.setup();
-    render(<CommandPalette index={searchIndex} navLinks={NAV_LINKS} />);
+    renderPalette();
 
     await user.click(screen.getByRole("button", { name: /search/i }));
 
     expect(await screen.findByRole("combobox")).toBeInTheDocument();
   });
 
-  it("typing a known facility name surfaces an option linking to it, and Enter navigates", async () => {
+  it("carries the input's focus cue on its row, since the input itself is outline-none", async () => {
     const user = userEvent.setup();
-    render(<CommandPalette index={searchIndex} navLinks={NAV_LINKS} />);
+    renderPalette();
 
     await user.click(screen.getByRole("button", { name: /search/i }));
-    const combobox = await screen.findByRole("combobox");
 
-    await user.type(combobox, knownFacility.name);
+    const input = await screen.findByRole("combobox");
+    expect(input).toHaveClass("outline-none");
+    // Inset: the dialog popup is overflow-hidden and the row is flush with its edges.
+    expect(input.parentElement).toHaveClass(
+      "has-[#cmdk-input:focus-visible]:outline-2",
+      "has-[#cmdk-input:focus-visible]:-outline-offset-2",
+      "has-[#cmdk-input:focus-visible]:outline-ring"
+    );
+  });
+});
 
-    const option = await screen.findByRole("option", {
-      name: new RegExp(knownFacility.name, "i"),
-    });
-    expect(option).toBeInTheDocument();
+describe("CommandPalette — facilities via /api/search", () => {
+  it("typing a facility name fetches it and Enter navigates to its facility page", async () => {
+    fetchMock.mockImplementation(async () => jsonResponse({ facilities: [DB_FACILITY] }));
+
+    const user = userEvent.setup();
+    renderPalette();
+    const combobox = await openPalette(user);
+
+    await user.type(combobox, "Zzyzx");
+
+    // The nav index contains no facilities, so this option can only have come
+    // from the debounced /api/search fetch.
+    expect(
+      await screen.findByRole("option", { name: nameMatcher(DB_FACILITY.name) })
+    ).toBeInTheDocument();
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      expect.stringContaining("/api/search?q=Zzyzx&shape=palette"),
+      expect.anything()
+    );
 
     await user.keyboard("{Enter}");
 
-    expect(pushMock).toHaveBeenCalledWith(`/facilities/${knownFacility.id}`);
+    expect(pushMock).toHaveBeenCalledWith(`/facilities/${DB_FACILITY.id}`);
   });
 
-  it("clicking a result option navigates to its href", async () => {
-    const user = userEvent.setup();
-    render(<CommandPalette index={searchIndex} navLinks={NAV_LINKS} />);
+  it("clicking a fetched facility option navigates to its href", async () => {
+    fetchMock.mockImplementation(async () => jsonResponse({ facilities: [DB_FACILITY] }));
 
-    await user.click(screen.getByRole("button", { name: /search/i }));
-    const combobox = await screen.findByRole("combobox");
-    await user.type(combobox, knownFacility.name);
+    const user = userEvent.setup();
+    renderPalette();
+    const combobox = await openPalette(user);
+
+    await user.type(combobox, "Zzyzx");
+    const option = await screen.findByRole("option", {
+      name: nameMatcher(DB_FACILITY.name),
+    });
+
+    await user.click(clickTarget(option));
+
+    expect(pushMock).toHaveBeenCalledWith(`/facilities/${DB_FACILITY.id}`);
+  });
+
+  it("sends the debounced query to /api/search encoded", async () => {
+    const user = userEvent.setup();
+    renderPalette();
+    const combobox = await openPalette(user);
+
+    await user.type(combobox, "zzyzx campus");
+
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalled());
+    expect(fetchMock).toHaveBeenLastCalledWith(
+      "/api/search?q=zzyzx%20campus&shape=palette",
+      expect.anything()
+    );
+  });
+});
+
+describe("CommandPalette — /api/search failure degrades", () => {
+  it("keeps operator/state results when /api/search responds non-ok", async () => {
+    fetchMock.mockImplementation(async () => jsonResponse({}, { ok: false, status: 500 }));
+
+    const user = userEvent.setup();
+    renderPalette();
+    const combobox = await openPalette(user);
+
+    await user.type(combobox, knownOperator.label);
+
+    expect(
+      await screen.findByRole("option", { name: nameMatcher(knownOperator.label) })
+    ).toBeInTheDocument();
+    // No error UI, and no "no matches" claim while local results are showing.
+    expect(screen.queryByText(/no matches for/i)).not.toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("keeps operator/state results when the /api/search fetch rejects", async () => {
+    fetchMock.mockImplementation(async () => {
+      throw new Error("network error");
+    });
+
+    const user = userEvent.setup();
+    renderPalette();
+    const combobox = await openPalette(user);
+
+    await user.type(combobox, knownState.label);
+
+    expect(
+      await screen.findByRole("option", { name: nameMatcher(knownState.label) })
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/no matches for/i)).not.toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+
+    // The rejection must not escape as an unhandled error — the palette still
+    // responds to input afterwards.
+    await user.keyboard("{Enter}");
+    expect(pushMock).toHaveBeenCalled();
+  });
+});
+
+describe("CommandPalette — local nav index", () => {
+  // fetch is stubbed to a promise that NEVER settles in these two tests: if an
+  // option still renders, it cannot have come from the network, which is a
+  // stronger and less timing-dependent claim than asserting fetch was not yet
+  // called (the debounce could always fire on a slow machine).
+  beforeEach(() => {
+    fetchMock.mockImplementation(() => new Promise(() => {}));
+  });
+
+  it("resolves an operator from the index with no /api/search response", async () => {
+    const user = userEvent.setup();
+    renderPalette();
+    const combobox = await openPalette(user);
+
+    await user.type(combobox, knownOperator.label);
 
     const option = await screen.findByRole("option", {
-      name: new RegExp(knownFacility.name, "i"),
+      name: nameMatcher(knownOperator.label),
     });
-    await user.click(option);
+    expect(option).toBeInTheDocument();
 
-    expect(pushMock).toHaveBeenCalledWith(`/facilities/${knownFacility.id}`);
+    await user.click(clickTarget(option));
+    expect(pushMock).toHaveBeenCalledWith(knownOperator.href);
+  });
+
+  it("resolves a state from the index with no /api/search response", async () => {
+    const user = userEvent.setup();
+    renderPalette();
+    const combobox = await openPalette(user);
+
+    await user.type(combobox, knownState.label);
+
+    const option = await screen.findByRole("option", {
+      name: nameMatcher(knownState.label),
+    });
+    expect(option).toBeInTheDocument();
+
+    await user.click(clickTarget(option));
+    expect(pushMock).toHaveBeenCalledWith(knownState.href);
+  });
+});
+
+describe("CommandPalette — /api/nav-index lazy load", () => {
+  it("does not fetch the nav index until the palette is opened", async () => {
+    renderPalette();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(navFetchMock).not.toHaveBeenCalled();
+  });
+
+  it("fetches once on first open, even after closing and reopening", async () => {
+    const user = userEvent.setup();
+    renderPalette();
+    await openPalette(user);
+    await vi.waitFor(() => expect(navFetchMock).toHaveBeenCalledTimes(1));
+    expect(navFetchMock).toHaveBeenCalledWith("/api/nav-index", undefined);
+
+    await user.keyboard("{Escape}");
+    await vi.waitFor(() => expect(screen.queryByRole("combobox")).not.toBeInTheDocument());
+    await openPalette(user);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    expect(navFetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("shows pages immediately and operators once the index arrives", async () => {
+    let resolveIndex!: (v: ReturnType<typeof jsonResponse>) => void;
+    navFetchMock.mockImplementation(
+      () => new Promise((resolve) => { resolveIndex = resolve; })
+    );
+    const user = userEvent.setup();
+    renderPalette();
+    await openPalette(user);
+
+    expect(screen.getByRole("option", { name: /home/i })).toBeInTheDocument();
+    await user.type(screen.getByRole("combobox"), knownOperator.label);
+    expect(
+      screen.queryByRole("option", { name: nameMatcher(knownOperator.label) })
+    ).not.toBeInTheDocument();
+
+    resolveIndex(jsonResponse({ entries: navIndex }));
+    expect(
+      await screen.findByRole("option", { name: nameMatcher(knownOperator.label) })
+    ).toBeInTheDocument();
+  });
+
+  it.each([
+    ["responds non-ok", () => jsonResponse({}, { ok: false, status: 500 })],
+    ["rejects", () => Promise.reject(new Error("network error"))],
+  ])("still shows pages when the nav index fetch %s", async (_name, respond) => {
+    navFetchMock.mockImplementation(async () => respond());
+    const user = userEvent.setup();
+    renderPalette();
+    await openPalette(user);
+    await vi.waitFor(() => expect(navFetchMock).toHaveBeenCalledTimes(1));
+
+    expect(screen.getByRole("option", { name: /home/i })).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: /map/i })).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+});
+
+describe("CommandPalette — /api/nav-index retry after failure", () => {
+  it.each([
+    ["responds non-ok", () => jsonResponse({}, { ok: false, status: 429 })],
+    ["rejects", () => Promise.reject(new Error("network error"))],
+  ])("retries on the next open when the first fetch %s", async (_name, respond) => {
+    navFetchMock.mockImplementationOnce(async () => respond());
+    const user = userEvent.setup();
+    renderPalette();
+    await openPalette(user);
+    await vi.waitFor(() => expect(navFetchMock).toHaveBeenCalledTimes(1));
+
+    await user.keyboard("{Escape}");
+    await vi.waitFor(() => expect(screen.queryByRole("combobox")).not.toBeInTheDocument());
+    const combobox = await openPalette(user);
+    await vi.waitFor(() => expect(navFetchMock).toHaveBeenCalledTimes(2));
+
+    await user.type(combobox, knownOperator.label);
+    expect(
+      await screen.findByRole("option", { name: nameMatcher(knownOperator.label) })
+    ).toBeInTheDocument();
   });
 });
 
 describe("CommandPalette — global shortcut", () => {
   it("Ctrl+K opens the palette", async () => {
-    render(<CommandPalette index={searchIndex} navLinks={NAV_LINKS} />);
+    renderPalette();
 
     fireEvent.keyDown(window, { key: "k", ctrlKey: true });
 
@@ -108,7 +455,7 @@ describe("CommandPalette — global shortcut", () => {
   });
 
   it("Cmd+K (metaKey) opens the palette", async () => {
-    render(<CommandPalette index={searchIndex} navLinks={NAV_LINKS} />);
+    renderPalette();
 
     fireEvent.keyDown(window, { key: "k", metaKey: true });
 
@@ -116,13 +463,45 @@ describe("CommandPalette — global shortcut", () => {
   });
 });
 
+// The homepage hero's search affordance (components/home/hero-search.tsx)
+// dispatches this event instead of sharing state — the hero and the palette
+// live in different subtrees. hero-search.test.tsx covers the dispatch side;
+// these cover the receiving side, so the contract is tested at both ends
+// rather than only where it is emitted.
+describe("CommandPalette — compute-atlas:open-search event", () => {
+  it("opens the palette when the hero dispatches the open-search event", async () => {
+    renderPalette();
+
+    fireEvent(window, new CustomEvent("compute-atlas:open-search"));
+
+    expect(await screen.findByRole("combobox")).toBeInTheDocument();
+  });
+
+  it("opens with a cleared query rather than resuming an abandoned search", async () => {
+    const user = userEvent.setup();
+    renderPalette();
+
+    // Open via ⌘K, type, then dismiss with Escape — which does NOT clear the
+    // query on its own.
+    fireEvent.keyDown(window, { key: "k", metaKey: true });
+    const input = await screen.findByRole("combobox");
+    await user.type(input, "solar");
+    expect(input).toHaveValue("solar");
+    await user.keyboard("{Escape}");
+
+    // Reopening from the hero must present a blank search, not "solar".
+    fireEvent(window, new CustomEvent("compute-atlas:open-search"));
+
+    expect(await screen.findByRole("combobox")).toHaveValue("");
+  });
+});
+
 describe("CommandPalette — empty-query quick nav", () => {
   it("shows only the Pages group before typing, no data results", async () => {
     const user = userEvent.setup();
-    render(<CommandPalette index={searchIndex} navLinks={NAV_LINKS} />);
+    renderPalette();
 
-    await user.click(screen.getByRole("button", { name: /search/i }));
-    await screen.findByRole("combobox");
+    await openPalette(user);
 
     expect(screen.getByText("Pages")).toBeInTheDocument();
     expect(screen.getByRole("option", { name: /home/i })).toBeInTheDocument();
@@ -130,21 +509,31 @@ describe("CommandPalette — empty-query quick nav", () => {
     expect(screen.queryByText("Facilities")).not.toBeInTheDocument();
     expect(screen.queryByText("Operators")).not.toBeInTheDocument();
     expect(screen.queryByText("States")).not.toBeInTheDocument();
+
+    // An empty query must not hit /api/search at all. The palette debounces
+    // 200 ms before fetching (command-palette.tsx), so asserting immediately
+    // would pass even if an empty query DID schedule a fetch — wait past the
+    // debounce (plus margin) so a scheduled call has actually fired by the
+    // time this asserts.
+    await new Promise((resolve) => setTimeout(resolve, SEARCH_DEBOUNCE_MS + 150));
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 });
 
 describe("CommandPalette — keyboard navigation", () => {
   it("ArrowDown advances aria-activedescendant, Enter navigates to the active option", async () => {
+    // A fetched facility plus the local operator entry guarantees at least two
+    // options, so there is a next one to advance to.
+    fetchMock.mockImplementation(async () => jsonResponse({ facilities: [DB_FACILITY] }));
+
     const user = userEvent.setup();
-    render(<CommandPalette index={searchIndex} navLinks={NAV_LINKS} />);
+    renderPalette();
+    const combobox = await openPalette(user);
 
-    await user.click(screen.getByRole("button", { name: /search/i }));
-    const combobox = await screen.findByRole("combobox");
-
-    // "Google" reliably surfaces multiple facility results plus the
-    // Google operator entry, so there's a next option to advance to.
-    await user.type(combobox, "Google");
-    await screen.findAllByRole("option");
+    await user.type(combobox, knownOperator.label);
+    // Wait for the fetched facility before moving, so the option list is
+    // settled and ArrowDown lands deterministically.
+    await screen.findByRole("option", { name: nameMatcher(DB_FACILITY.name) });
 
     const firstActiveId = combobox.getAttribute("aria-activedescendant");
     expect(firstActiveId).toBeTruthy();
@@ -155,45 +544,107 @@ describe("CommandPalette — keyboard navigation", () => {
     expect(secondActiveId).toBeTruthy();
     expect(secondActiveId).not.toBe(firstActiveId);
 
-    const activeOptionLabel = document
-      .getElementById(secondActiveId!)
-      ?.textContent?.trim();
-    expect(activeOptionLabel).toBeTruthy();
+    // `GROUP_ORDER` (lib/search.ts) puts facilities first, so option 0 is the
+    // fetched facility and option 1 — the one ArrowDown just moved to — is the
+    // operator entry. Assert that identity explicitly: a pattern loose enough
+    // to admit both options would pass even if Enter ignored
+    // aria-activedescendant and always took option 0, which is the exact
+    // regression this test is named for.
+    const activeOptionLabel = document.getElementById(secondActiveId!)?.textContent?.trim();
+    expect(activeOptionLabel).toContain(knownOperator.label);
 
     await user.keyboard("{Enter}");
 
-    // Assert the specific navigation call rather than a total call count —
-    // pushMock is module-scoped and accumulates calls across tests in this
-    // file (matches the existing assertion style above).
-    expect(pushMock).toHaveBeenLastCalledWith(
-      expect.stringMatching(/^\/(facilities|operators)\//)
-    );
+    expect(pushMock).toHaveBeenLastCalledWith(knownOperator.href);
+    expect(pushMock).not.toHaveBeenCalledWith(`/facilities/${DB_FACILITY.id}`);
   });
 });
 
 describe("CommandPalette — no results", () => {
   it("shows the no-matches message for a nonsense query", async () => {
     const user = userEvent.setup();
-    render(<CommandPalette index={searchIndex} navLinks={NAV_LINKS} />);
-
-    await user.click(screen.getByRole("button", { name: /search/i }));
-    const combobox = await screen.findByRole("combobox");
+    renderPalette();
+    const combobox = await openPalette(user);
 
     await user.type(combobox, "zzzzznonexistentquery9999");
 
-    expect(
-      await screen.findByText(/no matches for/i)
-    ).toBeInTheDocument();
+    expect(await screen.findByText(/no matches for/i)).toBeInTheDocument();
+  });
+
+  it("offers a /contribute link for reporting the missing facility", async () => {
+    const user = userEvent.setup();
+    renderPalette();
+    const combobox = await openPalette(user);
+
+    await user.type(combobox, "zzzzznonexistentquery9999");
+    await screen.findByText(/no matches for/i);
+
+    const link = screen.getByRole("link", { name: /send us a link/i });
+    expect(link).toHaveAttribute("href", "/contribute");
+  });
+
+  it("activating the /contribute link navigates there and closes the dialog", async () => {
+    const user = userEvent.setup();
+    renderPalette();
+    const combobox = await openPalette(user);
+
+    await user.type(combobox, "zzzzznonexistentquery9999");
+    await screen.findByText(/no matches for/i);
+
+    // Same close-and-navigate contract as a real result click (see
+    // "clicking a fetched facility option navigates to its href" above):
+    // this reuses `go()` rather than a bare next/link navigation, so the
+    // dialog must not still be mounted afterwards.
+    await user.click(screen.getByRole("link", { name: /send us a link/i }));
+
+    expect(pushMock).toHaveBeenCalledWith("/contribute");
+    expect(screen.queryByRole("combobox")).not.toBeInTheDocument();
+  });
+
+  it("lets a modified click (e.g. opening in a new tab) fall through instead of intercepting it", async () => {
+    const user = userEvent.setup();
+    renderPalette();
+    const combobox = await openPalette(user);
+
+    await user.type(combobox, "zzzzznonexistentquery9999");
+    await screen.findByText(/no matches for/i);
+
+    // A Ctrl/Cmd/Shift/Alt/middle click must be left to the browser's own
+    // "open in new tab" handling, not routed through `go()` — the dialog
+    // stays open and the click never reaches the app router.
+    fireEvent.click(screen.getByRole("link", { name: /send us a link/i }), {
+      ctrlKey: true,
+    });
+
+    expect(pushMock).not.toHaveBeenCalledWith("/contribute");
+    expect(screen.getByRole("combobox")).toBeInTheDocument();
+  });
+
+  it("does not enter the arrow-key result list", async () => {
+    const user = userEvent.setup();
+    renderPalette();
+    const combobox = await openPalette(user);
+
+    await user.type(combobox, "zzzzznonexistentquery9999");
+    await screen.findByText(/no matches for/i);
+
+    // A nonsense query has zero options, so aria-activedescendant must stay
+    // unset both before and after ArrowDown. If the contribute link had been
+    // folded into `flat`, this would start pointing at it — the regression
+    // this guards against is the link shifting the option/index arithmetic
+    // that "ArrowDown advances aria-activedescendant..." above depends on.
+    expect(combobox).not.toHaveAttribute("aria-activedescendant");
+    await user.keyboard("{ArrowDown}");
+    expect(combobox).not.toHaveAttribute("aria-activedescendant");
   });
 });
 
 describe("CommandPalette — Escape closes", () => {
   it("pressing Escape closes the dialog", async () => {
     const user = userEvent.setup();
-    render(<CommandPalette index={searchIndex} navLinks={NAV_LINKS} />);
+    renderPalette();
 
-    await user.click(screen.getByRole("button", { name: /search/i }));
-    await screen.findByRole("combobox");
+    await openPalette(user);
 
     await user.keyboard("{Escape}");
 
@@ -201,86 +652,18 @@ describe("CommandPalette — Escape closes", () => {
   });
 });
 
-describe("CommandPalette — live DB search", () => {
-  const DB_ONLY_FACILITY: Facility = {
-    id: "notes-only-match",
-    name: "Zzyzx Data Campus",
-    operator: "Zzyzx Holdings",
-    status: "operational",
-    confidence: "confirmed",
-    facilityType: "data_center",
-    location: { lat: 39.0, lon: -77.0, state: "VA", city: "Ashburn" },
-  } as Facility;
-
-  afterEach(() => {
-    vi.unstubAllGlobals();
-  });
-
-  it("merges DB results in, matched only via mocked full-text search", async () => {
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async () => ({
-        ok: true,
-        json: async () => ({ facilities: [DB_ONLY_FACILITY] }),
-      }))
-    );
-
-    const user = userEvent.setup();
-    render(<CommandPalette index={searchIndex} navLinks={NAV_LINKS} />);
-
-    await user.click(screen.getByRole("button", { name: /search/i }));
-    const combobox = await screen.findByRole("combobox");
-
-    await user.type(combobox, "backup generator notes");
-
-    expect(
-      await screen.findByRole("option", { name: /zzyzx data campus/i })
-    ).toBeInTheDocument();
-
-    expect(global.fetch).toHaveBeenCalledWith(
-      expect.stringContaining("/api/search?q=backup"),
-      expect.anything()
-    );
-  });
-
-  it("degrades to Fuse-only results when the fetch fails", async () => {
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async () => {
-        throw new Error("network error");
-      })
-    );
-
-    const user = userEvent.setup();
-    render(<CommandPalette index={searchIndex} navLinks={NAV_LINKS} />);
-
-    await user.click(screen.getByRole("button", { name: /search/i }));
-    const combobox = await screen.findByRole("combobox");
-
-    await user.type(combobox, knownFacility.name);
-
-    expect(
-      await screen.findByRole("option", {
-        name: new RegExp(knownFacility.name, "i"),
-      })
-    ).toBeInTheDocument();
-    expect(screen.queryByText(/no matches for/i)).not.toBeInTheDocument();
-  });
-});
-
 describe("CommandPalette — reduced motion", () => {
   it("gates the popup and backdrop transitions behind motion-reduce", async () => {
     // Class-contract proxy only: jsdom can't evaluate the
     // `prefers-reduced-motion` media query itself — the cascade/exit-timing
-    // is browser-verified separately (the s60 lesson: a passing class
+    // is browser-verified separately (the lesson that earned this note: a passing class
     // assertion can coexist with a defeated media query). The backdrop has
     // no data-slot to query by, so it's located via its `fixed inset-0 z-50`
     // utility classes, which are unique to it (the popup lacks `inset-0`).
     const user = userEvent.setup();
-    render(<CommandPalette index={searchIndex} navLinks={NAV_LINKS} />);
+    renderPalette();
 
-    await user.click(screen.getByRole("button", { name: /search/i }));
-    await screen.findByRole("combobox");
+    await openPalette(user);
 
     const popup = screen.getByRole("dialog");
     const backdrop = document.body.querySelector(".fixed.inset-0.z-50");

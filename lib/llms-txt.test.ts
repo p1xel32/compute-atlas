@@ -1,0 +1,71 @@
+import { describe, it, expect } from "vitest";
+import { readFileSync } from "node:fs";
+import path from "node:path";
+import robots from "@/app/robots";
+import { DATASET_LICENSE_URL, siteConfig } from "@/lib/site";
+
+/**
+ * `public/llms.txt` is hand-written and served verbatim — nothing regenerates
+ * it, so every fact it restates can go stale in silence. These tests are the
+ * substitute for that missing build step: each one pins the file against the
+ * code that owns the fact, so changing the licence deed, the site URL
+ * or the Content-Signal directive turns this file red instead of leaving a
+ * published document quietly wrong.
+ */
+const LLMS_TXT = readFileSync(path.join(process.cwd(), "public/llms.txt"), "utf8");
+
+describe("public/llms.txt", () => {
+  it("carries no DOI or Zenodo reference", () => {
+    expect(LLMS_TXT).not.toMatch(/zenodo|10\.5281/i);
+  });
+
+  it("names the licence deed that the JSON-LD and the API Link header use", () => {
+    expect(LLMS_TXT).toContain(DATASET_LICENSE_URL);
+  });
+
+  it("keeps the dual licence intact — MIT for code, CC BY 4.0 for data", () => {
+    expect(LLMS_TXT).toContain("MIT");
+    expect(LLMS_TXT).toContain("CC BY 4.0");
+    expect(LLMS_TXT).toContain("LICENSE-DATA");
+  });
+
+  it("uses the site's own canonical URL", () => {
+    expect(LLMS_TXT).toContain(siteConfig.url);
+  });
+
+  it("restates the Content-Signal directive exactly as robots.txt emits it", () => {
+    const { rules } = robots();
+    const ruleList = Array.isArray(rules) ? rules : [rules];
+    const signal = ruleList[0].other?.["Content-Signal"];
+
+    expect(typeof signal).toBe("string");
+    expect(LLMS_TXT).toContain(`Content-Signal: ${signal}`);
+  });
+
+  it("points to /contribute for corrections, with the public-source requirement stated", () => {
+    expect(LLMS_TXT).toMatch(/compute-atlas\.com\/contribute\b/);
+    expect(LLMS_TXT).toMatch(/public source/i);
+  });
+
+  it("points to /about", () => {
+    expect(LLMS_TXT).toMatch(/compute-atlas\.com\/about\b/);
+  });
+
+  it("names no bulk file or bulk-access wording, and says how to cite a single record", () => {
+    expect(LLMS_TXT).not.toMatch(/bulk|paused|download/i);
+    expect(LLMS_TXT).toMatch(/facilities\/<id>/);
+    expect(LLMS_TXT).not.toContain("facilities.json");
+    expect(LLMS_TXT).not.toContain("raw.githubusercontent.com");
+  });
+
+  it("carries no facility, source or other moving count", () => {
+    // The file has no build step, so a live number in it goes stale silently.
+    // Every number it may legitimately contain is part of a fixed token: the
+    // licence version (CC BY 4.0). Anything
+    // else that reads like a tally — "1,929 facilities", "934 records" — is a
+    // figure that will drift. The file points at no data endpoint.
+    expect(LLMS_TXT).not.toMatch(/\d[\d,]*\s+(facilities|records|sites|sources|operators|states)\b/i);
+    expect(LLMS_TXT).not.toMatch(/\/api\b/);
+    expect(LLMS_TXT).not.toMatch(/remain open to\s+direct requests/);
+  });
+});

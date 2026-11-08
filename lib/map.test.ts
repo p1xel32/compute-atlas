@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
   INITIAL_VIEW_STATE,
+  WIDE_AND_TALL_VIEWPORT_QUERY,
   buildMarkerLabel,
   computeFacilitiesBounds,
 } from "@/lib/map";
@@ -29,7 +30,7 @@ const facilityFull: Facility = {
     {
       url: "https://example.com/source",
       label: "Example Article",
-      retrievedAt: "2024-01",
+      retrievedAt: "2024-01-01",
       kind: "press",
     },
   ],
@@ -55,7 +56,7 @@ const facilityNoCapacity: Facility = {
     {
       url: "https://example.com/source2",
       label: "Filing",
-      retrievedAt: "2024-01",
+      retrievedAt: "2024-01-01",
       kind: "permit",
     },
   ],
@@ -96,63 +97,43 @@ describe("INITIAL_VIEW_STATE", () => {
   });
 });
 
+describe("WIDE_AND_TALL_VIEWPORT_QUERY", () => {
+  // MapFilterSubheader and FacilityMap's Tools column both default open/
+  // expanded only when this query matches, so a landscape phone (wide but
+  // short) stays collapsed instead of squeezing the map to ~half the
+  // viewport. Consumer components each carry their own regression test
+  // proving THEY query this exact exported value (not a hardcoded second
+  // copy) — this block instead pins the value itself.
+  it("requires a minimum width of 640px", () => {
+    expect(WIDE_AND_TALL_VIEWPORT_QUERY).toContain("(min-width: 640px)");
+  });
+
+  it("requires a minimum height of 600px, so a viewport that's wide but short (e.g. a landscape phone) still fails", () => {
+    expect(WIDE_AND_TALL_VIEWPORT_QUERY).toContain("(min-height: 600px)");
+  });
+
+  it("combines both terms with AND, so both must hold rather than either alone", () => {
+    expect(WIDE_AND_TALL_VIEWPORT_QUERY).toBe(
+      "(min-width: 640px) and (min-height: 600px)"
+    );
+  });
+});
+
 describe("buildMarkerLabel", () => {
-  it("includes the facility name", () => {
-    expect(buildMarkerLabel(facilityFull)).toContain("Colossus");
+  it("reads \"Type — Status — ST\"", () => {
+    expect(buildMarkerLabel(facilityFull)).toBe("Data center — Operational — TN");
   });
 
-  it("includes the operator", () => {
-    expect(buildMarkerLabel(facilityFull)).toContain("xAI");
-  });
-
-  it("includes city when present", () => {
-    expect(buildMarkerLabel(facilityFull)).toContain("Memphis");
-  });
-
-  it("includes the state code", () => {
-    expect(buildMarkerLabel(facilityFull)).toContain("TN");
-  });
-
-  it("includes the human-readable status label", () => {
-    expect(buildMarkerLabel(facilityFull)).toContain("Operational");
-  });
-
-  it("includes the human-readable facility-type label", () => {
-    expect(buildMarkerLabel(facilityFull)).toContain("Data center");
-  });
-
-  it("includes operational capacity when present", () => {
-    const label = buildMarkerLabel(facilityFull);
-    expect(label).toContain("150");
-    expect(label).toContain("MW operational");
-  });
-
-  it("does not include planned capacity when operational capacity is present", () => {
-    // When both are present, operational takes precedence
-    const label = buildMarkerLabel(facilityFull);
-    expect(label).not.toContain("MW planned");
-  });
-
-  it("falls back to planned capacity when operational is absent", () => {
+  it("uses the human-readable labels, not raw enum values", () => {
     const label = buildMarkerLabel(facilityPlannedOnly);
-    expect(label).toContain("500");
-    expect(label).toContain("MW planned");
+    expect(label).not.toMatch(/data_center|crypto_mining|power_generation/);
   });
 
-  it("omits capacity segment entirely when capacityMw is absent", () => {
-    const label = buildMarkerLabel(facilityNoCapacity);
-    expect(label).not.toContain("MW");
-  });
-
-  it("handles a facility with no city (no 'undefined' in label)", () => {
-    const label = buildMarkerLabel(facilityNoCapacity);
-    expect(label).not.toContain("undefined");
-    expect(label).toContain("PA");
-  });
-
-  it("uses — as separator between parts", () => {
+  it("carries no name, operator, city or capacity (the client does not hold them)", () => {
     const label = buildMarkerLabel(facilityFull);
-    expect(label).toMatch(/—/);
+    for (const leaked of ["Colossus", "xAI", "Memphis", "MW"]) {
+      expect(label).not.toContain(leaked);
+    }
   });
 });
 

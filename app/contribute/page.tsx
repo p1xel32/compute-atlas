@@ -1,23 +1,38 @@
 import type { Metadata } from "next";
+import Link from "next/link";
 
 import { Breadcrumb } from "@/components/breadcrumb";
+import { PageMasthead } from "@/components/page-masthead";
+import { ContributeLeadForm } from "@/components/contribute/contribute-lead-form";
 import { ContributeFacilityForm } from "@/components/contribute/contribute-facility-form";
-import { siteConfig } from "@/lib/site";
+import { SupportCta } from "@/components/support-cta";
+import { submissionNotifyEnabled } from "@/lib/submission-notify";
 
 export const metadata: Metadata = {
-  title: "Contribute a facility",
+  title: "Share a lead",
   description:
-    "Suggest a data center, crypto-mining, or power-generation facility for Compute Atlas. Anonymous, source-cited, and reviewed before publishing.",
+    "Know about a data center, mining site, or power plant that isn't on Compute Atlas yet? Send a link and we'll take it from there — anonymous, source-cited, and checked before anything is published.",
   alternates: { canonical: "/contribute" },
 };
 
 /**
- * /contribute — public facility-submission form. Static server component;
- * all interactivity (form state, fetch, validation-error surfacing) lives in
- * the client component it renders. Mirrors the masthead structure of
- * /opposition (Breadcrumb -> header -> border-t -> body).
+ * /contribute — public lead-intake page. Static server component; all
+ * interactivity lives in the client components it renders. Lead-first: a
+ * bare source link is the whole ask (ContributeLeadForm), with the full
+ * facility form (name/operator/coordinates/etc.) tucked behind a closed-by-
+ * default <details> disclosure for contributors who already know the
+ * details — same disclosure idiom as app/operators/page.tsx's "no disclosed
+ * capacity" toggle. Mirrors the masthead structure of /opposition
+ * (Breadcrumb -> header -> border-t -> body).
  */
 export default function ContributePage() {
+  // Read at render time, never at module scope. This page is static, so the
+  // value is fixed at build; an env change needs a new deployment anyway,
+  // and that re-renders it. Passed down as a plain boolean;
+  // ContributeFacilityForm (a client component) never reads process.env
+  // itself. Leave ContributeLeadForm alone — it posts to /api/leads, a
+  // different table with no notify support.
+  const notifyEnabled = submissionNotifyEnabled();
   return (
     <div
       data-content-width="4xl"
@@ -25,22 +40,59 @@ export default function ContributePage() {
     >
       <Breadcrumb items={[{ label: "Explore", href: "/explore" }, { label: "Contribute" }]} />
 
-      <header className="space-y-4 pb-2">
-        <p className="font-mono text-xs uppercase tracking-widest text-primary">Contribute</p>
-        <h1 className="font-display text-4xl leading-[1.05] text-foreground sm:text-5xl">
-          Suggest a facility
-        </h1>
-        <p className="max-w-2xl text-base text-muted-foreground">
-          Know a data center, mining site, or power plant that isn&rsquo;t on the
-          map yet? Submit it below. No account needed &mdash; every submission
-          is anonymous, needs at least one public source, and is reviewed by a
-          person before it goes live. We ask for coordinates because the atlas
-          is a map first; a rough location beats none.
-        </p>
-        <div className="border-t border-border" />
-      </header>
+      <PageMasthead
+        eyebrow="Contribute"
+        title="Share a lead"
+        dek={
+          <>
+            Know about a data center, mining site, or power plant that
+            isn&rsquo;t on the map yet? Send the link &mdash; a news article,
+            permit filing, or press release &mdash; and we&rsquo;ll take it
+            from there. No account needed, and every submission is anonymous.
+            If you already know the details, the full form is below.
+          </>
+        }
+      />
 
-      <ContributeFacilityForm />
+      <ContributeLeadForm />
+
+      <details className="group border-t border-border pt-6">
+        <summary className="flex min-h-11 cursor-pointer list-none items-center gap-2 rounded-sm font-mono text-xs uppercase tracking-wider text-muted-foreground hover:text-foreground focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring">
+          I know the full details
+          <span
+            aria-hidden="true"
+            className="transition-transform motion-reduce:transition-none group-open:rotate-90"
+          >
+            →
+          </span>
+        </summary>
+        <div className="mt-6">
+          <ContributeFacilityForm notifyEnabled={notifyEnabled} />
+        </div>
+      </details>
+
+      {/* Not sure what to send? */}
+      <section
+        aria-labelledby="gaps-pointer-heading"
+        className="space-y-3 border-t border-border pt-10"
+      >
+        <p className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
+          § Where to help
+        </p>
+        <h2 id="gaps-pointer-heading" className="font-display text-2xl text-foreground">
+          Not sure what to send?
+        </h2>
+        <p className="max-w-2xl text-sm leading-relaxed text-muted-foreground">
+          <Link
+            href="/gaps"
+            className="underline underline-offset-4 hover:text-foreground focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring rounded-sm"
+          >
+            See where the dataset needs help
+          </Link>{" "}
+          &mdash; ranked by what a permit or utility filing can actually
+          resolve, with example facilities to start from.
+        </p>
+      </section>
 
       {/* Support the atlas */}
       <section
@@ -54,24 +106,22 @@ export default function ContributePage() {
           Support the atlas
         </h2>
         <p className="max-w-2xl text-sm leading-relaxed text-muted-foreground">
-          Compute Atlas is free, open, and ad-free. It runs on a small monthly
+          Compute Atlas is free, independent, and ad-free. It runs on a small monthly
           infrastructure budget &mdash; a database and hosting &mdash; that I
-          cover myself. If it&rsquo;s useful to you, sponsorship helps keep it
+          cover myself. If it&rsquo;s useful to you, a one-off tip helps keep it
           independent and growing. Either way, every figure stays traceable to a
           public source:{" "}
           <strong className="font-medium text-foreground">
-            sponsorship never changes what the record says.
+            support never changes what the record says.
           </strong>
         </p>
-        <a
-          href={siteConfig.sponsorUrl}
-          target="_blank"
-          rel="noreferrer noopener"
-          aria-label="Sponsor Compute Atlas on GitHub Sponsors (opens in new tab)"
-          className="inline-flex h-11 items-center gap-2 rounded-md border border-primary bg-primary/10 px-5 font-mono text-sm font-semibold uppercase tracking-wider text-primary transition-colors hover:bg-primary/20 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
-        >
-          Sponsor on GitHub <span aria-hidden="true">↗</span>
-        </a>
+        <SupportCta />
+        <p className="max-w-2xl text-sm leading-relaxed text-muted-foreground">
+          <Link href="/support" className="underline underline-offset-4 hover:text-foreground focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring rounded-sm">
+            More on how Compute Atlas is funded
+          </Link>{" "}
+          &mdash; including what support does not buy.
+        </p>
       </section>
     </div>
   );

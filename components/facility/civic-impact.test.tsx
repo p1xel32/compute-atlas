@@ -1,6 +1,12 @@
 import { describe, it, expect } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { render, screen, within } from "@testing-library/react";
 import { CivicImpactSection, hasCivicImpact } from "./civic-impact";
+import {
+  hasEconomics,
+  hasEmissions,
+  hasEnergyWater,
+  hasSubsidies,
+} from "@/lib/facility-gaps";
 import type { DataCenterFacility, CryptoMiningFacility } from "@/lib/schema";
 
 /** Minimal data-center Facility stub with required fields. */
@@ -93,6 +99,105 @@ describe("CivicImpactSection — Economics", () => {
     expect(screen.queryByText(/construction/i)).not.toBeInTheDocument();
     expect(screen.queryByText(/permanent/i)).not.toBeInTheDocument();
   });
+
+  // Regression: a sourced 0 (a documented "no jobs" finding, e.g. real
+  // record atterix-raton-digital-hub-nm) is established data, not a gap — it
+  // must render as "0 construction · 0 permanent" and must NOT trigger the
+  // "Know jobs?" gap prompt beside it. A truthy check on `jobs.construction`/
+  // `jobs.permanent` would drop both zeros and misrepresent known data as
+  // missing.
+  it("renders a sourced 0 for construction and permanent jobs, without a gap prompt", () => {
+    const facility = makeFacility({
+      investmentUsd: 1_000_000_000,
+      jobs: { construction: 0, permanent: 0, sourceIndex: 0 },
+    });
+    render(<CivicImpactSection facility={facility} />);
+
+    expect(screen.getByText(/0 construction · 0 permanent/)).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /know jobs\?/i })
+    ).not.toBeInTheDocument();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Economics — gap prompts (whole-group SectionGapPrompt vs. per-field
+// FieldGapPrompt, correctable vs. non-correctable)
+// ---------------------------------------------------------------------------
+describe("CivicImpactSection — Economics gap prompts", () => {
+  it("renders exactly one SectionGapPrompt tip trigger, and no Economics heading, when investmentUsd/landAcres/jobs are all absent", () => {
+    // energy keeps hasCivicImpact true so CivicImpactSection actually renders
+    // its sub-groups (otherwise the whole section — a different, untouched
+    // guard — would return null before EconomicsGroup ever runs).
+    const facility = makeFacility({ energy: { source: "grid" } });
+    render(<CivicImpactSection facility={facility} />);
+
+    // By role, not text — the stronger form, and repo convention. `getByRole`
+    // throws on more than one match, which is the "exactly one" half of this
+    // test's name.
+    expect(screen.getByRole("button", { name: /economic impact data/i })).toBeInTheDocument();
+    expect(screen.queryByRole("link", { name: /economic impact data/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "Economics" })).not.toBeInTheDocument();
+    expect(screen.queryByText("Investment")).not.toBeInTheDocument();
+  });
+
+  it("renders a correction-dialog trigger for a missing jobs field inside an otherwise-populated Economics group", () => {
+    const facility = makeFacility({ investmentUsd: 1_000_000 });
+    render(<CivicImpactSection facility={facility} />);
+
+    expect(screen.getByText("Investment")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /know jobs\?/i })).toBeInTheDocument();
+  });
+
+  it("renders the tip trigger, not a field-correction trigger, for a missing investmentUsd field inside an otherwise-populated Economics group", () => {
+    const facility = makeFacility({ jobs: { permanent: 100 } });
+    render(<CivicImpactSection facility={facility} />);
+
+    // investmentUsd is not in CORRECTABLE_KEYS, so the trigger is the "Know a
+    // source for …" tip invite (it opens the dialog), not "Know …?".
+    expect(
+      screen.getByRole("button", { name: /know a source for the investment amount/i })
+    ).toBeInTheDocument();
+    expect(screen.queryByRole("link", { name: /the investment amount/i })).not.toBeInTheDocument();
+  });
+
+  it("renders a per-field gap prompt inside a dt/dd pair, not as a bare <dl> child (WCAG 1.3.1 dl structure)", () => {
+    // Regression for a `dl element has direct children that are not
+    // allowed: div > a` axe violation — a FieldGapPrompt used to render as
+    // a bare `<div><a>...</a></div>` sibling of FactRow's `<div><dt/><dd/></div>`
+    // pairs inside the same `<dl>`. It must render through FactRow instead,
+    // so the gap prompt IS the `<dd>` of a normal term/definition pair.
+    const facility = makeFacility({ jobs: { permanent: 100 } });
+    render(<CivicImpactSection facility={facility} />);
+
+    const trigger = screen.getByRole("button", { name: /the investment amount/i });
+    expect(trigger.closest("dd")).toBeInTheDocument();
+    expect(trigger.closest("dd")?.previousElementSibling?.tagName).toBe("DT");
+
+    // Every direct child of the enclosing <dl> must be a <div> wrapping a
+    // dt/dd pair — never a bare <div><button>...</button></div>.
+    const dl = trigger.closest("dl") as HTMLElement;
+    for (const child of Array.from(dl.children)) {
+      expect(child.tagName).toBe("DIV");
+      expect(child.querySelector(":scope > dt")).toBeInTheDocument();
+      expect(child.querySelector(":scope > dd")).toBeInTheDocument();
+    }
+  });
+
+  it("renders Economics with no gap prompts when investmentUsd, landAcres, and jobs are all present", () => {
+    const facility = makeFacility({
+      investmentUsd: 1_000_000,
+      landAcres: 10,
+      jobs: { permanent: 50 },
+    });
+    render(<CivicImpactSection facility={facility} />);
+
+    const economicsGroup = screen
+      .getByRole("heading", { name: "Economics" })
+      .closest("div") as HTMLElement;
+    expect(within(economicsGroup).queryByRole("link")).not.toBeInTheDocument();
+    expect(within(economicsGroup).queryByRole("button")).not.toBeInTheDocument();
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -154,6 +259,350 @@ describe("CivicImpactSection — Energy & water", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Air permit (emissions) sub-group
+// ---------------------------------------------------------------------------
+describe("CivicImpactSection — Air permit (emissions)", () => {
+  it("renders every pollutant with its value and unit", () => {
+    const facility = makeFacility({
+      emissions: {
+        permittedTpy: {
+          nox: 245.5,
+          co: 120,
+          pm25: 8,
+          pm10: 10,
+          so2: 5,
+          voc: 15,
+          co2e: 250_000,
+        },
+      },
+    });
+    render(<CivicImpactSection facility={facility} />);
+
+    expect(screen.getByText("NOx")).toBeInTheDocument();
+    expect(screen.getByText("245.5 tons/yr")).toBeInTheDocument();
+    expect(screen.getByText("CO")).toBeInTheDocument();
+    expect(screen.getByText("120 tons/yr")).toBeInTheDocument();
+    expect(screen.getByText("PM2.5")).toBeInTheDocument();
+    expect(screen.getByText("8 tons/yr")).toBeInTheDocument();
+    expect(screen.getByText("PM10")).toBeInTheDocument();
+    expect(screen.getByText("10 tons/yr")).toBeInTheDocument();
+    expect(screen.getByText("SO2")).toBeInTheDocument();
+    expect(screen.getByText("5 tons/yr")).toBeInTheDocument();
+    expect(screen.getByText("VOC")).toBeInTheDocument();
+    expect(screen.getByText("15 tons/yr")).toBeInTheDocument();
+    expect(screen.getByText("CO2e")).toBeInTheDocument();
+    expect(screen.getByText("250,000 tons/yr")).toBeInTheDocument();
+  });
+
+  // Regression: a `0` permitted limit is a real regulatory fact (a pollutant
+  // a unit is prohibited from emitting) and must render, never be hidden by
+  // a truthy check. This is the single most likely bug in this unit.
+  it("renders a 0 permitted limit as '0 tons/yr' rather than hiding it, alongside a non-zero sibling", () => {
+    // A non-zero sibling (co: 12) is included deliberately: it keeps
+    // `hasContent` true under a truthy-check regression, so a failure here
+    // can only mean the NOx row itself was hidden — not that the whole
+    // group unmounted for an unrelated reason.
+    const facility = makeFacility({
+      emissions: { permittedTpy: { nox: 0, co: 12 } },
+    });
+    render(<CivicImpactSection facility={facility} />);
+
+    expect(screen.getByText("NOx")).toBeInTheDocument();
+    expect(screen.getByText("0 tons/yr")).toBeInTheDocument();
+    expect(screen.getByText("CO")).toBeInTheDocument();
+    expect(screen.getByText("12 tons/yr")).toBeInTheDocument();
+  });
+
+  it("renders the mandatory 'regulatory ceiling, not measured emissions' line whenever the group renders", () => {
+    const facility = makeFacility({
+      emissions: { permittedTpy: { nox: 10 } },
+    });
+    render(<CivicImpactSection facility={facility} />);
+
+    expect(
+      screen.getByText(/regulatory ceiling, not measured emissions/i)
+    ).toBeInTheDocument();
+  });
+
+  it("renders permit number, permit type label, issuing agency, and issued date", () => {
+    const facility = makeFacility({
+      emissions: {
+        permitNumber: "P0123456",
+        permitType: "title_v",
+        issuingAgency: "Texas Commission on Environmental Quality",
+        issuedDate: "2023-05-01",
+      },
+    });
+    render(<CivicImpactSection facility={facility} />);
+
+    expect(screen.getByText("Permit")).toBeInTheDocument();
+    expect(screen.getByText("P0123456")).toBeInTheDocument();
+    expect(screen.getByText("Permit type")).toBeInTheDocument();
+    expect(screen.getByText("Title V")).toBeInTheDocument();
+    expect(screen.getByText("Agency")).toBeInTheDocument();
+    expect(
+      screen.getByText("Texas Commission on Environmental Quality")
+    ).toBeInTheDocument();
+    expect(screen.getByText("Issued")).toBeInTheDocument();
+    expect(screen.getByText("2023-05-01")).toBeInTheDocument();
+  });
+
+  it("renders emissions notes as a muted paragraph, with no pollutants or permit metadata", () => {
+    // Deliberately no permittedTpy/permitNumber/permitType/issuingAgency/
+    // issuedDate — isolates that the `!!emissions.notes` disjunct in
+    // `hasContent` is what renders the group, not an incidental pollutant.
+    const facility = makeFacility({
+      emissions: { notes: "Permit under renewal as of 2026." },
+    });
+    render(<CivicImpactSection facility={facility} />);
+
+    expect(
+      screen.getByText("Permit under renewal as of 2026.")
+    ).toBeInTheDocument();
+  });
+
+  it("omits the Air permit group when emissions is absent", () => {
+    const facility = makeFacility({ investmentUsd: 1_000_000 });
+    render(<CivicImpactSection facility={facility} />);
+    expect(screen.queryByText("Air permit")).not.toBeInTheDocument();
+  });
+
+  // Renamed from "renders nothing": it no longer does. An empty emissions
+  // object now takes the same gap-prompt path as an absent one — see
+  // "Air permit, empty emissions object" at the foot of this file for what
+  // it renders INSTEAD. The panel-absence assertions below are unchanged.
+  it("renders no Air permit panel for emissions: {} (no pollutants, no permit metadata, no notes)", () => {
+    const facility = makeFacility({ emissions: {} });
+    render(<CivicImpactSection facility={facility} />);
+
+    expect(screen.queryByText("Air permit")).not.toBeInTheDocument();
+    expect(
+      screen.queryByText(/regulatory ceiling, not measured emissions/i)
+    ).not.toBeInTheDocument();
+  });
+
+  it("renders a source link for the cited permit source", () => {
+    const facility = makeFacility({
+      emissions: {
+        permittedTpy: { nox: 10 },
+        sourceIndex: 0,
+      },
+    });
+    render(<CivicImpactSection facility={facility} />);
+
+    const link = screen.getByRole("link", {
+      name: /Subsidy Source \(opens in new tab\)/i,
+    });
+    expect(link).toHaveAttribute("href", "https://example.com/subsidy-source");
+  });
+
+  it("renders 'Per unit' for basis alongside the tonnages", () => {
+    const facility = makeFacility({
+      emissions: {
+        permittedTpy: { nox: 5.6 },
+        basis: "per_unit",
+      },
+    });
+    render(<CivicImpactSection facility={facility} />);
+
+    expect(screen.getByText("Limits apply to")).toBeInTheDocument();
+    expect(screen.getByText("Per unit")).toBeInTheDocument();
+  });
+
+  it("renders 'Facility-wide' for basis alongside the tonnages", () => {
+    const facility = makeFacility({
+      emissions: {
+        permittedTpy: { nox: 1142.8 },
+        basis: "facility_wide",
+      },
+    });
+    render(<CivicImpactSection facility={facility} />);
+
+    expect(screen.getByText("Limits apply to")).toBeInTheDocument();
+    expect(screen.getByText("Facility-wide")).toBeInTheDocument();
+  });
+
+  it("renders unitsCovered and averagingPeriod when present", () => {
+    const facility = makeFacility({
+      emissions: {
+        permittedTpy: { nox: 1142.8 },
+        basis: "facility_wide",
+        unitsCovered: "Units 1-4 (combustion turbines)",
+        averagingPeriod: "rolling_12_month",
+      },
+    });
+    render(<CivicImpactSection facility={facility} />);
+
+    expect(screen.getByText("Units covered")).toBeInTheDocument();
+    expect(
+      screen.getByText("Units 1-4 (combustion turbines)")
+    ).toBeInTheDocument();
+    expect(screen.getByText("Averaging period")).toBeInTheDocument();
+    expect(screen.getByText("12-month rolling")).toBeInTheDocument();
+  });
+
+  // Fixture shaped like the real xAI/MZX permit from the pilot: every
+  // tonnage is per-turbine, the permit names the covered equipment, and GHG
+  // is capped only as a rate — there is no facility-wide CO2e tonnage at
+  // all. This must render the pollutants it has and must NOT render a CO2e
+  // row, and must not crash despite `co2e` being absent.
+  it("renders an xAI-shaped per-unit permit without a CO2e row and without crashing", () => {
+    const facility = makeFacility({
+      emissions: {
+        permittedTpy: { nox: 15.47, formaldehyde: 0.9 },
+        basis: "per_unit",
+        unitsCovered: "41 combustion turbines",
+        notes: "GHG capped only as a rate (<=120 lb/MMBtu), not an annual tonnage.",
+      },
+    });
+    render(<CivicImpactSection facility={facility} />);
+
+    expect(screen.getByText("NOx")).toBeInTheDocument();
+    expect(screen.getByText("Formaldehyde")).toBeInTheDocument();
+    expect(screen.getByText("Per unit")).toBeInTheDocument();
+    expect(screen.getByText("41 combustion turbines")).toBeInTheDocument();
+    expect(screen.queryByText("CO2e")).not.toBeInTheDocument();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Air permit — per-equipment-group limits (emissions.unitGroups)
+// ---------------------------------------------------------------------------
+describe("CivicImpactSection — Air permit unit groups", () => {
+  // Item-1 trap: a record with ONLY unitGroups (no top-level permittedTpy,
+  // no basis, no permit metadata) must still render the panel. Before the
+  // `unitGroups.length > 0` disjunct was added to `hasContent`, this shape
+  // computed `hasContent === false` and the whole panel silently rendered
+  // nothing — this is the xAI/MZX MS shape from the pilot.
+  it("renders the panel and both groups' values for a groups-only record (no top-level permittedTpy)", () => {
+    const facility = makeFacility({
+      emissions: {
+        unitGroups: [
+          {
+            label: "Solar Titan 350 turbines",
+            unitCount: 6,
+            basis: "per_unit",
+            permittedTpy: { nox: 14.98 },
+          },
+          {
+            label: "GE LM2500 turbines",
+            unitCount: 4,
+            basis: "per_unit",
+            permittedTpy: { nox: 13.44 },
+          },
+        ],
+      },
+    });
+    render(<CivicImpactSection facility={facility} />);
+
+    expect(screen.getByText("Air permit")).toBeInTheDocument();
+    expect(
+      screen.getByText(/regulatory ceiling, not measured emissions/i)
+    ).toBeInTheDocument();
+    expect(screen.getByText("Solar Titan 350 turbines")).toBeInTheDocument();
+    expect(screen.getByText("14.98 tons/yr")).toBeInTheDocument();
+    expect(screen.getByText("GE LM2500 turbines")).toBeInTheDocument();
+    expect(screen.getByText("13.44 tons/yr")).toBeInTheDocument();
+  });
+
+  it("renders unitCount when present and omits the Units row when absent", () => {
+    const facility = makeFacility({
+      emissions: {
+        unitGroups: [
+          {
+            label: "Turbines with a stated count",
+            unitCount: 6,
+            basis: "group_wide",
+            permittedTpy: { nox: 90 },
+          },
+          {
+            label: "Turbines without a stated count",
+            basis: "group_wide",
+            permittedTpy: { co: 30 },
+          },
+        ],
+      },
+    });
+    render(<CivicImpactSection facility={facility} />);
+
+    expect(screen.getByText("6 units")).toBeInTheDocument();
+    // Only one group states a unitCount, so exactly one "Units" row exists.
+    expect(screen.getAllByText("Units")).toHaveLength(1);
+  });
+
+  // A 0 tpy value in a group is a real regulatory fact (a pollutant a unit
+  // is prohibited from emitting) and must render, never be hidden by a
+  // truthy check — same rule as the facility-wide pollutant table above.
+  it("renders a 0 tpy value in a group rather than hiding it", () => {
+    const facility = makeFacility({
+      emissions: {
+        unitGroups: [
+          {
+            label: "Zero-NOx group",
+            basis: "group_wide",
+            permittedTpy: { nox: 0, co: 5 },
+          },
+        ],
+      },
+    });
+    render(<CivicImpactSection facility={facility} />);
+
+    expect(screen.getByText("NOx")).toBeInTheDocument();
+    expect(screen.getByText("0 tons/yr")).toBeInTheDocument();
+    expect(screen.getByText("CO")).toBeInTheDocument();
+    expect(screen.getByText("5 tons/yr")).toBeInTheDocument();
+  });
+
+  it("labels a per_unit group 'Per unit' and a group_wide group 'Group total'", () => {
+    const facility = makeFacility({
+      emissions: {
+        unitGroups: [
+          {
+            label: "Per-unit group",
+            basis: "per_unit",
+            permittedTpy: { nox: 1 },
+          },
+          {
+            label: "Group-wide group",
+            basis: "group_wide",
+            permittedTpy: { co: 2 },
+          },
+        ],
+      },
+    });
+    render(<CivicImpactSection facility={facility} />);
+
+    expect(screen.getByText("Per unit")).toBeInTheDocument();
+    expect(screen.getByText("Group total")).toBeInTheDocument();
+  });
+
+  // Regression: the pre-existing Homer City shape (facility_wide basis +
+  // top-level permittedTpy, no unitGroups) must render exactly as before,
+  // with no group markup (no <h4> sub-headings, no "Units" rows).
+  it("renders the pre-existing facility_wide shape unchanged when unitGroups is absent", () => {
+    const facility = makeFacility({
+      emissions: {
+        permittedTpy: { nox: 245.5, co2e: 250_000 },
+        basis: "facility_wide",
+        permitNumber: "PA-0012345",
+        permitType: "title_v",
+      },
+    });
+    render(<CivicImpactSection facility={facility} />);
+
+    expect(screen.getByText("NOx")).toBeInTheDocument();
+    expect(screen.getByText("245.5 tons/yr")).toBeInTheDocument();
+    expect(screen.getByText("Facility-wide")).toBeInTheDocument();
+    expect(screen.getByText("PA-0012345")).toBeInTheDocument();
+    expect(
+      screen.queryByRole("heading", { level: 4 })
+    ).not.toBeInTheDocument();
+    expect(screen.queryByText("Units")).not.toBeInTheDocument();
+    expect(screen.queryByText("Group total")).not.toBeInTheDocument();
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Public subsidies sub-group
 // ---------------------------------------------------------------------------
 describe("CivicImpactSection — Public subsidies", () => {
@@ -189,6 +638,14 @@ describe("CivicImpactSection — Public subsidies", () => {
     });
     render(<CivicImpactSection facility={facility} />);
     expect(screen.getByText("Subsidy")).toBeInTheDocument();
+  });
+
+  it("renders a correction-dialog trigger (not the tip trigger that opens the dialog on 'Something else') when subsidies is absent", () => {
+    const facility = makeFacility({ investmentUsd: 1_000_000 });
+    render(<CivicImpactSection facility={facility} />);
+    expect(
+      screen.getByRole("button", { name: /know a public subsidy\?/i })
+    ).toBeInTheDocument();
   });
 });
 
@@ -358,6 +815,13 @@ describe("hasCivicImpact", () => {
     expect(hasCivicImpact(facility)).toBe(true);
   });
 
+  it("returns true when only emissions is populated", () => {
+    const facility = makeFacility({
+      emissions: { permittedTpy: { nox: 10 } },
+    });
+    expect(hasCivicImpact(facility)).toBe(true);
+  });
+
   it("returns false for a crypto_mining facility with no mining, environmental, or other civic fields", () => {
     const facility = makeMiningFacility();
     expect(hasCivicImpact(facility)).toBe(false);
@@ -369,5 +833,140 @@ describe("CivicImpactSection — renders nothing when no civic fields present", 
     const facility = makeFacility();
     const { container } = render(<CivicImpactSection facility={facility} />);
     expect(container).toBeEmptyDOMElement();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Drift guard: the rendered empty-state prompts vs. lib/facility-gaps.ts
+//
+// The printed brief's consolidated nil line is built from the predicates in
+// lib/facility-gaps.ts; the groups below render their empty state from the
+// SAME functions. This test is what makes "the same" checkable — if a group
+// ever re-inlines its own condition (the shape all four of these were in
+// before), a fixture where the two disagree renders a gap prompt for a
+// section the summary calls recorded, or vice versa, and fails here.
+//
+// Every fixture keeps at least one civic datum so CivicImpactSection's own
+// outer hasCivicImpact guard doesn't return null before the groups run.
+// ---------------------------------------------------------------------------
+const CIVIC_SECTIONS = [
+  { name: "economics", predicate: hasEconomics, gapText: /economic impact data/i },
+  { name: "energy & water", predicate: hasEnergyWater, gapText: /energy or water data/i },
+  { name: "air permit", predicate: hasEmissions, gapText: /air permit data/i },
+  { name: "subsidies", predicate: hasSubsidies, gapText: /a public subsidy/i },
+] as const;
+
+describe("CivicImpactSection — empty states agree with lib/facility-gaps predicates", () => {
+  it.each([
+    // water without energy: the shape that catches an inlined `!energy`
+    // check, which would leave the group filled while the summary omits it.
+    ["water only", makeFacility({ water: { coolingType: "closed_loop" } })],
+    ["energy only", makeFacility({ energy: { source: "grid" } })],
+    ["land only", makeFacility({ landAcres: 295 })],
+    ["jobs only", makeFacility({ jobs: { permanent: 40 } })],
+    ["emissions only", makeFacility({ emissions: { permittedTpy: { nox: 10 } } })],
+    // Schema-valid but renders nothing: every emissionsSchema field is
+    // optional and the superRefine only fires once permittedTpy carries a
+    // defined pollutant. The group used to swallow this in a second, inner
+    // guard while hasEmissions reported the section present — the exact
+    // predicate/render disagreement this block exists to catch.
+    ["empty emissions object", makeFacility({ emissions: {} })],
+    // A citation with nothing to cite is the same case one field along.
+    ["emissions with only a sourceIndex", makeFacility({ emissions: { sourceIndex: 0 } })],
+    // A permitted 0.0 tpy limit is real data, not an absence — it must
+    // render, and must NOT be named as a gap.
+    [
+      "a zero pollutant limit",
+      makeFacility({ emissions: { permittedTpy: { nox: 0 }, basis: "facility_wide" } }),
+    ],
+    ["empty subsidies array", makeFacility({ energy: { source: "grid" }, subsidies: [] })],
+    [
+      "subsidies only",
+      makeFacility({ subsidies: [{ program: "Sales-tax exemption", sourceIndex: 0 }] }),
+    ],
+  ])("%s", (_case, facility) => {
+    render(<CivicImpactSection facility={facility} />);
+
+    for (const section of CIVIC_SECTIONS) {
+      const promptShown = screen.queryByText(section.gapText) !== null;
+      expect(
+        promptShown,
+        `${section.name}: prompt ${promptShown ? "shown" : "absent"}, predicate says ${
+          section.predicate(facility) ? "populated" : "empty"
+        }`
+      ).toBe(!section.predicate(facility));
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Regression: `emissions: {}` used to be swallowed by a second, inner guard.
+//
+// EmissionsGroup computed its own `hasContent` and returned bare `null` for an
+// emissions object with no renderable field, while `hasEmissions` reported the
+// section PRESENT because the object existed — so the printed brief's summary
+// omitted "air permit" on a page that showed no air permit. Latent rather than
+// live (5 of 1,571 exported records carry an emissions object, none empty),
+// but the module exists so that this class cannot occur.
+// ---------------------------------------------------------------------------
+describe("CivicImpactSection — Air permit, empty emissions object", () => {
+  it.each([
+    ["a bare object", {}],
+    ["only a sourceIndex", { sourceIndex: 0 }],
+  ])("renders the gap prompt and no panel for %s", (_case, emissions) => {
+    const facility = makeFacility({ emissions });
+    render(<CivicImpactSection facility={facility} />);
+
+    // The gap prompt renders INSTEAD of the panel — not alongside it, and not
+    // the bare `null` that left the section silently blank.
+    expect(screen.getByRole("button", { name: /air permit data/i })).toBeInTheDocument();
+    expect(
+      screen.queryByRole("heading", { name: "Air permit" })
+    ).not.toBeInTheDocument();
+    expect(screen.queryByText(/regulatory ceiling/i)).not.toBeInTheDocument();
+  });
+
+  it("still renders the panel for a permit whose only content is a 0.0 tpy limit", () => {
+    const facility = makeFacility({
+      emissions: { permittedTpy: { nox: 0 }, basis: "facility_wide" },
+    });
+    render(<CivicImpactSection facility={facility} />);
+
+    expect(screen.getByRole("heading", { name: "Air permit" })).toBeInTheDocument();
+    expect(
+      screen.queryByRole("link", { name: /air permit data/i })
+    ).not.toBeInTheDocument();
+  });
+});
+
+describe("CivicImpactSection — notRecorded", () => {
+  it("renders 'Not recorded' with the reason for a marked energy/water field", () => {
+    const facility = makeFacility({
+      notRecorded: { "energy.utility": "The utility is not named in any public filing." },
+    });
+    render(<CivicImpactSection facility={facility} />);
+    expect(
+      screen.getByText(/Not recorded — The utility is not named in any public filing\./)
+    ).toBeInTheDocument();
+  });
+});
+
+describe("CivicImpactSection — notRecorded as the only data", () => {
+  const headings = (container: HTMLElement) =>
+    Array.from(container.querySelectorAll("h2, h3")).map((h) => h.textContent);
+
+  it("renders the same groups as a record with a single real energy data point", () => {
+    const marked = render(
+      <CivicImpactSection
+        facility={makeFacility({ notRecorded: { "energy.utility": "The utility is not named in any public filing." } })}
+      />
+    );
+    const markedHeadings = headings(marked.container);
+    marked.unmount();
+    const real = render(
+      <CivicImpactSection facility={makeFacility({ energy: { source: "grid" } })} />
+    );
+    expect(markedHeadings.length).toBeGreaterThan(0);
+    expect(markedHeadings).toEqual(headings(real.container));
   });
 });

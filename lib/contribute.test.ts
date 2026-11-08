@@ -1,15 +1,18 @@
 import { describe, it, expect } from "vitest";
 
 import {
+  slugBase,
   slugify,
   isHoneypotTripped,
   buildCreatePayload,
   buildCorrectionPatch,
+  CORRECTABLE_FIELDS,
   contributeInputSchema,
   sanitizeAttribution,
   type CreateContributeInput,
   type CorrectionContributeInput,
 } from "@/lib/contribute";
+import { mergeFacilityPatch } from "@/lib/facility-patch";
 import { facilitySchema, type DataCenterFacility } from "@/lib/schema";
 
 const TODAY = "2026-07-14";
@@ -57,6 +60,66 @@ describe("isHoneypotTripped", () => {
 
   it("returns true for non-empty website", () => {
     expect(isHoneypotTripped({ website: "http://spam.example" })).toBe(true);
+  });
+
+  // The type-flip oracle this predicate was widened to close: the three intake
+  // routes used to gate this check on `typeof rawWebsite === "string"`, so
+  // `{"website":1,"email":"bad"}` fell through to Zod and answered 400 with
+  // `issues` while `{"website":"x","email":"bad"}` answered 201. Every type must
+  // now answer identically.
+  it.each([
+    ["a number", 1],
+    ["zero", 0],
+    ["a negative number", -1],
+    ["true", true],
+    ["an object", { a: 1 }],
+    ["an empty object", {}],
+    ["a non-empty array", ["x"]],
+    ["a whitespace-padded string", "  x  "],
+  ])("trips on %s (non-empty after coercion)", (_label, website) => {
+    expect(isHoneypotTripped({ website })).toBe(true);
+  });
+
+  it.each([
+    ["undefined (absent)", undefined],
+    ["null", null],
+    ["false", false],
+    ["an empty array (coerces to \"\")", []],
+  ])("does NOT trip on %s — present but not filled in", (_label, website) => {
+    expect(isHoneypotTripped({ website })).toBe(false);
+  });
+
+  it("does not trip on null or false even though String() would make them non-empty", () => {
+    // Guards the explicit early return: without it, String(null) === "null" and
+    // String(false) === "false" would both trip, and a client sending a JSON
+    // null for an untouched hidden input would be silently treated as a bot.
+    expect(String(null)).not.toBe("");
+    expect(String(false)).not.toBe("");
+    expect(isHoneypotTripped({ website: null })).toBe(false);
+    expect(isHoneypotTripped({ website: false })).toBe(false);
+  });
+});
+
+describe("slugBase", () => {
+  it("returns the slug-safe part of a name, matching what slugify embeds", () => {
+    expect(slugBase("Example Data Center")).toBe("example-data-center");
+    // Same expression slugify uses — that shared derivation is the point.
+    expect(slugify("Example Data Center", "VA")).toBe(`${slugBase("Example Data Center")}-va`);
+  });
+
+  it.each([
+    ["dots", "..."],
+    ["dashes", "---"],
+    ["a bullet", "\u2022"],
+    ["mixed punctuation", "!?!?"],
+    ["whitespace", "   "],
+    ["an underscore", "_"],
+  ])("is EMPTY for a punctuation-only name (%s)", (_label, name) => {
+    expect(slugBase(name)).toBe("");
+    // Which is exactly the bug: slugify then produces a bare "-xx" id, and
+    // lib/schema.ts's /^[a-z0-9-]+$/ id pattern accepts it.
+    expect(slugify(name, "VA")).toBe("-va");
+    expect(slugify(name, "VA")).toMatch(/^[a-z0-9-]+$/);
   });
 });
 
@@ -221,6 +284,220 @@ describe("buildCorrectionPatch nested-merge safety", () => {
     const result = buildCorrectionPatch(existing, input, TODAY);
     expect("error" in result).toBe(true);
   });
+
+  it("appends a new subsidy record with the corrected amount, preserving existing subsidies", () => {
+    const existing = baseExistingFacility({
+      subsidies: [{ program: "Existing Abatement", amountUsd: 1_000_000 }],
+    });
+    const input: CorrectionContributeInput = {
+      kind: "correction",
+      targetFacilityId: existing.id,
+      field: "subsidies",
+      value: 5_000_000,
+      sourceUrl: "https://example.com/subsidy-correction",
+    };
+    const result = buildCorrectionPatch(existing, input, TODAY);
+    expect("payload" in result).toBe(true);
+    if ("payload" in result) {
+      const subsidies = result.payload.subsidies as Array<{ amountUsd?: number; sourceIndex?: number }>;
+      expect(subsidies).toHaveLength(2);
+      expect(subsidies[0]).toEqual({ program: "Existing Abatement", amountUsd: 1_000_000 });
+      expect(subsidies[1]).toEqual({ amountUsd: 5_000_000, sourceIndex: existing.sources.length });
+      const preview = { ...existing, ...result.payload, id: existing.id };
+      expect(facilitySchema.safeParse(preview).success).toBe(true);
+    }
+  });
+
+  it("points the new subsidy's sourceIndex at the correction's own appended source", () => {
+    const existing = baseExistingFacility({
+      subsidies: [{ program: "Existing Abatement", amountUsd: 1_000_000 }],
+    });
+    const input: CorrectionContributeInput = {
+      kind: "correction",
+      targetFacilityId: existing.id,
+      field: "subsidies",
+      value: 5_000_000,
+      sourceUrl: "https://example.com/subsidy-correction",
+    };
+    const result = buildCorrectionPatch(existing, input, TODAY);
+    expect("payload" in result).toBe(true);
+    if ("payload" in result) {
+      const subsidies = result.payload.subsidies as Array<{ sourceIndex?: number }>;
+      const sources = result.payload.sources as Array<{ label: string; url: string }>;
+      const newSubsidy = subsidies[subsidies.length - 1];
+      expect(newSubsidy.sourceIndex).toBeDefined();
+      const resolvedSource = sources[newSubsidy.sourceIndex as number];
+      expect(resolvedSource.label).toBe("Correction source");
+      expect(resolvedSource.url).toBe("https://example.com/subsidy-correction");
+    }
+  });
+
+  it("sets jobs.permanent while preserving jobs.construction", () => {
+    const existing = baseExistingFacility({
+      jobs: { construction: 300, permanent: 40 },
+    });
+    const input: CorrectionContributeInput = {
+      kind: "correction",
+      targetFacilityId: existing.id,
+      field: "jobs",
+      value: 75,
+      sourceUrl: "https://example.com/jobs-correction",
+    };
+    const result = buildCorrectionPatch(existing, input, TODAY);
+    expect("payload" in result).toBe(true);
+    if ("payload" in result) {
+      expect(result.payload.jobs).toEqual({ construction: 300, permanent: 75 });
+      const preview = { ...existing, ...result.payload, id: existing.id };
+      expect(facilitySchema.safeParse(preview).success).toBe(true);
+    }
+  });
+
+  it("rejects a correction targeting a still-deferred field like stakeholders", () => {
+    const existing = baseExistingFacility();
+    const input = {
+      kind: "correction",
+      targetFacilityId: existing.id,
+      field: "stakeholders",
+      value: "Jane Doe",
+      sourceUrl: "https://example.com/correction",
+    };
+    const parsed = contributeInputSchema.safeParse(input);
+    expect(parsed.success).toBe(false);
+  });
+
+  it("sets water.coolingType while preserving reportedMgd and notes", () => {
+    const existing = baseExistingFacility({
+      water: { reportedMgd: 1.2, notes: "existing note" },
+    });
+    const input: CorrectionContributeInput = {
+      kind: "correction",
+      targetFacilityId: existing.id,
+      field: "water",
+      value: "closed_loop",
+      sourceUrl: "https://example.com/water-correction",
+    };
+    const result = buildCorrectionPatch(existing, input, TODAY);
+    expect("payload" in result).toBe(true);
+    if ("payload" in result) {
+      expect(result.payload.water).toEqual({
+        reportedMgd: 1.2,
+        notes: "existing note",
+        coolingType: "closed_loop",
+      });
+      const preview = { ...existing, ...result.payload, id: existing.id };
+      expect(facilitySchema.safeParse(preview).success).toBe(true);
+    }
+  });
+
+  it("rejects an invalid enum value for water", () => {
+    const existing = baseExistingFacility();
+    const input: CorrectionContributeInput = {
+      kind: "correction",
+      targetFacilityId: existing.id,
+      field: "water",
+      value: "not-a-real-cooling-type",
+      sourceUrl: "https://example.com/correction",
+    };
+    const result = buildCorrectionPatch(existing, input, TODAY);
+    expect("error" in result).toBe(true);
+  });
+
+  it("sets energy.source while preserving utility and onSiteGenerationMw", () => {
+    const existing = baseExistingFacility({
+      energy: { utility: "Dominion", onSiteGenerationMw: 5 },
+    });
+    const input: CorrectionContributeInput = {
+      kind: "correction",
+      targetFacilityId: existing.id,
+      field: "energy",
+      value: "on_site_gas",
+      sourceUrl: "https://example.com/energy-correction",
+    };
+    const result = buildCorrectionPatch(existing, input, TODAY);
+    expect("payload" in result).toBe(true);
+    if ("payload" in result) {
+      expect(result.payload.energy).toEqual({
+        utility: "Dominion",
+        onSiteGenerationMw: 5,
+        source: "on_site_gas",
+      });
+      const preview = { ...existing, ...result.payload, id: existing.id };
+      expect(facilitySchema.safeParse(preview).success).toBe(true);
+    }
+  });
+
+  it("rejects an invalid enum value for energy", () => {
+    const existing = baseExistingFacility();
+    const input: CorrectionContributeInput = {
+      kind: "correction",
+      targetFacilityId: existing.id,
+      field: "energy",
+      value: "cold_fusion",
+      sourceUrl: "https://example.com/correction",
+    };
+    const result = buildCorrectionPatch(existing, input, TODAY);
+    expect("error" in result).toBe(true);
+  });
+
+  it("sets emissions.permitNumber while preserving other emissions fields", () => {
+    const existing = baseExistingFacility({
+      emissions: { issuingAgency: "Texas CEQ", notes: "existing note" },
+    });
+    const input: CorrectionContributeInput = {
+      kind: "correction",
+      targetFacilityId: existing.id,
+      field: "emissions",
+      value: "TCEQ-177263",
+      sourceUrl: "https://example.com/emissions-correction",
+    };
+    const result = buildCorrectionPatch(existing, input, TODAY);
+    expect("payload" in result).toBe(true);
+    if ("payload" in result) {
+      expect(result.payload.emissions).toEqual({
+        issuingAgency: "Texas CEQ",
+        notes: "existing note",
+        permitNumber: "TCEQ-177263",
+      });
+      const preview = { ...existing, ...result.payload, id: existing.id };
+      expect(facilitySchema.safeParse(preview).success).toBe(true);
+    }
+  });
+
+  it("sets community.status while preserving community.notes", () => {
+    const existing = baseExistingFacility({
+      community: { notes: "existing note" },
+    });
+    const input: CorrectionContributeInput = {
+      kind: "correction",
+      targetFacilityId: existing.id,
+      field: "community",
+      value: "contested",
+      sourceUrl: "https://example.com/community-correction",
+    };
+    const result = buildCorrectionPatch(existing, input, TODAY);
+    expect("payload" in result).toBe(true);
+    if ("payload" in result) {
+      expect(result.payload.community).toEqual({
+        notes: "existing note",
+        status: "contested",
+      });
+      const preview = { ...existing, ...result.payload, id: existing.id };
+      expect(facilitySchema.safeParse(preview).success).toBe(true);
+    }
+  });
+
+  it("rejects an invalid enum value for community", () => {
+    const existing = baseExistingFacility();
+    const input: CorrectionContributeInput = {
+      kind: "correction",
+      targetFacilityId: existing.id,
+      field: "community",
+      value: "not-a-real-status",
+      sourceUrl: "https://example.com/correction",
+    };
+    const result = buildCorrectionPatch(existing, input, TODAY);
+    expect("error" in result).toBe(true);
+  });
 });
 
 describe("contributeInputSchema length caps", () => {
@@ -241,6 +518,20 @@ describe("contributeInputSchema length caps", () => {
     };
     const result = contributeInputSchema.safeParse(input);
     expect(result.success).toBe(false);
+  });
+
+  it("rejects a correction whose targetFacilityId exceeds 120 characters", () => {
+    const input = {
+      kind: "correction",
+      targetFacilityId: "a".repeat(121),
+      field: "name",
+      value: "x",
+      sourceUrl: "https://example.com/correction",
+    };
+    expect(contributeInputSchema.safeParse(input).success).toBe(false);
+    expect(
+      contributeInputSchema.safeParse({ ...input, targetFacilityId: "a".repeat(120) }).success
+    ).toBe(true);
   });
 });
 
@@ -282,5 +573,222 @@ describe("sanitizeAttribution", () => {
 
   it("passes a clean handle through unchanged", () => {
     expect(sanitizeAttribution("grid_watcher-42")).toBe("grid_watcher-42");
+  });
+});
+
+// --- Finding 4: intake accepted any 2-char state and punctuation-only names.
+// Both were queue-noise/data-rigor issues caught by human review, so this only
+// changes what intake ACCEPTS — nothing here touches already-staged rows.
+
+describe("contributeInputSchema state validation", () => {
+  it.each(["VA", "va", "Va", "DC", "PR", "GU", "MP", "VI", "AK", "HI"])(
+    "accepts the real jurisdiction code %s (case-insensitive, territories included)",
+    (state) => {
+      expect(contributeInputSchema.safeParse(baseCreateInput({ state })).success).toBe(true);
+    }
+  );
+
+  it.each(["ZZ", "zz", "XX", "QQ", "A1", "--"])(
+    "rejects the non-existent 2-letter code %s",
+    (state) => {
+      // `z.string().length(2)` was the whole check, so "ZZ" staged a pending
+      // submission and facilitySchema (also `length(2)`) accepted it too.
+      const result = contributeInputSchema.safeParse(baseCreateInput({ state }));
+      expect(result.success).toBe(false);
+      const issue = result.error!.issues.find((i) => i.path.includes("state"));
+      expect(issue).toBeDefined();
+      expect(issue!.message).toContain("Unknown US state or territory code");
+    }
+  );
+
+  it("reports ONLY the length problem for a wrong-length value, never both issues", () => {
+    // Zod v4 runs a `.refine()` even after an earlier check in the chain fails,
+    // so the refinement deliberately passes on non-2-character input (see
+    // `usStateCodeSchema`). Without that escape this field reports two issues at
+    // once and the form, which keys errors by `issue.path[0]`, shows whichever
+    // it picks.
+    const result = contributeInputSchema.safeParse(baseCreateInput({ state: "Virginia" }));
+    expect(result.success).toBe(false);
+    const stateIssues = result.error!.issues.filter((i) => i.path.includes("state"));
+    expect(stateIssues).toHaveLength(1);
+    expect(stateIssues[0].message).not.toContain("Unknown US state or territory code");
+  });
+});
+
+describe("contributeInputSchema name validation (non-empty slug base)", () => {
+  it.each([
+    ["dots", "..."],
+    ["dashes", "---"],
+    ["a bullet", "\u2022"],
+    ["mixed punctuation", "!?!?"],
+    ["an underscore", "_"],
+    ["an emoji", "\u{1F600}"],
+  ])("rejects the punctuation-only name %s, which would slugify to a bare '-xx' id", (_label, name) => {
+    const result = contributeInputSchema.safeParse(baseCreateInput({ name }));
+    expect(result.success).toBe(false);
+    const issue = result.error!.issues.find((i) => i.path.includes("name"));
+    expect(issue).toBeDefined();
+    expect(issue!.message).toContain("at least one letter or number");
+  });
+
+  it.each([
+    "Example Data Center",
+    "DC1",
+    "Caf\u00e9's \u00dcn\u00efcode Facility, LLC!",
+    "\u2022 Site 7",
+    "7",
+  ])("accepts %s — a name with at least one alphanumeric survives", (name) => {
+    expect(contributeInputSchema.safeParse(baseCreateInput({ name })).success).toBe(true);
+    expect(slugBase(name).length).toBeGreaterThan(0);
+  });
+
+  it("rejects an empty name with ONLY the min(1) issue, never both", () => {
+    // Same Zod-v4 double-issue escape as the state field above.
+    const result = contributeInputSchema.safeParse(baseCreateInput({ name: "" }));
+    expect(result.success).toBe(false);
+    const nameIssues = result.error!.issues.filter((i) => i.path.includes("name"));
+    expect(nameIssues).toHaveLength(1);
+    expect(nameIssues[0].message).not.toContain("at least one letter or number");
+  });
+});
+
+describe("public-correction pre-validation merge", () => {
+  // submitContribution previews an update with mergeFacilityPatch instead of the
+  // plain `{...existing, ...payload}` it used before. That swap is only safe
+  // while every patch buildCorrectionPatch can emit merges identically, which
+  // holds because `state` builds a COMPLETE location (it spreads the existing
+  // one, so lat, lon and state are all present and the helper replaces).
+  function validValue(def: (typeof CORRECTABLE_FIELDS)[number]): string | number {
+    switch (def.valueKind) {
+      case "number":
+        return 75;
+      case "enum":
+        return def.enumValues![0];
+      case "state":
+        return "sc";
+      default:
+        return "Corrected value";
+    }
+  }
+
+  it.each(CORRECTABLE_FIELDS.map((def) => [def.key, def] as const))(
+    "merges the %s correction patch exactly as a plain spread would",
+    (_key, def) => {
+      const existing = baseExistingFacility({
+        location: { lat: 38.0, lon: -77.0, state: "VA", precision: "exact", city: "Reston", county: "Fairfax" },
+      });
+      const result = buildCorrectionPatch(
+        existing,
+        {
+          kind: "correction",
+          targetFacilityId: existing.id,
+          field: def.key,
+          value: validValue(def),
+          sourceUrl: "https://example.com/correction",
+        },
+        TODAY
+      );
+      expect("payload" in result).toBe(true);
+      if (!("payload" in result)) return;
+
+      expect(mergeFacilityPatch(existing, result.payload)).toEqual({ ...existing, ...result.payload });
+    }
+  );
+
+  it("keeps an exact pin and its city when only the state is corrected", () => {
+    const existing = baseExistingFacility({
+      location: { lat: 38.0, lon: -77.0, state: "VA", precision: "exact", city: "Reston" },
+    });
+    const result = buildCorrectionPatch(
+      existing,
+      {
+        kind: "correction",
+        targetFacilityId: existing.id,
+        field: "state",
+        value: "nc",
+        sourceUrl: "https://example.com/correction",
+      },
+      TODAY
+    );
+    expect("payload" in result).toBe(true);
+    if (!("payload" in result)) return;
+
+    const parsed = facilitySchema.safeParse({
+      ...mergeFacilityPatch(existing, result.payload),
+      id: existing.id,
+    });
+    expect(parsed.success).toBe(true);
+    if (!parsed.success) return;
+    expect(parsed.data.location).toEqual({
+      lat: 38.0,
+      lon: -77.0,
+      state: "NC",
+      precision: "exact",
+      city: "Reston",
+    });
+  });
+});
+
+describe("buildCorrectionPatch state field validation", () => {
+  it("rejects a correction that would set an existing facility's state to a non-existent code", () => {
+    // The other door into the same field: facilitySchema's location.state is
+    // `z.string().length(2)` too, so "ZZ" would have validated and staged.
+    const existing = baseExistingFacility();
+    const input: CorrectionContributeInput = {
+      kind: "correction",
+      targetFacilityId: existing.id,
+      field: "state",
+      value: "ZZ",
+      sourceUrl: "https://example.com/correction",
+    };
+    const result = buildCorrectionPatch(existing, input, TODAY);
+    expect("error" in result).toBe(true);
+    expect((result as { error: string }).error).toContain("real US state or territory code");
+  });
+
+  it("accepts a correction to a real code, normalising case", () => {
+    const existing = baseExistingFacility();
+    const result = buildCorrectionPatch(
+      existing,
+      {
+        kind: "correction",
+        targetFacilityId: existing.id,
+        field: "state",
+        value: "tx",
+        sourceUrl: "https://example.com/correction",
+      },
+      TODAY
+    );
+    expect("payload" in result).toBe(true);
+    const location = (result as { payload: { location: { state: string } } }).payload.location;
+    expect(location.state).toBe("TX");
+  });
+
+  it("still reports the LENGTH problem for a wrong-length correction value", () => {
+    const existing = baseExistingFacility();
+    const result = buildCorrectionPatch(
+      existing,
+      {
+        kind: "correction",
+        targetFacilityId: existing.id,
+        field: "state",
+        value: "Texas",
+        sourceUrl: "https://example.com/correction",
+      },
+      TODAY
+    );
+    expect((result as { error: string }).error).toContain("2-letter code");
+  });
+});
+
+describe("notRecorded is not accepted from public intake", () => {
+  it("is stripped by the create schema and absent from the built payload", () => {
+    const parsed = contributeInputSchema.parse({
+      ...baseCreateInput(),
+      notRecorded: { "capacityMw.operational": "Attacker-supplied reason text." },
+    });
+    expect("notRecorded" in parsed).toBe(false);
+    const payload = buildCreatePayload(parsed as CreateContributeInput, TODAY);
+    expect("notRecorded" in payload).toBe(false);
   });
 });

@@ -161,7 +161,7 @@ describe("Select", () => {
 
   // jsdom can't evaluate the prefers-reduced-motion media query, so this asserts
   // the class contract: the enter/exit animation must be paired with the
-  // motion-reduce: variant that disables it (s59 reduced-motion gating). The `!`
+  // motion-reduce: variant that disables it (reduced-motion gating). The `!`
   // important modifier is required because `data-open:animate-in`/
   // `data-closed:animate-out` out-specify a plain utility (attribute selector);
   // verified in-browser that only the important form wins the cascade and gates
@@ -170,5 +170,16 @@ describe("Select", () => {
     render(<Fixture defaultOpen />);
     const content = document.querySelector('[data-slot="select-content"]');
     expect(content).toHaveClass("motion-reduce:animate-none!");
+  });
+
+  // Forced-colors outline fallback; see the Input test for why each class matters.
+  it("keeps a forced-colors focus outline on the trigger alongside outline-none", () => {
+    render(<Fixture />);
+    expect(screen.getByRole("combobox")).toHaveClass(
+      "outline-none",
+      "focus-visible:outline-2",
+      "focus-visible:outline-solid",
+      "focus-visible:outline-transparent"
+    );
   });
 });

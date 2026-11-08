@@ -1,0 +1,490 @@
+import { describe, it, expect } from "vitest";
+import {
+  buildStaticRoutes,
+  buildStateRoutes,
+  buildOperatorRoutes,
+  buildStakeholderRoutes,
+  buildFacilityRoutes,
+  buildStatusRoutes,
+  buildMetroRoutes,
+  buildLearnRoutes,
+  buildCountyRoutes,
+  MIN_FACILITIES_FOR_OPERATOR_SITEMAP,
+  MIN_FACILITIES_FOR_COUNTY_SITEMAP,
+} from "@/lib/sitemap-routes";
+import {
+  getAllFacilities,
+  getStates,
+  getOperators,
+  operatorSlug,
+  getFacilitiesByMetro,
+  getCounties,
+  getFacilitiesByCounty,
+} from "@/lib/data";
+import { stateSlugFromCode } from "@/lib/us-states";
+import { STATUS_ORDER } from "@/lib/status";
+import { METROS } from "@/lib/metros";
+import { GLOSSARY_TOPICS } from "@/lib/glossary";
+import { siteConfig } from "@/lib/site";
+
+describe("sitemap", () => {
+  it("static routes include /, /map, /table, /states, /power, /opposition, /stats, /about, /explore, /activity, /contribute, /support, and /contact", async () => {
+    const routes = await buildStaticRoutes();
+    const urls = routes.map((r) => r.url);
+    expect(urls).toContain(siteConfig.url);
+    expect(urls).toContain(`${siteConfig.url}/map`);
+    expect(urls).toContain(`${siteConfig.url}/table`);
+    expect(urls).toContain(`${siteConfig.url}/states`);
+    expect(urls).toContain(`${siteConfig.url}/operators`);
+    expect(urls).toContain(`${siteConfig.url}/power`);
+    expect(urls).toContain(`${siteConfig.url}/opposition`);
+    expect(urls).toContain(`${siteConfig.url}/stats`);
+    expect(urls).toContain(`${siteConfig.url}/gaps`);
+    expect(urls).toContain(`${siteConfig.url}/about`);
+    expect(urls).toContain(`${siteConfig.url}/methodology`);
+    expect(urls).toContain(`${siteConfig.url}/explore`);
+    expect(urls).toContain(`${siteConfig.url}/activity`);
+    expect(urls).toContain(`${siteConfig.url}/contribute`);
+    expect(urls).toContain(`${siteConfig.url}/support`);
+    expect(urls).toContain(`${siteConfig.url}/sources/odod-dcte-2026-11`);
+    expect(urls).toContain(`${siteConfig.url}/sources/otc-1357-21-2026-11`);
+    // /contact is an indexable landing page that was missing from the sitemap
+    // entirely — GSC reported "URL is unknown to Google" (2026-09-03).
+    expect(urls).toContain(`${siteConfig.url}/contact`);
+    // /access redirects to /contact and must not be advertised.
+    expect(urls).not.toContain(`${siteConfig.url}/access`);
+  });
+
+  it("facility routes count equals facilities.length", async () => {
+    const facilityRoutes = await buildFacilityRoutes();
+    const facilities = await getAllFacilities();
+    expect(facilityRoutes).toHaveLength(facilities.length);
+  });
+
+  it("state routes count equals getStates().length, with no undefined slugs", async () => {
+    const stateRoutes = await buildStateRoutes();
+    const states = await getStates();
+    expect(stateRoutes).toHaveLength(states.length);
+    for (const code of states) {
+      const expectedUrl = `${siteConfig.url}/states/${stateSlugFromCode(code)}`;
+      const entry = stateRoutes.find((r) => r.url === expectedUrl);
+      expect(entry).toBeDefined();
+      expect(entry!.url).not.toContain("undefined");
+    }
+  });
+
+  it("operator routes count equals the number of operators with >= MIN_FACILITIES_FOR_OPERATOR_SITEMAP facilities, with no undefined slugs", async () => {
+    const operatorRoutes = await buildOperatorRoutes();
+    const operators = await getOperators();
+    const facilities = await getAllFacilities();
+    const multiFacilityOperators = operators.filter(
+      (name) =>
+        facilities.filter((f) => f.operator === name).length >=
+        MIN_FACILITIES_FOR_OPERATOR_SITEMAP
+    );
+    expect(operatorRoutes).toHaveLength(multiFacilityOperators.length);
+    for (const name of multiFacilityOperators) {
+      const expectedUrl = `${siteConfig.url}/operators/${operatorSlug(name)}`;
+      const entry = operatorRoutes.find((r) => r.url === expectedUrl);
+      expect(entry).toBeDefined();
+      expect(entry!.url).not.toContain("undefined");
+    }
+  });
+
+  it("an operator with >= MIN_FACILITIES_FOR_OPERATOR_SITEMAP facilities IS present in buildOperatorRoutes() output", async () => {
+    const operatorRoutes = await buildOperatorRoutes();
+    const operators = await getOperators();
+    const facilities = await getAllFacilities();
+    const multiFacilityOperator = operators.find(
+      (name) =>
+        facilities.filter((f) => f.operator === name).length >=
+        MIN_FACILITIES_FOR_OPERATOR_SITEMAP
+    );
+    expect(multiFacilityOperator).toBeDefined();
+    const expectedUrl = `${siteConfig.url}/operators/${operatorSlug(multiFacilityOperator!)}`;
+    const urls = operatorRoutes.map((r) => r.url);
+    expect(urls).toContain(expectedUrl);
+  });
+
+  it("an operator with exactly 1 facility is NOT present in buildOperatorRoutes() output", async () => {
+    const operatorRoutes = await buildOperatorRoutes();
+    const operators = await getOperators();
+    const facilities = await getAllFacilities();
+    const singleFacilityOperator = operators.find(
+      (name) => facilities.filter((f) => f.operator === name).length === 1
+    );
+    expect(singleFacilityOperator).toBeDefined();
+    const excludedUrl = `${siteConfig.url}/operators/${operatorSlug(singleFacilityOperator!)}`;
+    const urls = operatorRoutes.map((r) => r.url);
+    expect(urls).not.toContain(excludedUrl);
+  });
+
+  it("status routes include /status and all 5 /status/:value routes", async () => {
+    const statusRoutes = await buildStatusRoutes();
+    const urls = statusRoutes.map((r) => r.url);
+    expect(urls).toContain(`${siteConfig.url}/status`);
+    expect(urls).toContain(`${siteConfig.url}/status/proposed`);
+    for (const status of STATUS_ORDER) {
+      expect(urls).toContain(`${siteConfig.url}/status/${status}`);
+    }
+    // 1 index + 5 per-status entries, no duplicates.
+    expect(statusRoutes).toHaveLength(STATUS_ORDER.length + 1);
+  });
+
+  it("metro routes include /metros and all 27 /metros/:slug routes, including northern-virginia", async () => {
+    const metroRoutes = await buildMetroRoutes();
+    const urls = metroRoutes.map((r) => r.url);
+    expect(urls).toContain(`${siteConfig.url}/metros`);
+    expect(urls).toContain(`${siteConfig.url}/metros/northern-virginia`);
+    for (const m of METROS) {
+      expect(urls).toContain(`${siteConfig.url}/metros/${m.slug}`);
+    }
+    // 1 index + 27 per-metro entries, no duplicates.
+    expect(metroRoutes).toHaveLength(METROS.length + 1);
+  });
+
+  it("metro hub lastModified is derived from that metro's OWN facilities via getFacilitiesByMetro, not the whole-dataset max", async () => {
+    const testStart = Date.now();
+    const metroRoutes = await buildMetroRoutes();
+    const facilities = await getAllFacilities();
+    const datasetMax = Math.max(
+      ...facilities.map((f) => new Date(f.lastUpdated).getTime())
+    );
+
+    let sawEntryEarlierThanDatasetMax = false;
+    let populatedMetros = 0;
+    for (const m of METROS) {
+      const expectedUrl = `${siteConfig.url}/metros/${m.slug}`;
+      const entry = metroRoutes.find((r) => r.url === expectedUrl);
+      expect(entry).toBeDefined();
+
+      // Membership reuses the SAME helper app/metros/[metro]/page.tsx uses
+      // to render the hub (getFacilitiesByMetro), so the sitemap and the
+      // page can never disagree about which facilities belong to a metro.
+      const metroFacilities = await getFacilitiesByMetro(m.slug);
+      // The ~60-record fixture does not populate every metro; an empty one
+      // falls back to build-time "now" (maxLastUpdated), which the real
+      // dataset never exercises. Only populated metros carry the claim.
+      if (metroFacilities.length === 0) continue;
+      populatedMetros++;
+      const expectedMax = Math.max(
+        ...metroFacilities.map((f) => new Date(f.lastUpdated).getTime())
+      );
+      const actual = entry!.lastModified as Date;
+      expect(actual.getTime()).toBe(expectedMax);
+      // Proves the value is real facility data, not build-time "now".
+      expect(actual.getTime()).toBeLessThan(testStart);
+
+      if (expectedMax < datasetMax) sawEntryEarlierThanDatasetMax = true;
+    }
+
+    // If every metro happened to contain a facility updated on the exact
+    // dataset-max date, the "own facilities, not the whole-dataset max"
+    // claim above would be unfalsifiable by this suite. Verified against
+    // the real dataset (2026-09-08): 25 of 27 metros are strictly earlier.
+    // populatedMetros guards the loop above against skipping everything.
+    expect(populatedMetros).toBeGreaterThanOrEqual(2);
+    expect(sawEntryEarlierThanDatasetMax).toBe(true);
+  });
+
+  it("/metros index entry still carries the whole-dataset max lastModified", async () => {
+    const metroRoutes = await buildMetroRoutes();
+    const facilities = await getAllFacilities();
+    const expectedMax = Math.max(
+      ...facilities.map((f) => new Date(f.lastUpdated).getTime())
+    );
+    const indexEntry = metroRoutes.find((r) => r.url === `${siteConfig.url}/metros`);
+    expect(indexEntry).toBeDefined();
+    expect((indexEntry!.lastModified as Date).getTime()).toBe(expectedMax);
+  });
+
+  it("county routes count equals the number of counties with >= MIN_FACILITIES_FOR_COUNTY_SITEMAP facilities, plus the /counties index entry", async () => {
+    const countyRoutes = await buildCountyRoutes();
+    const counties = await getCounties();
+    const multiFacilityCounties = counties.filter(
+      (c) => c.count >= MIN_FACILITIES_FOR_COUNTY_SITEMAP
+    );
+    expect(countyRoutes).toHaveLength(multiFacilityCounties.length + 1);
+
+    const urls = countyRoutes.map((r) => r.url);
+    expect(urls).toContain(`${siteConfig.url}/counties`);
+    for (const c of multiFacilityCounties) {
+      const expectedUrl = `${siteConfig.url}/counties/${c.slug}`;
+      expect(urls).toContain(expectedUrl);
+      expect(expectedUrl).not.toContain("undefined");
+    }
+  });
+
+  it("a county with >= MIN_FACILITIES_FOR_COUNTY_SITEMAP facilities IS present in buildCountyRoutes() output", async () => {
+    const countyRoutes = await buildCountyRoutes();
+    const counties = await getCounties();
+    const multiFacilityCounty = counties.find(
+      (c) => c.count >= MIN_FACILITIES_FOR_COUNTY_SITEMAP
+    );
+    expect(multiFacilityCounty).toBeDefined();
+    const urls = countyRoutes.map((r) => r.url);
+    expect(urls).toContain(`${siteConfig.url}/counties/${multiFacilityCounty!.slug}`);
+  });
+
+  it("a county with exactly 2 facilities IS present — pins the threshold from above, where the derived tests are blind", async () => {
+    // The two tests above derive their expectation from the constant itself,
+    // so RAISING it (2 -> 3) satisfies them silently while silently dropping
+    // ~144 counties from the sitemap. This pins the boundary from the other
+    // side: a county sitting exactly ON the threshold must be submitted.
+    const countyRoutes = await buildCountyRoutes();
+    const counties = await getCounties();
+    // The literal 2 is deliberate and must NOT be replaced with the
+    // constant: deriving it from MIN_FACILITIES_FOR_COUNTY_SITEMAP makes this
+    // assertion move WITH the threshold, which is precisely the blind spot it
+    // exists to close (verified — the derived version passes with the
+    // constant raised to 3). Pin the policy value too, so a deliberate change
+    // has to come here and think.
+    expect(MIN_FACILITIES_FOR_COUNTY_SITEMAP).toBe(2);
+    const atThreshold = counties.find((c) => c.count === 2);
+    expect(atThreshold).toBeDefined();
+    const urls = countyRoutes.map((r) => r.url);
+    expect(urls).toContain(`${siteConfig.url}/counties/${atThreshold!.slug}`);
+  });
+
+  it("a county with exactly 1 facility is NOT present in buildCountyRoutes() output", async () => {
+    const countyRoutes = await buildCountyRoutes();
+    const counties = await getCounties();
+    const singleFacilityCounty = counties.find((c) => c.count === 1);
+    expect(singleFacilityCounty).toBeDefined();
+    const urls = countyRoutes.map((r) => r.url);
+    expect(urls).not.toContain(`${siteConfig.url}/counties/${singleFacilityCounty!.slug}`);
+  });
+
+  it("county hub lastModified is derived from that county's OWN facilities via getFacilitiesByCounty, not the whole-dataset max", async () => {
+    const testStart = Date.now();
+    const countyRoutes = await buildCountyRoutes();
+    const facilities = await getAllFacilities();
+    const datasetMax = Math.max(
+      ...facilities.map((f) => new Date(f.lastUpdated).getTime())
+    );
+    const counties = (await getCounties()).filter(
+      (c) => c.count >= MIN_FACILITIES_FOR_COUNTY_SITEMAP
+    );
+
+    let sawEntryEarlierThanDatasetMax = false;
+    for (const c of counties) {
+      const entry = countyRoutes.find(
+        (r) => r.url === `${siteConfig.url}/counties/${c.slug}`
+      );
+      expect(entry).toBeDefined();
+
+      // Membership reuses the SAME helper app/counties/[county]/page.tsx
+      // uses to render the hub, so the sitemap and the page can never
+      // disagree about which facilities belong to a county.
+      const countyFacilities = await getFacilitiesByCounty(c.slug);
+      const expectedMax = Math.max(
+        ...countyFacilities.map((f) => new Date(f.lastUpdated).getTime())
+      );
+      expect((entry!.lastModified as Date).getTime()).toBe(expectedMax);
+      // Proves the value is real facility data, not build-time "now".
+      expect((entry!.lastModified as Date).getTime()).toBeLessThan(testStart);
+
+      if (expectedMax < datasetMax) sawEntryEarlierThanDatasetMax = true;
+    }
+
+    // Without this, a dataset where every county happened to contain a
+    // facility updated on the exact dataset-max date would make the "own
+    // facilities, not the whole-dataset max" claim unfalsifiable here.
+    expect(sawEntryEarlierThanDatasetMax).toBe(true);
+  });
+
+  it("/counties index entry carries the whole-dataset max lastModified", async () => {
+    const countyRoutes = await buildCountyRoutes();
+    const facilities = await getAllFacilities();
+    const expectedMax = Math.max(
+      ...facilities.map((f) => new Date(f.lastUpdated).getTime())
+    );
+    const indexEntry = countyRoutes.find((r) => r.url === `${siteConfig.url}/counties`);
+    expect(indexEntry).toBeDefined();
+    expect((indexEntry!.lastModified as Date).getTime()).toBe(expectedMax);
+  });
+
+  it("learn routes include /learn and all 5 /learn/:slug routes, derived from GLOSSARY_TOPICS", async () => {
+    const learnRoutes = await buildLearnRoutes();
+    const urls = learnRoutes.map((r) => r.url);
+    expect(urls).toContain(`${siteConfig.url}/learn`);
+    for (const topic of GLOSSARY_TOPICS) {
+      expect(urls).toContain(`${siteConfig.url}/learn/${topic.slug}`);
+    }
+    // 1 index + 5 per-topic entries, no duplicates.
+    expect(learnRoutes).toHaveLength(GLOSSARY_TOPICS.length + 1);
+  });
+
+  it("learn route lastModified is derived from the dataset, not 'new Date()' now", async () => {
+    const testStart = Date.now();
+    const learnRoutes = await buildLearnRoutes();
+    const facilities = await getAllFacilities();
+    const expectedMax = Math.max(...facilities.map((f) => new Date(f.lastUpdated).getTime()));
+
+    for (const entry of learnRoutes) {
+      const actual = entry.lastModified as Date;
+      expect(actual.getTime()).toBe(expectedMax);
+      // Proves the value is real dataset data, not build-time "now" — these
+      // pages interpolate live figures, so a churning lastmod was wrong twice
+      // over: it lied about freshness AND re-stamped on every hourly regen.
+      expect(actual.getTime()).toBeLessThan(testStart);
+    }
+  });
+
+  it("state hub lastModified is derived from the state's facilities, not 'new Date()' now", async () => {
+    const testStart = Date.now();
+    const stateRoutes = await buildStateRoutes();
+    const facilities = await getAllFacilities();
+    const states = await getStates();
+    for (const code of states) {
+      const expectedUrl = `${siteConfig.url}/states/${stateSlugFromCode(code)}`;
+      const entry = stateRoutes.find((r) => r.url === expectedUrl);
+      expect(entry).toBeDefined();
+
+      const stateFacilities = facilities.filter((f) => f.location.state === code);
+      const expectedMax = Math.max(
+        ...stateFacilities.map((f) => new Date(f.lastUpdated).getTime())
+      );
+      const actual = entry!.lastModified as Date;
+      expect(actual.getTime()).toBe(expectedMax);
+      // Proves the value is real facility data, not build-time "now".
+      expect(actual.getTime()).toBeLessThan(testStart);
+    }
+  });
+
+  it("operator hub lastModified is derived from the operator's facilities, not 'new Date()' now", async () => {
+    const testStart = Date.now();
+    const operatorRoutes = await buildOperatorRoutes();
+    const facilities = await getAllFacilities();
+    const operators = await getOperators();
+    const multiFacilityOperators = operators.filter(
+      (name) =>
+        facilities.filter((f) => f.operator === name).length >=
+        MIN_FACILITIES_FOR_OPERATOR_SITEMAP
+    );
+    for (const name of multiFacilityOperators) {
+      const expectedUrl = `${siteConfig.url}/operators/${operatorSlug(name)}`;
+      const entry = operatorRoutes.find((r) => r.url === expectedUrl);
+      expect(entry).toBeDefined();
+
+      const operatorFacilities = facilities.filter((f) => f.operator === name);
+      const expectedMax = Math.max(
+        ...operatorFacilities.map((f) => new Date(f.lastUpdated).getTime())
+      );
+      const actual = entry!.lastModified as Date;
+      expect(actual.getTime()).toBe(expectedMax);
+      // Proves the value is real facility data, not build-time "now".
+      expect(actual.getTime()).toBeLessThan(testStart);
+    }
+  });
+
+  // Replaces a prior test named "total route count equals the sum of all
+  // five builders", which compared a sum to the same expression recomputed
+  // a second time — that could never fail (code-reviewer-confirmed
+  // tautology). This asserts something falsifiable instead: every one of
+  // the nine route-family builders (matching lib/sitemap-families.ts'
+  // SITEMAP_FAMILY_IDS) produces at least one route, and none of them emits
+  // the same URL twice.
+  it("every builder returns a non-empty array with no duplicate URLs within itself", async () => {
+    const builders = [
+      ["static", buildStaticRoutes],
+      ["learn", buildLearnRoutes],
+      ["states", buildStateRoutes],
+      ["operators", buildOperatorRoutes],
+      ["stakeholders", buildStakeholderRoutes],
+      ["facilities", buildFacilityRoutes],
+      ["status", buildStatusRoutes],
+      ["metros", buildMetroRoutes],
+      ["counties", buildCountyRoutes],
+    ] as const;
+
+    for (const [name, build] of builders) {
+      const routes = await build();
+      expect(routes.length, `${name} builder returned zero routes`).toBeGreaterThan(0);
+      const urls = routes.map((r) => r.url);
+      expect(new Set(urls).size, `${name} builder produced duplicate URLs`).toBe(urls.length);
+    }
+  });
+
+  it("all URLs are absolute and under siteConfig.url", async () => {
+    const allRoutes = [
+      ...(await buildStaticRoutes()),
+      ...(await buildStateRoutes()),
+      ...(await buildOperatorRoutes()),
+      ...(await buildFacilityRoutes()),
+      ...(await buildStatusRoutes()),
+    ];
+    for (const route of allRoutes) {
+      expect(route.url).toMatch(/^https?:\/\//);
+      expect(route.url).toContain(siteConfig.url);
+    }
+  });
+
+  it("facility routes use /facilities/:id pattern under siteConfig.url", async () => {
+    const facilityRoutes = await buildFacilityRoutes();
+    const facilities = await getAllFacilities();
+    for (const f of facilities) {
+      const entry = facilityRoutes.find((r) =>
+        r.url.endsWith(`/facilities/${f.id}`)
+      );
+      expect(entry).toBeDefined();
+      expect(entry!.url).toBe(`${siteConfig.url}/facilities/${f.id}`);
+    }
+  });
+
+  it("static routes' lastModified does not change across two calls made at different wall-clock times", async () => {
+    const first = await buildStaticRoutes();
+    // A real, non-zero clock advance between calls — the bug this guards
+    // against is `new Date()` baked into every entry, which would differ
+    // between these two calls even a millisecond apart.
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    const second = await buildStaticRoutes();
+
+    expect(first).toHaveLength(second.length);
+    for (let i = 0; i < first.length; i++) {
+      expect(first[i].url).toBe(second[i].url);
+      const a = first[i].lastModified as Date;
+      const b = second[i].lastModified as Date;
+      expect(a.getTime()).toBe(b.getTime());
+    }
+  });
+
+  it("dataset-backed static routes (e.g. /) use the dataset's real max lastUpdated, not 'now'", async () => {
+    const testStart = Date.now();
+    const routes = await buildStaticRoutes();
+    const facilities = await getAllFacilities();
+    const expectedMax = Math.max(
+      ...facilities.map((f) => new Date(f.lastUpdated).getTime())
+    );
+
+    const home = routes.find((r) => r.url === siteConfig.url);
+    expect(home).toBeDefined();
+    const actual = home!.lastModified as Date;
+    expect(actual.getTime()).toBe(expectedMax);
+    // Proves the value is real facility data, not build-time "now".
+    expect(actual.getTime()).toBeLessThan(testStart);
+  });
+
+  it("/sources/odod-dcte-2026-11 carries its own pinned lastModified, not the stale static-page date", async () => {
+    const routes = await buildStaticRoutes();
+    const entry = routes.find((r) => r.url === `${siteConfig.url}/sources/odod-dcte-2026-11`);
+    expect((entry!.lastModified as Date).getTime()).toBe(Date.UTC(2026, 10, 6));
+  });
+
+  it("/sources/otc-1357-21-2026-11 carries its own pinned lastModified, not the stale static-page date", async () => {
+    const routes = await buildStaticRoutes();
+    const entry = routes.find((r) => r.url === `${siteConfig.url}/sources/otc-1357-21-2026-11`);
+    expect((entry!.lastModified as Date).getTime()).toBe(Date.UTC(2026, 10, 6));
+  });
+
+  it("genuinely static editorial routes (/about, /contribute, /support, /contact) use a stable date, not 'now'", async () => {
+    const testStart = Date.now();
+    const routes = await buildStaticRoutes();
+    for (const path of ["/about", "/contribute", "/support", "/contact"]) {
+      const entry = routes.find((r) => r.url === `${siteConfig.url}${path}`);
+      expect(entry).toBeDefined();
+      const actual = entry!.lastModified as Date;
+      expect(actual.getTime()).toBeLessThan(testStart);
+    }
+  });
+});

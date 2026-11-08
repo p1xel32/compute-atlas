@@ -2,7 +2,7 @@ import { describe, it, expect, vi, afterEach } from "vitest";
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
-import { ContributeFacilityForm } from "./contribute-facility-form";
+import { ContributeFacilityForm, buildContributePayload } from "./contribute-facility-form";
 
 // ---------------------------------------------------------------------------
 // fetch mock helpers
@@ -59,6 +59,53 @@ describe("ContributeFacilityForm — structure", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Select labels — Base UI's <SelectValue /> resolves its displayed text from
+// the Select root's `items` prop, not from the rendered <SelectItem>
+// children; without `items` it falls back to the raw enum value
+// (resolveValueLabel.js's `stringifyAsLabel`). Regression coverage for that:
+// select an option and assert the trigger shows the human label, not the
+// stored value.
+// ---------------------------------------------------------------------------
+
+describe("ContributeFacilityForm — select labels", () => {
+  it("shows the human label on the Type trigger after selecting an option", async () => {
+    const user = userEvent.setup();
+    render(<ContributeFacilityForm />);
+
+    await user.click(screen.getByRole("combobox", { name: /^type$/i }));
+    await user.click(await screen.findByRole("option", { name: "Crypto mining" }));
+
+    const trigger = screen.getByRole("combobox", { name: /^type$/i });
+    expect(trigger).toHaveTextContent("Crypto mining");
+    expect(trigger).not.toHaveTextContent("crypto_mining");
+  });
+
+  it("shows the human label on the Status trigger after selecting an option", async () => {
+    const user = userEvent.setup();
+    render(<ContributeFacilityForm />);
+
+    await user.click(screen.getByRole("combobox", { name: /^status$/i }));
+    await user.click(await screen.findByRole("option", { name: "Under construction" }));
+
+    const trigger = screen.getByRole("combobox", { name: /^status$/i });
+    expect(trigger).toHaveTextContent("Under construction");
+    expect(trigger).not.toHaveTextContent("under_construction");
+  });
+
+  it("shows the full state name on the State trigger after selecting an option", async () => {
+    const user = userEvent.setup();
+    render(<ContributeFacilityForm />);
+
+    await user.click(screen.getByRole("combobox", { name: /^state$/i }));
+    await user.click(await screen.findByRole("option", { name: "California" }));
+
+    const trigger = screen.getByRole("combobox", { name: /^state$/i });
+    expect(trigger).toHaveTextContent("California");
+    expect(trigger).not.toHaveTextContent("CA");
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Submit outcomes (mocked fetch)
 // ---------------------------------------------------------------------------
 
@@ -73,6 +120,33 @@ describe("ContributeFacilityForm — submit outcomes", () => {
 
     expect(await screen.findByText(/in the review queue/i)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /submit another/i })).toBeInTheDocument();
+  });
+
+  it("sets a review-window expectation and links to the public activity feed on success", async () => {
+    const user = userEvent.setup();
+    mockFetchOnce({ ok: true, status: 201, json: async () => ({ ok: true }) });
+
+    render(<ContributeFacilityForm />);
+    await fillRequiredFields(user);
+    await user.click(screen.getByRole("button", { name: /submit facility/i }));
+
+    await screen.findByText(/in the review queue/i);
+    expect(screen.getByText(/reviewed within about a week/i)).toBeInTheDocument();
+    const activityLink = screen.getByRole("link", { name: /public activity feed/i });
+    expect(activityLink).toHaveAttribute("href", "/activity");
+  });
+
+  it("links named contributors to the contributors page on success", async () => {
+    const user = userEvent.setup();
+    mockFetchOnce({ ok: true, status: 201, json: async () => ({ ok: true }) });
+
+    render(<ContributeFacilityForm />);
+    await fillRequiredFields(user);
+    await user.click(screen.getByRole("button", { name: /submit facility/i }));
+
+    await screen.findByText(/in the review queue/i);
+    const contributorsLink = screen.getByRole("link", { name: /contributors page/i });
+    expect(contributorsLink).toHaveAttribute("href", "/contributors");
   });
 
   it("surfaces a field-level error from a 400 response's issues array", async () => {
@@ -123,6 +197,66 @@ function getPostedBody(): Record<string, unknown> {
   return JSON.parse(init.body as string);
 }
 
+// ---------------------------------------------------------------------------
+// Coordinate paste-and-split (B6a) — the manual lat/lon inputs stay usable;
+// this is an additive shortcut, not a replacement.
+// ---------------------------------------------------------------------------
+
+describe("ContributeFacilityForm — paste coordinates", () => {
+  it("populates both latitude and longitude fields from a pasted coordinate string", async () => {
+    const user = userEvent.setup();
+    render(<ContributeFacilityForm />);
+
+    const latInput = screen.getByLabelText(/latitude/i) as HTMLInputElement;
+    const lonInput = screen.getByLabelText(/longitude/i) as HTMLInputElement;
+    expect(latInput.value).toBe("");
+    expect(lonInput.value).toBe("");
+
+    await user.type(screen.getByLabelText(/paste coordinates/i), "39.51, -98.53");
+
+    expect(latInput.value).toBe("39.51");
+    expect(lonInput.value).toBe("-98.53");
+    expect(
+      await screen.findByText(/filled from pasted coordinates/i)
+    ).toBeInTheDocument();
+  });
+
+  it("preserves a negative longitude when populating the field (not just when parsing)", async () => {
+    const user = userEvent.setup();
+    render(<ContributeFacilityForm />);
+
+    await user.type(screen.getByLabelText(/paste coordinates/i), "39.51, -98.53");
+
+    const lonInput = screen.getByLabelText(/longitude/i) as HTMLInputElement;
+    expect(lonInput.value.startsWith("-")).toBe(true);
+  });
+
+  it("does not overwrite the manual fields while the pasted text is still incomplete", async () => {
+    const user = userEvent.setup();
+    render(<ContributeFacilityForm />);
+
+    await user.type(screen.getByLabelText(/paste coordinates/i), "39.51");
+
+    const latInput = screen.getByLabelText(/latitude/i) as HTMLInputElement;
+    const lonInput = screen.getByLabelText(/longitude/i) as HTMLInputElement;
+    expect(latInput.value).toBe("");
+    expect(lonInput.value).toBe("");
+  });
+
+  it("leaves manual lat/lon entry fully working as a fallback", async () => {
+    const user = userEvent.setup();
+    render(<ContributeFacilityForm />);
+
+    const latInput = screen.getByLabelText(/latitude/i) as HTMLInputElement;
+    const lonInput = screen.getByLabelText(/longitude/i) as HTMLInputElement;
+    await user.type(latInput, "30");
+    await user.type(lonInput, "-90");
+
+    expect(latInput.value).toBe("30");
+    expect(lonInput.value).toBe("-90");
+  });
+});
+
 describe("ContributeFacilityForm — attribution", () => {
   it("renders an optional attribution field", () => {
     render(<ContributeFacilityForm />);
@@ -152,5 +286,110 @@ describe("ContributeFacilityForm — attribution", () => {
 
     await screen.findByText(/in the review queue/i);
     expect(getPostedBody()).not.toHaveProperty("attribution");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// "Email me when reviewed" (C1b, Unit C) — gated by the notifyEnabled prop,
+// which app/contribute/page.tsx derives from SUBMISSION_NOTIFY_ENABLED and
+// passes down. This component never reads process.env itself.
+// ---------------------------------------------------------------------------
+
+// Derives the state-object type from buildContributePayload's own (unexported)
+// parameter type rather than importing/duplicating ContributeFormState.
+type FormState = Parameters<typeof buildContributePayload>[0];
+
+function baseFormState(overrides: Partial<FormState> = {}): FormState {
+  return {
+    name: "New DC",
+    operator: "New Op",
+    state: "CA",
+    facilityType: "data_center",
+    status: "proposed",
+    lat: "30",
+    lon: "-90",
+    city: "",
+    capacityOperationalMw: "",
+    capacityPlannedMw: "",
+    sourceUrl: "https://example.com/press-release",
+    sourceLabel: "",
+    attribution: "",
+    notifyEmail: "",
+    note: "",
+    website: "",
+    ...overrides,
+  };
+}
+
+describe("ContributeFacilityForm — notify email (C1b)", () => {
+  it("does not render the notify-email field when notifyEnabled is false (the default)", () => {
+    render(<ContributeFacilityForm />);
+    expect(screen.queryByLabelText(/your email/i)).not.toBeInTheDocument();
+  });
+
+  it("omits notifyEmail from buildContributePayload's output when the flag is off, even if state carries a value", () => {
+    const payload = buildContributePayload(baseFormState({ notifyEmail: "someone@example.com" }));
+    expect(payload).not.toHaveProperty("notifyEmail");
+  });
+
+  it("renders the notify-email field, reachable by its accessible label, when notifyEnabled is true", () => {
+    render(<ContributeFacilityForm notifyEnabled />);
+    expect(screen.getByLabelText(/your email/i)).toBeInTheDocument();
+  });
+
+  it("associates the notify-email field with its 'email you once when this is reviewed' description", () => {
+    render(<ContributeFacilityForm notifyEnabled />);
+    expect(screen.getByLabelText(/your email/i)).toHaveAccessibleDescription(/email you once when this is reviewed/i);
+  });
+
+  it("includes a trimmed notifyEmail in the submitted payload when the flag is on and a value is entered", async () => {
+    const user = userEvent.setup();
+    mockFetchOnce({ ok: true, status: 201, json: async () => ({ ok: true }) });
+
+    render(<ContributeFacilityForm notifyEnabled />);
+    await fillRequiredFields(user);
+    await user.type(screen.getByLabelText(/your email/i), "  someone@example.com  ");
+    await user.click(screen.getByRole("button", { name: /submit facility/i }));
+
+    await screen.findByText(/in the review queue/i);
+    expect(getPostedBody().notifyEmail).toBe("someone@example.com");
+  });
+
+  it("omits notifyEmail from the submitted payload when the flag is on but the field is left blank", async () => {
+    const user = userEvent.setup();
+    mockFetchOnce({ ok: true, status: 201, json: async () => ({ ok: true }) });
+
+    render(<ContributeFacilityForm notifyEnabled />);
+    await fillRequiredFields(user);
+    await user.click(screen.getByRole("button", { name: /submit facility/i }));
+
+    await screen.findByText(/in the review queue/i);
+    expect(getPostedBody()).not.toHaveProperty("notifyEmail");
+  });
+
+  it("surfaces a server-side 'Invalid notify email' rejection on the field via issuesToFieldMap", async () => {
+    const user = userEvent.setup();
+    mockFetchOnce({
+      ok: false,
+      status: 400,
+      json: async () => ({
+        error: "Invalid notify email",
+        // lib/contribute.ts wraps notifyEmailSchema in an object schema
+        // before parsing specifically so Zod's issue path is
+        // ["notifyEmail"], not [] — issuesToFieldMap needs a non-empty
+        // path[0] to attach an error to this field, same as every other
+        // field-level error in this form.
+        issues: [{ path: ["notifyEmail"], message: "Invalid email address" }],
+      }),
+    });
+
+    render(<ContributeFacilityForm notifyEnabled />);
+    await fillRequiredFields(user);
+    await user.type(screen.getByLabelText(/your email/i), "not-an-email");
+    await user.click(screen.getByRole("button", { name: /submit facility/i }));
+
+    const message = await screen.findByText("Invalid email address");
+    expect(message).toBeInTheDocument();
+    expect(message).toHaveAttribute("role", "alert");
   });
 });

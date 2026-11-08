@@ -5,18 +5,17 @@ import { useRouter } from "next/navigation";
 import { Dialog } from "@base-ui/react/dialog";
 import { Search } from "lucide-react";
 
-import { cn } from "@/lib/utils";
+import { cn, QUIET_ACTION_CLASS } from "@/lib/utils";
 import {
   searchCommands,
   facilityToSearchEntry,
+  type FacilitySearchHit,
   mergeFacilityResults,
   SEARCH_GROUP_LABELS,
   type SearchEntry,
 } from "@/lib/search";
-import type { Facility } from "@/lib/schema";
 
 interface CommandPaletteProps {
-  index: SearchEntry[];
   navLinks: readonly { readonly label: string; readonly href: string }[];
 }
 
@@ -25,11 +24,18 @@ interface CommandPaletteProps {
 const EMPTY_SEARCH_ENTRIES: SearchEntry[] = [];
 
 /**
+ * Keystroke-to-`/api/search` debounce. Exported so tests can wait past it
+ * rather than hardcoding a duplicate literal — a "did not fetch" assertion
+ * made before this window elapses cannot fail.
+ */
+export const SEARCH_DEBOUNCE_MS = 200;
+
+/**
  * Site-wide ⌘K / Ctrl+K command palette. Renders both the header trigger
  * button and the modal itself, sharing open/query state. Does content search
  * (facilities/operators/states) and page navigation in one place.
  */
-export function CommandPalette({ index, navLinks }: CommandPaletteProps) {
+export function CommandPalette({ navLinks }: CommandPaletteProps) {
   const router = useRouter();
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
@@ -37,6 +43,7 @@ export function CommandPalette({ index, navLinks }: CommandPaletteProps) {
   const [isMac, setIsMac] = useState(false);
   const [prevQuery, setPrevQuery] = useState(query);
   const [dbEntries, setDbEntries] = useState<SearchEntry[]>([]);
+  const [index, setIndex] = useState<SearchEntry[]>(EMPTY_SEARCH_ENTRIES);
   const [isSearching, setIsSearching] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
   const activeItemRef = useRef<HTMLLIElement>(null);
@@ -61,6 +68,54 @@ export function CommandPalette({ index, navLinks }: CommandPaletteProps) {
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, []);
 
+  // Opened from the homepage hero's search affordance
+  // (components/home/hero-search.tsx) via a DOM CustomEvent rather than
+  // React context or a prop: CommandPalette renders inside SiteHeader (root
+  // layout) while the hero renders in app/page.tsx — different subtrees, so
+  // sharing open-state through context would mean lifting it into the root
+  // layout and adding a client boundary there just to bridge two otherwise
+  // unrelated components.
+  //
+  // Resets `query` as well as opening: `query` is otherwise only cleared in
+  // `go()` (on selection), so dismissing with Escape or a backdrop click
+  // leaves the previous search in state. Without the reset, ⌘K → type
+  // "solar" → Escape → click the hero search reopens showing stale results.
+  // The hero affordance is presented as a fresh starting point, so it should
+  // open a blank search, not resume an abandoned one.
+  useEffect(() => {
+    function handleOpenSearch() {
+      setQuery("");
+      setOpen(true);
+    }
+    window.addEventListener("compute-atlas:open-search", handleOpenSearch);
+    return () => window.removeEventListener("compute-atlas:open-search", handleOpenSearch);
+  }, []);
+
+  // Operator + state index, fetched once on first open (not shipped in every
+  // page's RSC payload). Page entries show immediately; these join when they
+  // arrive. A failed fetch degrades silently to pages only and the NEXT open
+  // retries; after a success it is never refetched. The query-driven
+  // /api/search results are unaffected either way.
+  const navIndexRequested = useRef(false);
+  useEffect(() => {
+    if (!open || navIndexRequested.current) return;
+    navIndexRequested.current = true;
+    fetch("/api/nav-index")
+      .then((res) => {
+        if (!res.ok) {
+          navIndexRequested.current = false;
+          return null;
+        }
+        return res.json();
+      })
+      .then((data: { entries?: SearchEntry[] } | null) => {
+        if (data?.entries) setIndex(data.entries);
+      })
+      .catch(() => {
+        navIndexRequested.current = false;
+      });
+  }, [open]);
+
   // Debounced live DB full-text search. Augments the instant client-side Fuse
   // results with facilities matched by their notes/description content (which
   // the name-only Fuse index can't see). Race-safe: each run aborts the prior
@@ -78,14 +133,14 @@ export function CommandPalette({ index, navLinks }: CommandPaletteProps) {
     const timer = setTimeout(async () => {
       setIsSearching(true);
       try {
-        const res = await fetch(`/api/search?q=${encodeURIComponent(trimmedQuery)}`, {
+        const res = await fetch(`/api/search?q=${encodeURIComponent(trimmedQuery)}&shape=palette`, {
           signal: controller.signal,
         });
         if (!res.ok) {
           setDbEntries([]);
           return;
         }
-        const data: { facilities?: Facility[] } = await res.json();
+        const data: { facilities?: FacilitySearchHit[] } = await res.json();
         setDbEntries((data.facilities ?? []).map(facilityToSearchEntry));
       } catch (err) {
         // Ignore aborts (superseded by a newer keystroke); on any other failure
@@ -94,7 +149,7 @@ export function CommandPalette({ index, navLinks }: CommandPaletteProps) {
       } finally {
         if (!controller.signal.aborted) setIsSearching(false);
       }
-    }, 200);
+    }, SEARCH_DEBOUNCE_MS);
     return () => {
       clearTimeout(timer);
       controller.abort();
@@ -132,6 +187,18 @@ export function CommandPalette({ index, navLinks }: CommandPaletteProps) {
     [fuseGroups, shownDbEntries]
   );
   const flat = useMemo(() => groups.flatMap((g) => g.items), [groups]);
+
+  // Per-group starting offset into `flat`, precomputed once per `groups`
+  // change instead of re-scanning all groups for every group on every render.
+  const groupOffsets = useMemo(() => {
+    const offsets = new Map<string, number>();
+    let running = 0;
+    for (const g of groups) {
+      offsets.set(g.type, running);
+      running += g.items.length;
+    }
+    return offsets;
+  }, [groups]);
 
   // Reset the active option whenever the query (and thus results) changes.
   // Adjusted during render (React's recommended pattern) rather than in an
@@ -183,11 +250,13 @@ export function CommandPalette({ index, navLinks }: CommandPaletteProps) {
       <button
         type="button"
         onClick={() => setOpen(true)}
-        aria-label="Search (press Ctrl K or Command K)"
-        className="flex h-11 items-center gap-2 rounded-lg px-2 sm:px-3 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+        aria-label={isMac ? "Search ⌘K" : "Search Ctrl K"}
+        aria-keyshortcuts="Meta+K Control+K"
+        className="flex h-11 items-center gap-2 rounded-lg px-2 sm:px-3 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"
       >
         <Search aria-hidden className="size-4" />
         <span className="hidden sm:inline font-mono text-xs">Search</span>
+        {" "}
         <kbd className="hidden sm:inline-flex items-center rounded border border-border bg-muted px-1.5 py-0.5 font-mono text-[0.65rem] text-muted-foreground">
           {isMac ? "⌘K" : "Ctrl K"}
         </kbd>
@@ -206,7 +275,9 @@ export function CommandPalette({ index, navLinks }: CommandPaletteProps) {
               the arrow keys to navigate results and Enter to select.
             </Dialog.Description>
 
-            <div className="flex items-center gap-2 border-b border-border px-3">
+            {/* The input keeps outline-none, so the focus cue lives on this row
+                (mirrors LocationSearch). Inset: the dialog panel clips outside. */}
+            <div className="flex items-center gap-2 border-b border-border px-3 has-[#cmdk-input:focus-visible]:outline-2 has-[#cmdk-input:focus-visible]:-outline-offset-2 has-[#cmdk-input:focus-visible]:outline-ring">
               <Search aria-hidden className="size-4 shrink-0 text-muted-foreground" />
               <label htmlFor="cmdk-input" className="sr-only">
                 Search facilities, operators, states, or pages
@@ -236,11 +307,7 @@ export function CommandPalette({ index, navLinks }: CommandPaletteProps) {
               className="max-h-[60vh] overflow-y-auto py-1"
             >
               {groups.map((group) => {
-                let groupStart = 0;
-                for (const g of groups) {
-                  if (g === group) break;
-                  groupStart += g.items.length;
-                }
+                const groupStart = groupOffsets.get(group.type) ?? 0;
                 return (
                   <li key={group.type}>
                     <div className="px-3 pb-1 pt-2 font-mono text-[0.65rem] uppercase tracking-wider text-muted-foreground">
@@ -260,6 +327,7 @@ export function CommandPalette({ index, navLinks }: CommandPaletteProps) {
                           >
                             <button
                               type="button"
+                              tabIndex={-1}
                               onClick={() => go(item.href)}
                               onMouseEnter={() => setActiveIndex(flatIndex)}
                               className={cn(
@@ -285,6 +353,44 @@ export function CommandPalette({ index, navLinks }: CommandPaletteProps) {
               {trimmedQuery && groups.length === 0 && !showSearching && (
                 <li className="px-3 py-6 text-center font-mono text-sm text-muted-foreground">
                   No matches for &ldquo;{query}&rdquo;.
+                  {/*
+                    Highest-intent contribution moment on the site: GSC shows
+                    visitors arriving by searching for one named facility we
+                    don't have. Not part of `flat`/`groups` — deliberately
+                    outside the arrow-key/aria-activedescendant path (see
+                    those below) — so it keeps its default tabIndex (0) and
+                    is reached by Tab instead, since it would otherwise have
+                    no keyboard path at all. Reuses `go()` so it closes the
+                    dialog and clears `query` exactly like a result click.
+                    Plain `<a>`, not `next/link`: this file is `"use client"`
+                    and covered by the client-bundle allowlist in
+                    lib/search-index.guard.test.ts, and `next/link` would earn
+                    its keep only via prefetch — wasted bandwidth for a
+                    contribute page reached from a zero-result search — since
+                    `go()` already does the soft-navigate (router.push) and
+                    the onClick below preempts Link's own navigation anyway.
+                  */}
+                  <p className="mt-2 text-xs">
+                    If it is real and missing,{" "}
+                    <a
+                      href="/contribute"
+                      className={QUIET_ACTION_CLASS}
+                      onClick={(e) => {
+                        // Let the browser handle modified clicks (middle/⌘/Ctrl/
+                        // Shift/Alt) so "open in new tab" still works — only a
+                        // plain left click needs the dialog closed before
+                        // navigating. Same guard Next's own Link uses internally.
+                        if (e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) {
+                          return;
+                        }
+                        e.preventDefault();
+                        go("/contribute");
+                      }}
+                    >
+                      send us a link
+                    </a>{" "}
+                    — that is what gets it added.
+                  </p>
                 </li>
               )}
             </ul>

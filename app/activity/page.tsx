@@ -3,7 +3,7 @@ import { Rss } from "lucide-react";
 
 import { getQuarterlyPipelineSummary, getRecentActivity } from "@/lib/data";
 import { ActivityList } from "@/app/activity/activity-list";
-import { WatchButton } from "@/components/subscribe/watch-button";
+import { CommunityFilter } from "@/app/activity/community-filter";
 
 export const revalidate = 3600;
 
@@ -53,15 +53,12 @@ export default async function ActivityPage() {
         <p className="pt-1">
           <a
             href="/activity/feed.xml"
-            className="inline-flex items-center gap-1.5 font-mono text-xs uppercase tracking-wider text-primary underline underline-offset-4 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 rounded-sm"
+            className="inline-flex items-center gap-1.5 font-mono text-xs uppercase tracking-wider text-primary underline underline-offset-4 hover:text-foreground focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring rounded-sm"
           >
             <Rss aria-hidden="true" className="h-3.5 w-3.5" />
             Subscribe via RSS
           </a>
         </p>
-        <div className="pt-2">
-          <WatchButton targetType="all" label="Watch all updates" />
-        </div>
       </div>
 
       <p className="mb-8 rounded-md border border-border px-4 py-3 font-mono text-sm text-muted-foreground">
@@ -70,7 +67,12 @@ export default async function ActivityPage() {
           : "No pipeline changes recorded this quarter yet."}
       </p>
 
-      <ActivityList entries={entries} />
+      <CommunityFilter
+        total={entries.length}
+        communityCount={entries.filter((e) => e.community).length}
+      >
+        <ActivityList entries={entries} />
+      </CommunityFilter>
     </div>
   );
 }

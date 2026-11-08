@@ -1,0 +1,206 @@
+import { describe, it, expect } from "vitest";
+import { render, screen, within } from "@testing-library/react";
+
+import type { Facility } from "@/lib/schema";
+import { ContestedStrip } from "./contested-strip";
+
+// ---------------------------------------------------------------------------
+// Fixtures
+//
+// No shared facility factory exists in the repo yet — each test file (e.g.
+// related-facilities.test.tsx, format.test.ts) defines its own minimal
+// makeFacility() helper. This one carries only the fields ContestedStrip
+// actually reads (id, name, location, community); `as Facility` is a partial
+// mock cast, acceptable for a presentational component test.
+// ---------------------------------------------------------------------------
+
+function makeFacility(overrides: Partial<Facility> = {}): Facility {
+  return {
+    id: "test-site",
+    name: "Test Site",
+    operator: "Acme Corp",
+    status: "operational",
+    confidence: "confirmed",
+    facilityType: "data_center",
+    location: { lat: 40, lon: -90, city: "Springfield", state: "IL", precision: "exact" },
+    statusHistory: [],
+    sources: [
+      { url: "https://example.com", label: "Example source", retrievedAt: "2025-01-01", kind: "press" },
+    ],
+    lastUpdated: "2026-01-01",
+    ...overrides,
+  } as Facility;
+}
+
+const CASES: Facility[] = [
+  makeFacility({
+    id: "site-one",
+    name: "Site One",
+    location: { lat: 40, lon: -90, city: "Springfield", state: "IL", precision: "exact" },
+    community: { status: "litigation", notes: "Residents filed suit over water use." },
+  }),
+  makeFacility({
+    id: "site-two",
+    name: "Site Two",
+    location: { lat: 33, lon: -84, city: "Atlanta", state: "GA", precision: "exact" },
+    community: { status: "opposed", notes: "County board rejected the rezoning request." },
+  }),
+  makeFacility({
+    id: "site-three",
+    name: "Site Three",
+    location: { lat: 47, lon: -122, state: "WA", precision: "exact" },
+    community: { status: "contested", notes: "Neighbors dispute the water-use permit." },
+  }),
+];
+
+const BREAKDOWN = { litigation: 12, opposed: 34, contested: 56 };
+const FRICTION_COUNT = BREAKDOWN.litigation + BREAKDOWN.opposed + BREAKDOWN.contested;
+
+describe("ContestedStrip", () => {
+  it("renders each case as a link to its facility page", () => {
+    render(
+      <ContestedStrip cases={CASES} frictionCount={FRICTION_COUNT} breakdown={BREAKDOWN} />
+    );
+
+    expect(screen.getByRole("link", { name: /Site One/ })).toHaveAttribute(
+      "href",
+      "/facilities/site-one"
+    );
+    expect(screen.getByRole("link", { name: /Site Two/ })).toHaveAttribute(
+      "href",
+      "/facilities/site-two"
+    );
+    expect(screen.getByRole("link", { name: /Site Three/ })).toHaveAttribute(
+      "href",
+      "/facilities/site-three"
+    );
+  });
+
+  it("renders formatLocation output and community notes for each case", () => {
+    render(
+      <ContestedStrip cases={CASES} frictionCount={FRICTION_COUNT} breakdown={BREAKDOWN} />
+    );
+
+    expect(screen.getByText("Springfield, IL")).toBeInTheDocument();
+    expect(screen.getByText("Atlanta, GA")).toBeInTheDocument();
+    // Site Three has no city -> formatLocation falls back to bare state.
+    expect(screen.getByText("WA")).toBeInTheDocument();
+
+    expect(
+      screen.getByText("Residents filed suit over water use.")
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText("County board rejected the rezoning request.")
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText("Neighbors dispute the water-use permit.")
+    ).toBeInTheDocument();
+  });
+
+  it("renders the friction headline with the interpolated counts", () => {
+    render(
+      <ContestedStrip cases={CASES} frictionCount={FRICTION_COUNT} breakdown={BREAKDOWN} />
+    );
+
+    expect(
+      screen.getByText(
+        `${FRICTION_COUNT} tracked sites carry a documented friction status — ${BREAKDOWN.litigation} in litigation, ${BREAKDOWN.opposed} opposed, ${BREAKDOWN.contested} contested — each with a public source.`
+      )
+    ).toBeInTheDocument();
+  });
+
+  it("renders the sourced-friction finding verbatim, including the Electricity contrast, and its explainer link", () => {
+    const { container } = render(
+      <ContestedStrip cases={CASES} frictionCount={FRICTION_COUNT} breakdown={BREAKDOWN} />
+    );
+    const text = container.textContent ?? "";
+
+    // Pinned to literal substrings of the two glossary constants, not to the
+    // constants themselves — asserting getByText(FRICTION_CAUSES_FINDING)
+    // against the same imported constant the component renders can never
+    // fail, even if the component's own text drifts from the source finding.
+    expect(text).toContain(
+      "found water raised most often, ahead of noise, complaints about the approval process itself, and air quality and emissions."
+    );
+    expect(text).toContain(
+      "Electricity — the concern the national debate centers on — appears less often in local records than any of those."
+    );
+
+    const explainerLink = screen.getByRole("link", {
+      name: "why communities oppose data centers",
+    });
+    expect(explainerLink).toHaveAttribute(
+      "href",
+      "/learn/why-do-communities-oppose-data-centers"
+    );
+  });
+
+  it("renders the trailing link to /opposition", () => {
+    render(
+      <ContestedStrip cases={CASES} frictionCount={FRICTION_COUNT} breakdown={BREAKDOWN} />
+    );
+
+    const trailing = screen.getByRole("link", { name: /See all contested sites/ });
+    expect(trailing).toHaveAttribute("href", "/opposition");
+  });
+
+  it("renders the header, lead, and trailing link with an empty cases list, without crashing", () => {
+    render(<ContestedStrip cases={[]} frictionCount={0} breakdown={{ litigation: 0, opposed: 0, contested: 0 }} />);
+
+    expect(
+      screen.getByRole("heading", { level: 2, name: "Contested sites" })
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "0 tracked sites carry a documented friction status — 0 in litigation, 0 opposed, 0 contested — each with a public source."
+      )
+    ).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: /See all contested sites/ })).toHaveAttribute(
+      "href",
+      "/opposition"
+    );
+    expect(screen.queryAllByRole("listitem")).toHaveLength(0);
+  });
+
+  // Same wiring guard as lens-gateway.test.tsx: `.plate-hover` (app/globals.css)
+  // is the whole mechanism, so stripping the class from this className reverts
+  // the hover tilt on these cards while leaving every other assertion green.
+  // jsdom has no `:hover` and applies no `@media` block, so the class is the
+  // only observable; the angle and its clearance are pinned in
+  // app/globals.css.test.ts.
+  it("carries the plate-hover tilt on every case card surface", () => {
+    render(
+      <ContestedStrip cases={CASES} frictionCount={FRICTION_COUNT} breakdown={BREAKDOWN} />
+    );
+
+    const cards = screen.getAllByRole("listitem");
+    expect(cards).toHaveLength(CASES.length);
+    for (const card of cards) {
+      expect(within(card).getByRole("link")).toHaveClass("plate-hover");
+    }
+  });
+
+  // Queried by role+name rather than container.querySelector("section"): a
+  // <section> is only exposed as an accessible "region" when it HAS a name, so
+  // this proves the section's aria-labelledby actually resolves to the h2's id.
+  // SectionHeading deliberately leaves that pairing to the caller (see its `id`
+  // doc comment), which is exactly the contract that can break silently — move
+  // the id onto the wrapper div and every other assertion in this file stays
+  // green while the landmark goes unnamed. Same form as lens-gateway.test.tsx.
+  it("renders as a labeled region and passes className through to it", () => {
+    render(
+      <ContestedStrip
+        cases={CASES}
+        frictionCount={FRICTION_COUNT}
+        breakdown={BREAKDOWN}
+        className="mt-12 border-t border-border pt-10"
+      />
+    );
+
+    const section = screen.getByRole("region", { name: "Contested sites" });
+    expect(section).toHaveClass("mt-12", "border-t", "border-border", "pt-10");
+    expect(
+      screen.getByRole("heading", { level: 2, name: "Contested sites" })
+    ).toBeInTheDocument();
+  });
+});

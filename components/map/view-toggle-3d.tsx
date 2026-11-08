@@ -19,6 +19,7 @@ export function ViewToggle3D({ is3D, onToggle }: ViewToggle3DProps) {
       onClick={onToggle}
       aria-pressed={is3D}
       aria-label="Toggle 3D tilted view"
+      title="3D tilt"
       className={[
         // Size — ≥44 px touch target (WCAG 2.5.8 project rule)
         "flex h-11 w-11 items-center justify-center",
@@ -27,7 +28,7 @@ export function ViewToggle3D({ is3D, onToggle }: ViewToggle3DProps) {
         "shadow-[0_1px_4px_rgba(0,0,0,0.12)]",
         // Interaction
         "cursor-pointer transition-colors",
-        "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1",
+        "focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-ring",
         // Activation: subtle primary ring when in 3-D mode
         is3D ? "ring-1 ring-primary/50" : "",
       ]

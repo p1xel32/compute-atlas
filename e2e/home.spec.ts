@@ -1,4 +1,4 @@
-import { test, expect } from "@playwright/test";
+import { test, expect, devices } from "@playwright/test";
 
 // ---------------------------------------------------------------------------
 // Landing page (/) — editorial home
@@ -64,9 +64,12 @@ test("/map shows interactive datacenter map region", async ({ page }) => {
 
 test("/map shows result count status", async ({ page }) => {
   await page.goto("/map");
-  await expect(page.getByRole("status")).toContainText(
-    /Showing \d+ of \d+ facilities/
-  );
+  // /map has two role="status" live regions (result-count subheader +
+  // location-search jump-to status); scope to the one with text so this
+  // doesn't hit a strict-mode violation once both are mounted.
+  await expect(
+    page.getByRole("status").filter({ hasText: /Showing/ })
+  ).toContainText(/Showing [\d,]+ of [\d,]+ facilities/);
 });
 
 test("/map has View as table cross-link", async ({ page }) => {
@@ -82,8 +85,11 @@ test("/map status filter updates URL and reduces results; Clear all resets", asy
 }) => {
   await page.goto("/map");
 
-  const statusEl = page.getByRole("status");
-  await expect(statusEl).toContainText(/Showing \d+ of \d+ facilities/);
+  // /map has two role="status" live regions (result-count subheader +
+  // location-search jump-to status); scope to the one with text so this
+  // doesn't hit a strict-mode violation once both are mounted.
+  const statusEl = page.getByRole("status").filter({ hasText: /Showing/ });
+  await expect(statusEl).toContainText(/Showing [\d,]+ of [\d,]+ facilities/);
 
   // Click the "Operational" status checkbox
   const operationalCheckbox = page.getByRole("checkbox", {
@@ -95,7 +101,7 @@ test("/map status filter updates URL and reduces results; Clear all resets", asy
   await expect(page).toHaveURL(/[?&]status=operational/);
 
   // Count region still shows a valid result summary
-  await expect(statusEl).toContainText(/Showing \d+ of \d+ facilities/);
+  await expect(statusEl).toContainText(/Showing [\d,]+ of [\d,]+ facilities/);
 
   // "Clear all" button appears when filters are active; click it
   await page.getByRole("button", { name: /Clear all/i }).click();
@@ -109,9 +115,21 @@ test("filter state carries from /map to /table via the shared URL", async ({
 }) => {
   await page.goto("/map");
 
-  const statusEl = page.getByRole("status");
+  // /map has two role="status" live regions (result-count subheader +
+  // location-search jump-to status); scope to the one with text so this
+  // doesn't hit a strict-mode violation once both are mounted.
+  const statusEl = page.getByRole("status").filter({ hasText: /Showing/ });
   // Capture the unfiltered count: "Showing N of N facilities"
-  await expect(statusEl).toContainText(/Showing \d+ of \d+ facilities/);
+  await expect(statusEl).toContainText(/Showing [\d,]+ of [\d,]+ facilities/);
+  const parseMapCounts = async () => {
+    const m = (await statusEl.textContent())?.match(/Showing ([\d,]+) of ([\d,]+)/);
+    expect(m).toBeTruthy();
+    return {
+      shown: Number(m![1].replace(/,/g, "")),
+      total: Number(m![2].replace(/,/g, "")),
+    };
+  };
+  const { total: unfilteredTotal } = await parseMapCounts();
 
   // Click the "Operational" status checkbox to apply a filter
   const operationalCheckbox = page.getByRole("checkbox", {
@@ -122,6 +140,12 @@ test("filter state carries from /map to /table via the shared URL", async ({
   // Assert the URL now includes the filter parameter
   await expect(page).toHaveURL(/[?&]status=operational/);
 
+  // Wait for the map's filtered count to drop below the unfiltered total
+  await expect
+    .poll(async () => (await parseMapCounts()).shown)
+    .toBeLessThan(unfilteredTotal);
+  const { shown: mapFilteredCount } = await parseMapCounts();
+
   // Click "View as table" link to navigate to /table
   const tableLink = page.getByRole("link", { name: /View as table/i });
   await tableLink.click();
@@ -129,21 +153,58 @@ test("filter state carries from /map to /table via the shared URL", async ({
   // Assert the /table URL also has the status filter in the query string
   await expect(page).toHaveURL(/\/table\?.*status=operational/);
 
-  // Verify the status region is visible and shows filtered results
-  const tableStatusEl = page.getByRole("status");
-  await expect(tableStatusEl).toContainText(/Showing \d+ of \d+ facilities/);
+  // Verify the status region is visible and shows filtered results.
+  // Scoped defensively like the /map lookups above — /table only has one
+  // role="status" today (no location-search control in table view), but
+  // filtering keeps this locator correct if that ever changes.
+  const tableStatusEl = page
+    .getByRole("status")
+    .filter({ hasText: /Showing/ });
+  // /table is server-paginated: "Showing 1–50 of N facilities" (en dash), where
+  // N is the FILTERED total.
+  await expect(tableStatusEl).toContainText(
+    /Showing 1–[\d,]+ of [\d,]+ facilities/
+  );
 
-  // Parse the status text to confirm the filter is actually applied:
-  // The filtered count (first number) should be less than the total (second number)
+  // Same filter, same dataset: the table total must equal the map's filtered
+  // count and be smaller than the unfiltered total.
   const statusText = await tableStatusEl.textContent();
-  const match = statusText?.match(/Showing (\d+) of (\d+)/);
+  const match = statusText?.match(/Showing 1–[\d,]+ of ([\d,]+) facilities/);
   expect(match).toBeTruthy();
-  const filteredCount = Number(match![1]);
-  const totalCount = Number(match![2]);
-  expect(filteredCount).toBeLessThan(totalCount);
+  const tableTotal = Number(match![1].replace(/,/g, ""));
+  expect(tableTotal).toBe(mapFilteredCount);
+  expect(tableTotal).toBeLessThan(unfilteredTotal);
 
   // Verify the table is visible on /table
   await expect(page.getByRole("table")).toBeVisible();
+});
+
+test("/table paginates through real links and keeps the query", async ({ page }) => {
+  await page.goto("/table");
+  const nav = page.getByRole("navigation", { name: "Table pagination" });
+  await expect(nav).toBeVisible();
+  const status = page.getByRole("status").filter({ hasText: /Showing/ });
+  await expect(status).toContainText(/Showing 1–50 of [\d,]+ facilities/);
+  const total = Number(/of ([\d,]+) facilities/.exec((await status.textContent()) ?? "")?.[1].replace(/,/g, ""));
+  // Fewer than two pages would make this test pass without paginating anything.
+  expect(total, "pagination is untestable with <= 50 facilities").toBeGreaterThan(50);
+  await nav.getByRole("link", { name: "Next" }).click();
+  await expect(page).toHaveURL(/[?&]page=2/);
+  await expect(status).toContainText(new RegExp(`Showing 51–${Math.min(100, total)} of [\\d,]+ facilities`));
+  await expect(
+    page.getByRole("navigation", { name: "Table pagination" }).getByRole("link", { name: "Page 2" })
+  ).toHaveAttribute("aria-current", "page");
+});
+
+test("/table sorts from the header and resets to page 1", async ({ page }) => {
+  await page.goto("/table?page=2");
+  await page.getByRole("button", { name: "Sort by Name" }).click();
+  await expect(page).toHaveURL(/[?&]sort=name/);
+  await expect(page).not.toHaveURL(/[?&]page=/);
+  await expect(page.getByRole("columnheader", { name: /name/i })).toHaveAttribute(
+    "aria-sort",
+    "ascending"
+  );
 });
 
 // ---------------------------------------------------------------------------
@@ -192,4 +253,44 @@ test("clicking a facility name on /table navigates to its detail page", async ({
   await expect(page.getByRole("heading", { level: 1 })).toContainText(
     facilityName!
   );
+});
+
+// Regression for F-3: on phones the cartouche is taller than the hero box, and
+// its opaque scrim used to cover the whole absolutely-positioned dot plate, so
+// the only map phones get was invisible. The plate must be in flow, below the
+// text, and actually hit-testable at its centre.
+test.describe("hero plate on a phone", () => {
+  // Viewport only: a full device descriptor carries defaultBrowserType, which
+  // Playwright refuses inside a describe group.
+  test.use({ viewport: devices["iPhone 13"].viewport, isMobile: true });
+
+  test("/ hero dot plate is visible and not covered", async ({ page }) => {
+    await page.goto("/");
+    const plate = page.locator(".hero-plate-vt");
+    await expect(plate).toBeVisible();
+    await plate.scrollIntoViewIfNeeded();
+
+    const covered = await plate.evaluate((el) => {
+      const box = el.getBoundingClientRect();
+      const hit = document.elementFromPoint(
+        box.x + box.width / 2,
+        box.y + box.height / 2
+      );
+      return { height: box.height, inside: hit !== null && el.contains(hit) };
+    });
+    expect(covered.height).toBeGreaterThan(200);
+    expect(covered.inside).toBe(true);
+  });
+
+  // F-4: an `sr-only` <table> sizes to its content (CSS 2.1 auto layout), so
+  // the StackArea data table widened the layout viewport (scrollWidth 761 at
+  // 390px, measured 2026-10-15). Relies on this describe's phone viewport.
+  test("/ does not scroll sideways", async ({ page }) => {
+    await page.goto("/");
+    const widths = await page.evaluate(() => ({
+      scroll: document.documentElement.scrollWidth,
+      client: document.documentElement.clientWidth,
+    }));
+    expect(widths.scroll).toBeLessThanOrEqual(widths.client);
+  });
 });

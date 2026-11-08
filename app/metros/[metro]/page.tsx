@@ -2,27 +2,16 @@ import { notFound } from "next/navigation";
 import type { Metadata } from "next";
 
 import { getFacilitiesByMetro } from "@/lib/data";
+import { sumCapacityMw } from "@/lib/capacity-sums";
+import { formatPower } from "@/lib/format";
 import { getMetroBySlug, METROS, type Metro } from "@/lib/metros";
+import { statesPhrase } from "@/lib/us-states";
 import type { Facility } from "@/lib/schema";
 import { CollectionPage } from "@/components/collection/collection-page";
+import { WatchButton } from "@/components/subscribe/watch-button";
+import { watchAreasEnabled } from "@/lib/watch-target-types";
 
-export const revalidate = 3600;
-
-/** Formats a MW figure as GW (1 decimal) above 1000, else whole MW. Mirrors app/status/[status]/page.tsx's formatPower. */
-function formatPower(mw: number): string {
-  if (mw >= 1000) {
-    return `${(mw / 1000).toFixed(1)} GW`;
-  }
-  return `${Math.round(mw)} MW`;
-}
-
-function sumOperationalMw(facilities: Facility[]): number {
-  return facilities.reduce((sum, f) => sum + (f.capacityMw?.operational ?? 0), 0);
-}
-
-function sumPlannedMw(facilities: Facility[]): number {
-  return facilities.reduce((sum, f) => sum + (f.capacityMw?.planned ?? 0), 0);
-}
+export const revalidate = 86400;
 
 /**
  * The most frequently occurring operators among a metro's facilities, most
@@ -106,8 +95,8 @@ export default async function MetroPage({
 
   const facilities = await getFacilitiesByMetro(slug);
   const countyList = countyListFor(metro);
-  const operationalMw = sumOperationalMw(facilities);
-  const plannedMw = sumPlannedMw(facilities);
+  const operationalMw = sumCapacityMw(facilities, "operational");
+  const plannedMw = sumCapacityMw(facilities, "planned");
   const topOperators = topOperatorsFor(facilities);
   const isMultiState = metro.states.length > 1;
 
@@ -143,11 +132,23 @@ export default async function MetroPage({
             Compute Atlas tracks {facilities.length} data center
             {facilities.length === 1 ? "" : "s"} across {metro.name} —{" "}
             {countyList}
-            {isMultiState ? `, spanning ${metro.states.length} states` : ""}{" "}
+            {isMultiState
+              ? `, spanning ${statesPhrase(metro.states)}`
+              : ""}{" "}
             — each traced to a public source.
           </p>
           {capacityLine && <p>{capacityLine}</p>}
           {operatorLine && <p>{operatorLine}</p>}
+          {watchAreasEnabled() && (
+            <div className="print:hidden">
+              <WatchButton
+                targetType="metro"
+                targetId={metro.slug}
+                label="Watch this metro — monthly digest"
+                description={`Get a monthly email summarizing what changed for tracked facilities in ${metro.name}. One click to unsubscribe, anytime.`}
+              />
+            </div>
+          )}
         </>
       }
       crumbs={[

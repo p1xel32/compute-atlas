@@ -5,15 +5,17 @@ import { siteConfig } from "@/lib/site";
 
 /**
  * 256-bit random token, base64url-encoded (~43 chars, URL-safe, no padding).
- * Used for both the single-use confirm token and the long-lived unsubscribe
- * token on `subscriptions` rows (`lib/db/schema.ts`) — see that file's
- * comment for the raw-storage (no hashing/signing) rationale.
+ * The raw value returned here goes to the recipient once (embedded in a
+ * confirm/access/unsubscribe email) and is never itself the value compared on
+ * lookup — confirm and access tokens are stored as a sha256 hash (see
+ * `lib/token-hash.ts` and the per-column comments in `lib/db/schema.ts`); the
+ * unsubscribe token is the one deliberate exception and stays raw in storage.
  */
 export function generateToken(): string {
   return randomBytes(32).toString("base64url");
 }
 
-function fromAddress(): string {
+export function fromAddress(): string {
   return process.env.EMAIL_FROM ?? "Compute Atlas <alerts@compute-atlas.com>";
 }
 
@@ -31,7 +33,7 @@ function getResend(): Resend | null {
   return key ? new Resend(key) : null;
 }
 
-function escapeHtml(value: string): string {
+export function escapeHtml(value: string): string {
   return value
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
@@ -40,36 +42,154 @@ function escapeHtml(value: string): string {
     .replace(/'/g, "&#39;");
 }
 
+/**
+ * Outcome of one send attempt. `resendId` and `errorCode` are shaped to be
+ * persisted: `errorCode` is always an identifier (see `safeErrorCode`), never
+ * free text, an address, or a message.
+ */
+export type SendResult =
+  | { sent: true; resendId: string | null }
+  | { sent: false; errorCode: string; skipped?: "no_key" };
+
+/**
+ * What the public senders return: a `SendResult`, or a bare `{ sent: false }`
+ * from the two senders' pre-send guards (CONTACT_TO_EMAIL unset, EMAIL_FROM
+ * refused), where no send was attempted and there is no code to record.
+ */
+export type SendOutcome = SendResult | { sent: false };
+
+const ERROR_CODE_PATTERN = /^[A-Za-z0-9_]{1,64}$/;
+
+/**
+ * Returns `name` only if identifier-shaped, else "unknown". A SHAPE check, not
+ * an allowlist: acceptable because Resend error names are library-controlled,
+ * and it bounds anything persisted to identifier shape.
+ */
+export function safeErrorCode(name: unknown): string {
+  return typeof name === "string" && ERROR_CODE_PATTERN.test(name) ? name : "unknown";
+}
+
+/**
+ * Shared send path for every outbound email. Module-private on purpose: a
+ * public sender is the only way to mail, so the gate guard can see every use.
+ * Resolves the Resend client (skipping with `skipLogMessage` if
+ * `RESEND_API_KEY` is unset), sends `payload`, and logs any failure under
+ * `logLabel`. Each sender still composes its own subject/text/html (and any
+ * sender-specific guard, e.g. sendContactEmail's CONTACT_TO_EMAIL check)
+ * before calling this. Never throws.
+ */
+async function sendViaResend(
+  logLabel: string,
+  skipLogMessage: string,
+  payload: Parameters<Resend["emails"]["send"]>[0],
+): Promise<SendResult> {
+  try {
+    // Client construction is inside the try so a constructor throw is a
+    // failed send, not an exception — the "never throws" contract.
+    const resend = getResend();
+    if (!resend) {
+      console.warn(skipLogMessage);
+      return { sent: false, errorCode: "no_key", skipped: "no_key" };
+    }
+
+    const result = await resend.emails.send(payload);
+    if (result.error) {
+      // Log only the error type, not the raw Resend error object — it can
+      // echo the recipient address back on a validation failure (caught in
+      // a prior security review).
+      const errorCode = safeErrorCode(result.error?.name);
+      console.error(`${logLabel} failed:`, errorCode);
+      return { sent: false, errorCode };
+    }
+    return { sent: true, resendId: result.data?.id ?? null };
+  } catch (error) {
+    const errorCode = safeErrorCode(error instanceof Error ? error.name : undefined);
+    console.error(`${logLabel} failed:`, errorCode);
+    return { sent: false, errorCode };
+  }
+}
+
 export async function sendConfirmEmail(input: {
   email: string;
   targetLabel: string;
   confirmToken: string;
-}): Promise<{ sent: boolean }> {
-  const resend = getResend();
-  if (!resend) {
-    console.warn("RESEND_API_KEY not set — skipping confirm email send");
-    return { sent: false };
-  }
-
+}): Promise<SendOutcome> {
   const confirmUrl = `${linkBase()}/api/subscribe/confirm?token=${encodeURIComponent(input.confirmToken)}`;
   const subject = "Confirm your Compute Atlas alerts";
   const text = `You asked to be notified when ${input.targetLabel} changes on Compute Atlas. Confirm to start receiving updates: ${confirmUrl}. If this wasn't you, ignore this email — nothing is sent unless you confirm.`;
   const html = `<p>You asked to be notified when <strong>${escapeHtml(input.targetLabel)}</strong> changes on Compute Atlas.</p><p><a href="${escapeHtml(confirmUrl)}">Confirm to start receiving updates</a></p><p>If this wasn't you, ignore this email — nothing is sent unless you confirm.</p>`;
 
-  try {
-    const result = await resend.emails.send({ from: fromAddress(), to: input.email, subject, text, html });
-    if (result.error) {
-      // Log only the error type, not the raw Resend error object — it can
-      // echo the recipient address back on a validation failure (s65
-      // security review, Fix 3).
-      console.error("sendConfirmEmail failed:", result.error?.name ?? "unknown");
-      return { sent: false };
-    }
-    return { sent: true };
-  } catch (error) {
-    console.error("sendConfirmEmail failed:", error instanceof Error ? error.name : "unknown");
+  return sendViaResend(
+    "sendConfirmEmail",
+    "RESEND_API_KEY not set — skipping confirm email send",
+    { from: fromAddress(), to: input.email, subject, text, html },
+  );
+}
+
+export async function sendContactEmail(input: {
+  name: string;
+  email: string;
+  topic: string;
+  message: string;
+}): Promise<SendOutcome> {
+  const to = process.env.CONTACT_TO_EMAIL;
+  if (!to) {
+    // The message is already durably stored (the route inserts the row
+    // before calling this), so nothing is lost — just log so the gap is
+    // visible in server logs rather than silently swallowed.
+    console.warn("CONTACT_TO_EMAIL not set — skipping contact email send");
     return { sent: false };
   }
+
+  const subject = `Compute Atlas contact — ${input.topic}`;
+  const adminUrl = `${linkBase()}/admin/contact`;
+  const text = `New contact form submission.\n\nName: ${input.name}\nEmail: ${input.email}\nTopic: ${input.topic}\n\n${input.message}\n\nReply as Compute Atlas: ${adminUrl}`;
+  const html = `<p><strong>New contact form submission</strong></p><p>Name: ${escapeHtml(input.name)}<br>Email: ${escapeHtml(input.email)}<br>Topic: ${escapeHtml(input.topic)}</p><p>${escapeHtml(input.message).replace(/\n/g, "<br>")}</p><p><a href="${escapeHtml(adminUrl)}">Reply as Compute Atlas</a></p>`;
+
+  // `replyTo` is deliberately absent. With it set, pressing Reply in the
+  // maintainer's mail client would send to the visitor FROM his personal
+  // address, leaking it. Replies go through /admin/contact, which calls
+  // sendContactReply and sends under the Compute Atlas name. Do not re-add it.
+  return sendViaResend(
+    "sendContactEmail",
+    "RESEND_API_KEY not set — skipping contact email send",
+    { from: fromAddress(), to, subject, text, html },
+  );
+}
+
+/**
+ * Answers a public contact-form message from the Compute Atlas sender. No
+ * `replyTo`/cc/bcc and no reference to CONTACT_TO_EMAIL: the visitor must
+ * never see the maintainer's personal address. A follow-up goes to the From
+ * address, which Cloudflare Email Routing forwards privately.
+ */
+export async function sendContactReply(input: {
+  to: string;
+  originalMessage: string;
+  replyBody: string;
+}): Promise<SendOutcome> {
+  // A reply to a member of the public must never go out under a personal From
+  // (e.g. a misconfigured EMAIL_FROM); fail closed rather than expose it.
+  const rawFrom = fromAddress();
+  const bracketed = /<([^>]*)>/.exec(rawFrom);
+  const fromEmail = (bracketed ? bracketed[1] : rawFrom).trim().toLowerCase();
+  if (!/^[^@\s<>]+@compute-atlas\.com$/.test(fromEmail)) {
+    console.warn("sendContactReply: EMAIL_FROM is not a compute-atlas.com address — refusing to send");
+    return { sent: false };
+  }
+  const subject = "Re: your message to Compute Atlas";
+  const quoted = input.originalMessage
+    .split("\n")
+    .map((line) => `> ${line}`)
+    .join("\n");
+  const text = `${input.replyBody}\n\n—\nCompute Atlas\n${linkBase()}\n\n${quoted}`;
+  const html = `<p>${escapeHtml(input.replyBody).replace(/\n/g, "<br>")}</p><p>—<br>Compute Atlas<br><a href="${escapeHtml(linkBase())}">${escapeHtml(linkBase())}</a></p><blockquote>${escapeHtml(input.originalMessage).replace(/\n/g, "<br>")}</blockquote>`;
+
+  return sendViaResend(
+    "sendContactReply",
+    "RESEND_API_KEY not set — skipping contact reply send",
+    { from: rawFrom, to: input.to, subject, text, html },
+  );
 }
 
 export async function sendChangeNotification(input: {
@@ -79,21 +199,17 @@ export async function sendChangeNotification(input: {
   changeLabel: string;
   status: string;
   unsubscribeToken: string;
-}): Promise<{ sent: boolean }> {
-  const resend = getResend();
-  if (!resend) {
-    console.warn("RESEND_API_KEY not set — skipping change notification send");
-    return { sent: false };
-  }
-
+}): Promise<SendOutcome> {
   const facilityUrl = `${linkBase()}/facilities/${input.facilitySlug}`;
   const unsubUrl = `${linkBase()}/api/subscribe/unsubscribe?token=${encodeURIComponent(input.unsubscribeToken)}`;
   const subject = `${input.facilityName} — record updated on Compute Atlas`;
-  const text = `The record you're watching changed: ${input.facilityName} — ${input.changeLabel} (now ${input.status}). View it: ${facilityUrl}.\n\nYou're receiving this because you asked to be notified when this record changes on Compute Atlas. Unsubscribe: ${unsubUrl}`;
-  const html = `<p>The record you're watching changed: <strong>${escapeHtml(input.facilityName)}</strong> — ${escapeHtml(input.changeLabel)} (now ${escapeHtml(input.status)}).</p><p><a href="${escapeHtml(facilityUrl)}">View it</a></p><p style="color:#666;font-size:0.85em;">You're receiving this because you asked to be notified when this record changes on Compute Atlas. <a href="${escapeHtml(unsubUrl)}">Unsubscribe</a></p>`;
+  const text = `The record you're watching changed: ${input.facilityName} — ${input.changeLabel} (now ${input.status}). View it: ${facilityUrl}.\n\nYou're receiving this because you asked to be notified when this record changes on Compute Atlas. Unsubscribe from this record: ${unsubUrl}\nStop all automated email from Compute Atlas: ${unsubUrl}&scope=all`;
+  const html = `<p>The record you're watching changed: <strong>${escapeHtml(input.facilityName)}</strong> — ${escapeHtml(input.changeLabel)} (now ${escapeHtml(input.status)}).</p><p><a href="${escapeHtml(facilityUrl)}">View it</a></p><p style="color:#666;font-size:0.85em;">You're receiving this because you asked to be notified when this record changes on Compute Atlas. <a href="${escapeHtml(unsubUrl)}">Unsubscribe from this record</a> · <a href="${escapeHtml(unsubUrl + "&scope=all")}">Stop all automated email from Compute Atlas</a></p>`;
 
-  try {
-    const result = await resend.emails.send({
+  return sendViaResend(
+    "sendChangeNotification",
+    "RESEND_API_KEY not set — skipping change notification send",
+    {
       from: fromAddress(),
       to: input.email,
       subject,
@@ -103,17 +219,259 @@ export async function sendChangeNotification(input: {
         "List-Unsubscribe": `<${unsubUrl}>`,
         "List-Unsubscribe-Post": "List-Unsubscribe=One-Click",
       },
-    });
-    if (result.error) {
-      // Log only the error type, not the raw Resend error object — it can
-      // echo the recipient address back on a validation failure (s65
-      // security review, Fix 3).
-      console.error("sendChangeNotification failed:", result.error?.name ?? "unknown");
-      return { sent: false };
-    }
-    return { sent: true };
-  } catch (error) {
-    console.error("sendChangeNotification failed:", error instanceof Error ? error.name : "unknown");
-    return { sent: false };
+    },
+  );
+}
+
+/**
+ * Sent instead of a confirm email when a new subscription is auto-confirmed
+ * because the address already holds a confirmed subscription elsewhere (see
+ * hasConfirmedSubscription in lib/subscribe.ts) — there is nothing to
+ * confirm, so this states plainly that no confirmation was needed and that
+ * the subscription is already live, then gives an unsubscribe path exactly
+ * like sendChangeNotification's, since this recipient (unlike
+ * sendSubmissionReviewedEmail's) IS a real subscriber going forward.
+ */
+export async function sendWatchStartedEmail(input: {
+  email: string;
+  targetLabel: string;
+  unsubscribeToken: string;
+}): Promise<SendOutcome> {
+  const unsubUrl = `${linkBase()}/api/subscribe/unsubscribe?token=${encodeURIComponent(input.unsubscribeToken)}`;
+  const subject = `You're now watching ${input.targetLabel} — Compute Atlas`;
+  const text = `You're already a confirmed Compute Atlas subscriber, so this new subscription needed no confirmation: you're now watching ${input.targetLabel} and will get an email whenever it changes.\n\nIf this wasn't you, unsubscribe from this one: ${unsubUrl}\nStop all automated email from Compute Atlas: ${unsubUrl}&scope=all`;
+  const html = `<p>You're already a confirmed Compute Atlas subscriber, so this new subscription needed no confirmation: you're now watching <strong>${escapeHtml(input.targetLabel)}</strong> and will get an email whenever it changes.</p><p style="color:#666;font-size:0.85em;">If this wasn't you, <a href="${escapeHtml(unsubUrl)}">unsubscribe from this one</a> · <a href="${escapeHtml(unsubUrl + "&scope=all")}">Stop all automated email from Compute Atlas</a>.</p>`;
+
+  return sendViaResend(
+    "sendWatchStartedEmail",
+    "RESEND_API_KEY not set — skipping watch-started email send",
+    {
+      from: fromAddress(),
+      to: input.email,
+      subject,
+      text,
+      html,
+      headers: {
+        "List-Unsubscribe": `<${unsubUrl}>`,
+        "List-Unsubscribe-Post": "List-Unsubscribe=One-Click",
+      },
+    },
+  );
+}
+
+/**
+ * "Email me when this is reviewed" — the one-shot send for the
+ * `submission_notify_requests` flow (see lib/submission-notify.ts and the
+ * review-time hook in lib/submissions.ts). Deliberately NOT a copy-paste of
+ * `sendChangeNotification` above, even though both are "a facility changed"
+ * emails: this recipient never subscribed to anything, so every one of that
+ * template's phrases — "the record you're watching", "you asked to be
+ * notified", an unsubscribe link, a List-Unsubscribe header — would be false
+ * here. (This repo shipped exactly that mistake once already: a state digest
+ * inherited a facility-watch template's copy and an unsubscribe link that
+ * lied to its recipients.) Instead this says plainly what happened and that
+ * the address is now deleted — there is nothing to unsubscribe FROM.
+ *
+ * Deliberately no `note`/`reason` parameter, and none should be added:
+ * `rejectSubmission`'s `reason` is maintainer-authored commentary for the
+ * internal review queue (rendered in the admin UI), never contributor-facing
+ * copy — mailing it to an anonymous third party would forward internal notes
+ * ("obvious spam", "IP looks like a bot farm") to whoever the submitter
+ * named as their contact.
+ */
+export async function sendSubmissionReviewedEmail(input: {
+  email: string;
+  decision: "approved" | "rejected";
+  facilityName: string;
+  facilitySlug?: string; // present on approval — links to the live /facilities/<slug> page
+}): Promise<SendOutcome> {
+  if (input.decision === "approved") {
+    const facilityUrl = `${linkBase()}/facilities/${input.facilitySlug}`;
+    const subject = `${input.facilityName} is now live on Compute Atlas`;
+    const text = `Compute Atlas has reviewed and published ${input.facilityName}: ${facilityUrl}\n\nThis is the only email you will receive about this submission — your address has now been deleted from our records.`;
+    const html = `<p>Compute Atlas has reviewed and published <strong>${escapeHtml(input.facilityName)}</strong>.</p><p><a href="${escapeHtml(facilityUrl)}">View it</a></p><p style="color:#666;font-size:0.85em;">This is the only email you will receive about this submission — your address has now been deleted from our records.</p>`;
+
+    return sendViaResend(
+      "sendSubmissionReviewedEmail",
+      "RESEND_API_KEY not set — skipping submission-reviewed email send",
+      { from: fromAddress(), to: input.email, subject, text, html },
+    );
   }
+
+  // Rejected: non-accusatory by design. Most rejections are "couldn't verify
+  // from the cited source," not "you did something wrong" — the copy speaks
+  // in those general terms about the CLASS of rejection rather than
+  // asserting a specific cause for this one (there is no `reason` param to
+  // draw from — see the doc comment above), never implies wrongdoing, and
+  // never promises a human reply.
+  const contributeUrl = `${linkBase()}/contribute`;
+  const subject = "Update on your Compute Atlas submission";
+  const text = `Compute Atlas has finished reviewing ${input.facilityName}, and it was not published. The verification bar for this source-cited dataset is strict — most submissions that don't go through simply couldn't be confirmed from the source provided, not a reflection on you. If you have a stronger or more specific source, you're welcome to submit again: ${contributeUrl}\n\nThis is the only email you will receive about this submission — your address has now been deleted from our records.`;
+  const html = `<p>Compute Atlas has finished reviewing <strong>${escapeHtml(input.facilityName)}</strong>, and it was not published.</p><p>The verification bar for this source-cited dataset is strict — most submissions that don't go through simply couldn't be confirmed from the source provided, not a reflection on you. If you have a stronger or more specific source, you're welcome to submit again: <a href="${escapeHtml(contributeUrl)}">${escapeHtml(contributeUrl)}</a></p><p style="color:#666;font-size:0.85em;">This is the only email you will receive about this submission — your address has now been deleted from our records.</p>`;
+
+  return sendViaResend(
+    "sendSubmissionReviewedEmail",
+    "RESEND_API_KEY not set — skipping submission-reviewed email send",
+    { from: fromAddress(), to: input.email, subject, text, html },
+  );
+}
+
+/** One facility change as a digest email lists it (structurally a subset of lib/notify.ts's change rows). */
+export interface DigestChange {
+  facilityName: string;
+  facilitySlug: string;
+  changeLabel: string;
+  status: string;
+  unsubscribeToken: string;
+}
+
+/**
+ * Composes and sends the multi-facility digest email for a recipient with
+ * more than one change in a single run. Lives here so `sendViaResend` can stay
+ * module-private: the only way to mail is a public sender, and every
+ * subscription sender is guarded to run inside `sendGated`.
+ *
+ * Never throws — same contract as `sendChangeNotification` — so a failed
+ * digest send can never turn a successful publish into an error.
+ */
+export async function sendChangeDigestEmail(
+  email: string,
+  changes: DigestChange[],
+): Promise<SendResult> {
+  const base = linkBase();
+  const subject = `${changes.length} updates on facilities you're watching — Compute Atlas`;
+
+  // Each change here is a DISTINCT facility-watch subscription row, so each
+  // carries its OWN unsubscribeToken — every list item gets its own
+  // unsubscribe link, and unsubscribing from one watch never silently
+  // touches the recipient's other watches. This invariant holds because a
+  // facility-watch group is N rows (one per facility). Contrast
+  // `sendAreaDigestEmail` below: a state-digest group is exactly ONE row
+  // (one email + one state) shared across every change, which is why it
+  // renders a single unsubscribe link instead of one per item.
+  const textItems = changes.map((c) => {
+    const url = `${base}/facilities/${c.facilitySlug}`;
+    const unsubUrl = `${base}/api/subscribe/unsubscribe?token=${encodeURIComponent(c.unsubscribeToken)}`;
+    return `- ${c.facilityName} — ${c.changeLabel} (now ${c.status}): ${url} (unsubscribe from this one: ${unsubUrl})`;
+  });
+  // The stop-all link rides the first change's token: any of the recipient's
+  // tokens proves the same address.
+  //
+  // A digest covers MORE THAN ONE watch (the single-change case goes through
+  // `sendChangeNotification`), so the mailbox "Unsubscribe" button cannot
+  // honestly mean "this one watch": a client shows it as "stop email from this
+  // sender". The header therefore carries the stop-all link, and the footer
+  // says so.
+  const stopAllUrl = `${base}/api/subscribe/unsubscribe?token=${encodeURIComponent(changes[0].unsubscribeToken)}&scope=all`;
+  const mailboxNote =
+    "Your mail program's Unsubscribe button stops all automated email from Compute Atlas. To stop just one watch, use the link beside it.";
+  const text = `${changes.length} records you're watching changed on Compute Atlas:\n\n${textItems.join("\n")}\n\nStop all automated email from Compute Atlas: ${stopAllUrl}\n${mailboxNote}`;
+
+  const htmlItems = changes
+    .map((c) => {
+      const url = `${base}/facilities/${c.facilitySlug}`;
+      const unsubUrl = `${base}/api/subscribe/unsubscribe?token=${encodeURIComponent(c.unsubscribeToken)}`;
+      return `<li><strong>${escapeHtml(c.facilityName)}</strong> — ${escapeHtml(c.changeLabel)} (now ${escapeHtml(c.status)}). <a href="${escapeHtml(url)}">View it</a> · <a href="${escapeHtml(unsubUrl)}">Unsubscribe from this one</a></li>`;
+    })
+    .join("");
+  const html = `<p>${changes.length} records you're watching changed on Compute Atlas:</p><ul>${htmlItems}</ul><p style="color:#666;font-size:0.85em;"><a href="${escapeHtml(stopAllUrl)}">Stop all automated email from Compute Atlas</a><br>${escapeHtml(mailboxNote)}</p>`;
+
+  return sendViaResend(
+    "sendChangeDigestEmail",
+    "RESEND_API_KEY not set — skipping change digest email send",
+    {
+      from: fromAddress(),
+      to: email,
+      subject,
+      text,
+      html,
+      headers: {
+        "List-Unsubscribe": `<${stopAllUrl}>`,
+        "List-Unsubscribe-Post": "List-Unsubscribe=One-Click",
+      },
+    },
+  );
+}
+
+/**
+ * Composes and sends the monthly area-digest email (Theme D, D3a; county and metro added by A-3 unit 8b) — the
+ * state-digest counterpart to `sendChangeDigestEmail` above, deliberately NOT
+ * a copy-paste of it. The two are the same SHAPE (a recipient, a list of
+ * facility changes) but different TRUTHS: a facility-watch recipient asked to
+ * be told about specific records; a state-digest recipient asked to be told
+ * about a state. This copy:
+ *   - names the state and states the monthly cadence, instead of implying a
+ *     per-facility watch the recipient never set up;
+ *   - renders exactly ONE unsubscribe link, not one per change — a
+ *     state-digest recipient has exactly ONE subscription row (one email +
+ *     one state), so every `changes` entry here carries that SAME row's
+ *     `unsubscribeToken`. Taking it once (from the first change) and never
+ *     labelling it "unsubscribe from this one" avoids the false claim that
+ *     clicking it only mutes one facility, when it actually unsubscribes the
+ *     recipient from the whole state.
+ *
+ * One sender for state, county and metro: only the NAME and the noun in the
+ * unsubscribe label vary ("this state's" / "this county's" / "this metro
+ * area's"). The state output is pinned byte-for-byte by a golden test in
+ * lib/notify.test.ts.
+ *
+ * Never throws — same contract as `sendChangeDigestEmail`.
+ */
+export type AreaDigestType = "state" | "county" | "metro";
+
+const AREA_NOUN: Record<AreaDigestType, string> = {
+  state: "state",
+  county: "county",
+  metro: "metro area",
+};
+
+export async function sendAreaDigestEmail(
+  email: string,
+  area: { type: AreaDigestType; name: string },
+  changes: DigestChange[],
+): Promise<SendResult> {
+  // Collapse C0 controls (and DEL) so a name can never inject a header line
+  // into the subject or break the text body.
+  const stateName = area.name.replace(/[\u0000-\u001f\u007f]+/g, " ").trim();
+  const noun = AREA_NOUN[area.type];
+  const base = linkBase();
+  const facilityWord = changes.length === 1 ? "facility" : "facilities";
+  const subject = `${changes.length} ${facilityWord} changed in ${stateName} — Compute Atlas monthly digest`;
+
+  // Every change in a state-digest group shares ONE subscription row (one
+  // email + one state), so its unsubscribeToken is identical across all of
+  // them — take it once rather than repeating an identical link per item.
+  const unsubscribeToken = changes[0].unsubscribeToken;
+  const unsubUrl = `${base}/api/subscribe/unsubscribe?token=${encodeURIComponent(unsubscribeToken)}`;
+  const stopAllUrl = `${unsubUrl}&scope=all`;
+
+  const textItems = changes.map((c) => {
+    const url = `${base}/facilities/${c.facilitySlug}`;
+    return `- ${c.facilityName} — ${c.changeLabel} (now ${c.status}): ${url}`;
+  });
+  const text = `Your monthly Compute Atlas digest for ${stateName}: ${changes.length} tracked ${facilityWord} changed this period.\n\n${textItems.join("\n")}\n\nYou're receiving this because you subscribed to a monthly digest for ${stateName} on Compute Atlas. Unsubscribe from this ${noun}'s digest: ${unsubUrl}\nStop all automated email from Compute Atlas: ${stopAllUrl}`;
+
+  const htmlItems = changes
+    .map((c) => {
+      const url = `${base}/facilities/${c.facilitySlug}`;
+      return `<li><strong>${escapeHtml(c.facilityName)}</strong> — ${escapeHtml(c.changeLabel)} (now ${escapeHtml(c.status)}). <a href="${escapeHtml(url)}">View it</a></li>`;
+    })
+    .join("");
+  const html = `<p>Your monthly Compute Atlas digest for <strong>${escapeHtml(stateName)}</strong>: ${changes.length} tracked ${facilityWord} changed this period.</p><ul>${htmlItems}</ul><p style="color:#666;font-size:0.85em;">You're receiving this because you subscribed to a monthly digest for ${escapeHtml(stateName)} on Compute Atlas. <a href="${escapeHtml(unsubUrl)}">Unsubscribe from this ${noun}'s digest</a> · <a href="${escapeHtml(stopAllUrl)}">Stop all automated email from Compute Atlas</a></p>`;
+
+  return sendViaResend(
+    "sendAreaDigestEmail",
+    "RESEND_API_KEY not set — skipping area digest email send",
+    {
+      from: fromAddress(),
+      to: email,
+      subject,
+      text,
+      html,
+      headers: {
+        "List-Unsubscribe": `<${unsubUrl}>`,
+        "List-Unsubscribe-Post": "List-Unsubscribe=One-Click",
+      },
+    },
+  );
 }

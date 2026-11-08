@@ -1,0 +1,162 @@
+import { describe, it, expect, vi, beforeEach } from "vitest";
+import { render, screen } from "@testing-library/react";
+
+import { SiteFooter } from "./site-footer";
+
+// next/link renders to <a> — mock to avoid Next.js router-context dependency
+// in jsdom (same pattern as components/home/open-record.test.tsx).
+vi.mock("next/link", () => ({
+  default: ({
+    href,
+    children,
+    className,
+    ...rest
+  }: {
+    href: string;
+    children: React.ReactNode;
+    className?: string;
+    [key: string]: unknown;
+  }) => (
+    <a href={href} className={className} {...rest}>
+      {children}
+    </a>
+  ),
+}));
+
+describe("SiteFooter", () => {
+  beforeEach(() => {
+  });
+
+  it("renders the wordmark/home link with an accessible name that includes its visible text", () => {
+    render(<SiteFooter />);
+    const home = screen.getByRole("link", {
+      name: "Compute Atlas: Mapping the U.S. compute buildout, home",
+    });
+    expect(home).toHaveAttribute("href", "/");
+    // WCAG 2.5.3 Label in Name: both visible strings (name + tagline) appear in the name.
+    expect(home).toHaveAccessibleName(/^Compute Atlas/);
+    expect(home).toHaveAccessibleName(/Mapping the U\.S\. compute buildout/);
+  });
+
+  it("renders the mission paragraph and independent-project attribution", () => {
+    render(<SiteFooter />);
+    expect(
+      screen.getByText(/A source-cited survey of the U\.S\. compute buildout/i)
+    ).toBeInTheDocument();
+    expect(screen.getByText(/An independent project by/i)).toBeInTheDocument();
+  });
+
+  it("names the maintainer as plain text with no link to a personal site", () => {
+    const { container } = render(<SiteFooter />);
+    expect(
+      screen.getByText("An independent project by Edward Kubiak")
+    ).toBeInTheDocument();
+    expect(container.querySelector('a[href*="edwardkubiak.com"]')).toBeNull();
+    expect(screen.queryByRole("link", { name: /Edward Kubiak/ })).toBeNull();
+  });
+
+  it("renders the Explore and Data & project column labels", () => {
+    render(<SiteFooter />);
+    expect(screen.getByText("Explore")).toBeInTheDocument();
+    expect(screen.getByText("Data & project")).toBeInTheDocument();
+  });
+
+  it("renders every Explore column link with the correct href", () => {
+    render(<SiteFooter />);
+    expect(screen.getByRole("link", { name: "States" })).toHaveAttribute(
+      "href",
+      "/states"
+    );
+    expect(screen.getByRole("link", { name: "By status" })).toHaveAttribute(
+      "href",
+      "/status"
+    );
+    expect(screen.getByRole("link", { name: "By metro" })).toHaveAttribute(
+      "href",
+      "/metros"
+    );
+    expect(screen.getByRole("link", { name: "Power" })).toHaveAttribute(
+      "href",
+      "/power"
+    );
+    expect(screen.getByRole("link", { name: "Opposition" })).toHaveAttribute(
+      "href",
+      "/opposition"
+    );
+    expect(
+      screen.getByRole("link", { name: /All lenses/i })
+    ).toHaveAttribute("href", "/explore");
+  });
+
+  it("renders every Data & project column link with the correct href", () => {
+    const { container } = render(<SiteFooter />);
+    expect(
+      screen.getByRole("link", { name: "About the project" })
+    ).toHaveAttribute("href", "/about");
+    expect(
+      screen.getByRole("link", { name: "Methodology" })
+    ).toHaveAttribute("href", "/methodology");
+    expect(screen.queryByRole("link", { name: "API" })).not.toBeInTheDocument();
+    expect(
+      screen.getByRole("link", { name: "Cite" })
+    ).toHaveAttribute("href", "/data");
+    expect(screen.getByRole("link", { name: "Contact" })).toHaveAttribute(
+      "href",
+      "/contact"
+    );
+    expect(
+      screen.getByRole("link", { name: /Contribute a facility/i })
+    ).toHaveAttribute("href", "/contribute");
+    expect(
+      screen.getByRole("link", { name: /Recent activity/i })
+    ).toHaveAttribute("href", "/activity");
+    expect(
+      screen.getByRole("link", { name: "Contributors" })
+    ).toHaveAttribute("href", "/contributors");
+    expect(
+      screen.getByRole("link", { name: /Support the atlas/i })
+    ).toHaveAttribute("href", "/support");
+    expect(
+      screen.getByRole("link", { name: /Source on GitHub/i })
+    ).toHaveAttribute("href", "https://github.com/ek33450505/compute-atlas");
+    expect(
+      screen.getByRole("link", { name: /Compute Atlas on Bluesky/i })
+    ).toHaveAttribute("href", "https://bsky.app/profile/compute-atlas.com");
+    expect(
+      screen.getByRole("link", { name: /^Newsletter on Buttondown/i })
+    ).toHaveAttribute("href", "https://buttondown.com/compute-atlas");
+    expect(container.innerHTML).not.toMatch(/monthly newsletter/i);
+  });
+
+  it("marks external links with target=_blank and rel=noreferrer noopener", () => {
+    render(<SiteFooter />);
+    const repo = screen.getByRole("link", { name: /Source on GitHub/i });
+    const osm = screen.getByRole("link", { name: /OpenStreetMap/i });
+    const bluesky = screen.getByRole("link", { name: /on Bluesky/i });
+    const newsletter = screen.getByRole("link", { name: /newsletter on Buttondown/i });
+
+    for (const link of [repo, osm, bluesky, newsletter]) {
+      expect(link).toHaveAttribute("target", "_blank");
+      expect(link).toHaveAttribute("rel", "noreferrer noopener");
+    }
+  });
+
+  it("renders the OpenStreetMap attribution line", () => {
+    render(<SiteFooter />);
+    expect(screen.getByText(/contributors/)).toBeInTheDocument();
+    expect(
+      // Accessible name is the aria-label ("OpenStreetMap copyright and
+      // license (opens in new tab)"), which supersedes the visible link text.
+      screen.getByRole("link", { name: /OpenStreetMap/i })
+    ).toHaveAttribute("href", "https://www.openstreetmap.org/copyright");
+  });
+
+  it("renders the margin line without a dataset version", () => {
+    render(<SiteFooter />);
+    expect(screen.getAllByText("Compute Atlas")).toHaveLength(2);
+    expect(screen.queryByText(/v1\.30\.0/)).not.toBeInTheDocument();
+    expect(
+      screen.getByLabelText("Coordinates: 39.5 degrees north, 98.5 degrees west")
+    ).toBeInTheDocument();
+  });
+});

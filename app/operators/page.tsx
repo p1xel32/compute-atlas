@@ -2,19 +2,14 @@ import Link from "next/link";
 import type { Metadata } from "next";
 
 import { getOperators, getOperatorSummary, getAllFacilities, operatorSlug } from "@/lib/data";
+import { formatPower } from "@/lib/format";
 import { Breadcrumb } from "@/components/breadcrumb";
+import { PageMasthead } from "@/components/page-masthead";
+import { SurveyStatRow } from "@/components/survey-stat-row";
 import { itemListJsonLdString } from "@/lib/seo";
 import { siteConfig } from "@/lib/site";
 
-export const revalidate = 3600;
-
-/** Formats a MW figure as GW (1 decimal) above 1000, else whole MW. Avoids "0.0 GW" for small operators. */
-function formatPower(mw: number): string {
-  if (mw >= 1000) {
-    return `${(mw / 1000).toFixed(1)} GW`;
-  }
-  return `${Math.round(mw)} MW`;
-}
+export const revalidate = 86400;
 
 export const metadata: Metadata = {
   title: "Data centers by operator",
@@ -56,6 +51,7 @@ export default async function OperatorsIndexPage() {
 
   const disclosed = rows.filter((r) => r.total > 0);
   const undisclosed = rows.filter((r) => r.total === 0);
+  const totalDisclosedMw = disclosed.reduce((sum, r) => sum + r.total, 0);
 
   const totalFacilities = (await getAllFacilities()).length;
 
@@ -77,26 +73,41 @@ export default async function OperatorsIndexPage() {
       />
       <Breadcrumb items={[{ label: "Explore", href: "/explore" }, { label: "Operators" }]} />
 
-      {/* ------------------------------------------------------------------ */}
-      {/* Masthead                                                            */}
-      {/* ------------------------------------------------------------------ */}
-      <header className="space-y-4 pb-2">
-        <p className="font-mono text-xs uppercase tracking-widest text-primary">
-          By operator
-        </p>
-        <h1 className="font-display text-4xl leading-[1.05] text-foreground sm:text-5xl">
-          Operators
-        </h1>
-        <p className="text-base text-muted-foreground">
-          {rows.length} operators &middot; {disclosed.length} with disclosed
-          capacity &middot; {totalFacilities} facilities tracked
-        </p>
-        <div className="border-t border-border" />
-      </header>
+      <PageMasthead
+        eyebrow="By operator"
+        title="Operators"
+        dek="Who is building it. Every company running tracked capacity, ranked by disclosed megawatts. Operators with no disclosed figure are listed separately — undisclosed is not the same as small."
+      />
 
-      {/* ------------------------------------------------------------------ */}
-      {/* Operator grid                                                       */}
-      {/* ------------------------------------------------------------------ */}
+      <SurveyStatRow
+        stats={[
+          { value: rows.length.toLocaleString(), label: "Operators" },
+          { value: disclosed.length.toLocaleString(), label: "With capacity" },
+          { value: totalFacilities.toLocaleString(), label: "Facilities" },
+          { value: formatPower(totalDisclosedMw), label: "Disclosed" },
+        ]}
+      />
+
+      <section
+        aria-labelledby="operators-overview-heading"
+        className="max-w-2xl space-y-4"
+      >
+        <h2
+          id="operators-overview-heading"
+          className="font-display text-2xl text-foreground"
+        >
+          Why the list is split
+        </h2>
+        <p className="text-base leading-relaxed text-muted-foreground">
+          Operators are ranked by operational plus planned capacity, because
+          much of the largest buildout is still unbuilt — ranking on
+          operational alone would bury the companies with the biggest
+          pipelines. Companies that have never published a megawatt figure
+          sit in their own list below rather than at rank zero, where they
+          would read as small rather than silent.
+        </p>
+      </section>
+
       <section aria-labelledby="operators-list-heading" className="space-y-4">
         <h2 id="operators-list-heading" className="sr-only">
           All tracked operators
@@ -106,7 +117,7 @@ export default async function OperatorsIndexPage() {
             <li key={slug}>
               <Link
                 href={`/operators/${slug}`}
-                className="flex min-h-11 items-center justify-between gap-4 rounded-sm border border-border px-4 py-3 transition-colors hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+                className="flex min-h-11 items-center justify-between gap-4 rounded-sm border border-border px-4 py-3 transition-colors hover:bg-muted/50 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"
               >
                 <span className="flex flex-col gap-0.5 min-w-0">
                   <span className="text-sm text-foreground truncate">
@@ -117,7 +128,7 @@ export default async function OperatorsIndexPage() {
                   </span>
                 </span>
                 <span className="font-mono tabular-nums text-sm text-muted-foreground shrink-0">
-                  {summary.count}
+                  {summary.count} {summary.count === 1 ? "site" : "sites"}
                 </span>
               </Link>
             </li>
@@ -125,12 +136,9 @@ export default async function OperatorsIndexPage() {
         </ul>
       </section>
 
-      {/* ------------------------------------------------------------------ */}
-      {/* Zero-capacity operators — collapsed by default                     */}
-      {/* ------------------------------------------------------------------ */}
       {undisclosed.length > 0 && (
         <details className="group border-t border-border pt-6">
-          <summary className="flex min-h-11 cursor-pointer list-none items-center gap-2 rounded-sm font-mono text-xs uppercase tracking-wider text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2">
+          <summary className="flex min-h-11 cursor-pointer list-none items-center gap-2 rounded-sm font-mono text-xs uppercase tracking-wider text-muted-foreground hover:text-foreground focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring">
             Show {undisclosed.length} operators with no disclosed capacity
             <span
               aria-hidden="true"
@@ -144,7 +152,7 @@ export default async function OperatorsIndexPage() {
               <li key={slug}>
                 <Link
                   href={`/operators/${slug}`}
-                  className="flex min-h-11 items-center justify-between gap-4 rounded-sm border border-border px-4 py-3 transition-colors hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+                  className="flex min-h-11 items-center justify-between gap-4 rounded-sm border border-border px-4 py-3 transition-colors hover:bg-muted/50 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"
                 >
                   <span className="flex flex-col gap-0.5 min-w-0">
                     <span className="text-sm text-foreground truncate">
@@ -155,7 +163,7 @@ export default async function OperatorsIndexPage() {
                     </span>
                   </span>
                   <span className="font-mono tabular-nums text-sm text-muted-foreground shrink-0">
-                    {summary.count}
+                    {summary.count} {summary.count === 1 ? "site" : "sites"}
                   </span>
                 </Link>
               </li>

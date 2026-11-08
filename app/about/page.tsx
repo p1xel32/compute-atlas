@@ -2,11 +2,22 @@ import type { Metadata } from "next";
 import Link from "next/link";
 
 import { siteConfig } from "@/lib/site";
+import {
+  getStats,
+  getGenerationBuildoutStats,
+  getWaterStressExposure,
+  getCommunityReceptionCounts,
+  getFrictionTotal,
+} from "@/lib/data";
+import { formatPower } from "@/lib/format";
+import { AI_CLASSIFICATION_ENTRIES } from "@/lib/ai-classification";
 import { STATUS_META, STATUS_ORDER } from "@/lib/status";
 import { FACILITY_TYPE_ORDER, FACILITY_TYPE_META } from "@/lib/facility-type";
 import { COMMUNITY_RECEPTION_ORDER, COMMUNITY_RECEPTION_META } from "@/lib/community";
+import { statesPhrase } from "@/lib/us-states";
 import { Breadcrumb } from "@/components/breadcrumb";
 import { GraticuleSurvey } from "@/components/home/graticule-survey";
+import { SupportCta } from "@/components/support-cta";
 
 export const metadata: Metadata = {
   title: "About & method",
@@ -15,22 +26,36 @@ export const metadata: Metadata = {
   alternates: { canonical: "/about" },
 };
 
-export default function AboutPage() {
+/**
+ * Matches every sibling aggregate page that reads `loadFacilities` (which is
+ * itself tagged `"facilities"` on a 86400s timer): § Sources renders the live
+ * facility/state counts, so /about self-heals daily as well as on tag bust.
+ */
+export const revalidate = 86400;
+
+export default async function AboutPage() {
+  const stats = await getStats();
+  // § The stance's "receipts" paragraph — same helpers /power and the
+  // homepage already read, so the figures can never disagree across pages.
+  const buildout = await getGenerationBuildoutStats();
+  const waterStress = await getWaterStressExposure();
+  const community = await getCommunityReceptionCounts();
+  const frictionTotal = getFrictionTotal(community);
+
   return (
     <div data-content-width="3xl" className="mx-auto max-w-3xl px-4 py-10 sm:px-6 sm:py-16 space-y-12">
       <Breadcrumb items={[{ label: "Map", href: "/map" }, { label: "About" }]} />
-      {/* ---- Masthead ---- */}
       <header className="relative">
         <GraticuleSurvey className="pointer-events-none absolute inset-0 [mask-image:linear-gradient(to_bottom,transparent,black_20%,black_80%,transparent)]" />
         <div className="relative space-y-4 pb-8">
           <p className="font-mono text-xs uppercase tracking-widest text-primary">
-            About &amp; method · Edition 2026
+            About &amp; method
           </p>
           <h1 className="font-display text-4xl leading-[1.05] text-foreground sm:text-5xl">
             Public, but scattered.
           </h1>
           <p className="drop-cap max-w-2xl text-base leading-relaxed text-muted-foreground">
-            Compute Atlas is an open, source-cited survey of the grid-scale
+            Compute Atlas is a source-cited survey of the grid-scale
             compute buildout across the United States — where it&rsquo;s being
             built, by whom, and at what cost to energy, water, and the
             communities nearby.
@@ -39,7 +64,6 @@ export default function AboutPage() {
         <div className="border-t border-border" />
       </header>
 
-      {/* ---- About ---- */}
       <section aria-labelledby="about-method-heading" className="space-y-8">
         <h2 id="about-method-heading" className="sr-only">
           About &amp; method
@@ -72,11 +96,11 @@ export default function AboutPage() {
           </h3>
           <p className="text-sm leading-relaxed text-muted-foreground">
             Every field traces back to a public source, cited on the facility&rsquo;s
-            page. We record what the documents say and no more: ranges and
-            projections are marked as estimates, not presented as fact; where a
-            figure genuinely isn&rsquo;t known, the record says so rather than
-            guessing. Nothing here is fabricated or inferred beyond what a reader
-            can check for themselves.
+            page. Compute Atlas records what the documents say and no more:
+            ranges and projections are marked as estimates, not presented as
+            fact; where a figure genuinely isn&rsquo;t known, the record says
+            so rather than guessing. Nothing here is fabricated or inferred
+            beyond what a reader can check for themselves.
           </p>
         </div>
 
@@ -101,21 +125,84 @@ export default function AboutPage() {
             § The stance
           </p>
           <h3 className="font-display text-2xl text-foreground">
-            Non-partisan, and not affiliated with anyone.
+            Non-partisan, not neutral.
           </h3>
           <p className="text-sm leading-relaxed text-muted-foreground">
-            Compute Atlas takes no editorial position on whether any facility
-            should be built. It is not affiliated with any company, advocacy
-            group, or government agency. The aim is a factual, honest starting
-            point — what to make of it is up to the reader.{" "}
+            Compute Atlas takes no editorial position on whether any
+            particular facility should be built, and it is not affiliated
+            with any company, advocacy group, or government agency.
+          </p>
+          <p className="text-sm leading-relaxed text-muted-foreground">
+            That is not the same as having nothing to say. A buildout this
+            size is being paid for somewhere, and the somewhere is local. The
+            bill arrives as a gas plant permitted within sight of houses, as
+            water drawn from a basin that was already short of it, as a
+            rezoning settled before the neighbors knew there was a decision
+            to make. Those costs are consistently harder to look up than the
+            announcement that created them, and closing that gap is most of
+            what this record is for.
+          </p>
+          <p className="text-sm leading-relaxed text-muted-foreground">
+            The record is not ambiguous about the shape of it. Of{" "}
+            <Link
+              href="/power"
+              className="underline underline-offset-2 hover:text-foreground focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring rounded-sm"
+            >
+              the generation being built specifically to serve compute
+            </Link>
+            , {formatPower(buildout.fossilPlannedMw)} of planned capacity is
+            natural gas, against {formatPower(buildout.nonFossilPlannedMw)}{" "}
+            for every non-fossil technology combined — nuclear and
+            renewables included. Most of it is not built yet: the most
+            carbon-intensive option on the table is still the one being
+            chosen, in proceedings that are still open.
+            {waterStress.rated > 0 && (
+              <>
+                {" "}
+                {waterStress.highOrExtreme.toLocaleString("en-US")} of the{" "}
+                {waterStress.rated.toLocaleString("en-US")} sites with basin
+                data on file sit where the WRI already rates{" "}
+                <Link
+                  href="/learn/data-center-water-use"
+                  className="underline underline-offset-2 hover:text-foreground focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring rounded-sm"
+                >
+                  baseline water stress high or extremely high
+                </Link>
+                ; that describes the basin, not the facility&rsquo;s own
+                measured use.
+              </>
+            )}
+            {frictionTotal > 0 && (
+              <>
+                {" "}
+                {frictionTotal.toLocaleString("en-US")} sites have drawn{" "}
+                <Link
+                  href="/opposition"
+                  className="underline underline-offset-2 hover:text-foreground focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring rounded-sm"
+                >
+                  documented local opposition
+                </Link>
+                , {community.litigation.toLocaleString("en-US")} of them
+                into court.
+              </>
+            )}{" "}
+            Each figure is a count of sourced records, not an estimate.
+          </p>
+          <p className="text-sm leading-relaxed text-muted-foreground">
+            None of that is an argument against AI, or against computing at
+            scale. It is an argument that the costs should be as easy to
+            find as the announcements, and that nobody should have to
+            reverse-engineer a water filing to learn what is being built
+            next to them. What to make of the figures is still the
+            reader&rsquo;s.{" "}
             <a
               href={siteConfig.repoUrl}
               target="_blank"
               rel="noreferrer noopener"
-              aria-label="View the source code and data on GitHub (opens in new tab)"
-              className="underline underline-offset-2 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 rounded-sm"
+              aria-label="The source code is public. View it on GitHub (opens in new tab)"
+              className="underline underline-offset-2 hover:text-foreground focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring rounded-sm"
             >
-              The source code and data are public.
+              The source code is public.
             </a>
           </p>
         </div>
@@ -163,8 +250,9 @@ export default function AboutPage() {
               {FACILITY_TYPE_META[FACILITY_TYPE_ORDER[2]].label}
             </dt>
             <dd className="text-muted-foreground">
-              Dedicated generation — e.g. nuclear or small modular reactors —
-              built or contracted specifically to feed the compute buildout.
+              Dedicated generation — most often natural gas, plus nuclear and
+              small modular reactors — built or contracted specifically to feed
+              the compute buildout.
               Tracked as its own layer, distinct from the compute campuses it
               supplies.
             </dd>
@@ -195,28 +283,12 @@ export default function AboutPage() {
           itself meaningful information, not a gap in the data:
         </p>
         <dl className="space-y-3 text-sm">
-          <div>
-            <dt className="font-medium text-foreground">Confirmed</dt>
-            <dd className="text-muted-foreground">
-              The operator or a credible primary source explicitly describes the
-              facility as an AI or GPU cluster (e.g., xAI Colossus).
-            </dd>
-          </div>
-          <div>
-            <dt className="font-medium text-foreground">Likely</dt>
-            <dd className="text-muted-foreground">
-              The facility exhibits strong indicators (e.g., hyperscale GPU
-              procurement, AI-specific power agreements) but has not been
-              explicitly confirmed as AI-primary.
-            </dd>
-          </div>
-          <div>
-            <dt className="font-medium text-foreground">Mixed use</dt>
-            <dd className="text-muted-foreground">
-              A multi-purpose campus where AI workloads are a known component
-              but not necessarily the primary or exclusive use.
-            </dd>
-          </div>
+          {AI_CLASSIFICATION_ENTRIES.map((entry) => (
+            <div key={entry.key}>
+              <dt className="font-medium text-foreground">{entry.label}</dt>
+              <dd className="text-muted-foreground">{entry.description}</dd>
+            </div>
+          ))}
         </dl>
       </section>
 
@@ -372,9 +444,19 @@ export default function AboutPage() {
           Sources
         </h2>
         <p className="text-sm leading-relaxed text-muted-foreground">
-          The current dataset is a curated seed drawn from publicly available
-          sources. Every record links to the specific sources used to create or
-          update it. Source types include:
+          The dataset now covers {stats.count.toLocaleString("en-US")}{" "}
+          facilities across {statesPhrase(stats.stateCodes)},
+          compiled from publicly available sources. Every record links to the
+          specific sources used to create or update it. Source types include:
+        </p>
+        <p className="text-sm leading-relaxed text-muted-foreground">
+          For the full sourcing standard &mdash; how facilities are found,
+          verified, and deduplicated, and how to read the citations behind a
+          record &mdash; see the{" "}
+          <Link href="/methodology" className="underline underline-offset-2 hover:text-foreground focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring rounded-sm">
+            methodology
+          </Link>
+          .
         </p>
         <ul className="list-disc list-inside space-y-1 text-sm text-muted-foreground">
           <li>Company announcements and press releases</li>
@@ -384,9 +466,16 @@ export default function AboutPage() {
           <li>OpenStreetMap data (for coordinates and facility boundaries)</li>
         </ul>
         <p className="text-sm leading-relaxed text-muted-foreground">
-          The roadmap includes automated ingestion from interconnection queues
-          and public permit databases, as well as a structured community
-          submission process.
+          <Link
+            href="/contribute"
+            className="underline underline-offset-2 hover:text-foreground focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring rounded-sm"
+          >
+            Community submissions
+          </Link>{" "}
+          are live: anyone can share a lead or submit a full record, and every
+          submission is staged for human review before it publishes. Automated
+          ingestion from interconnection queues and public permit databases
+          remains on the roadmap.
         </p>
       </section>
 
@@ -410,15 +499,16 @@ export default function AboutPage() {
           <div>
             <dt className="font-medium text-foreground">Exact</dt>
             <dd className="text-muted-foreground">
-              Lat/lon is the facility&rsquo;s real footprint. The default —
-              every record without an explicit precision value is exact.
+              Lat/lon is the facility&rsquo;s real footprint. Set only when a
+              source places the facility there; it is never assumed.
             </dd>
           </div>
           <div>
             <dt className="font-medium text-foreground">Approximate</dt>
             <dd className="text-muted-foreground">
               A best-effort geocode, e.g. from a street address, not
-              parcel-confirmed.
+              parcel-confirmed. The default for any record that does not state a
+              precision.
             </dd>
           </div>
           <div>
@@ -496,7 +586,7 @@ export default function AboutPage() {
               target="_blank"
               rel="noreferrer noopener"
               aria-label="OpenFreeMap map tiles (opens in new tab)"
-              className="underline underline-offset-2 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 rounded-sm"
+              className="underline underline-offset-2 hover:text-foreground focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring rounded-sm"
             >
               OpenFreeMap
             </a>
@@ -506,7 +596,7 @@ export default function AboutPage() {
               target="_blank"
               rel="noreferrer noopener"
               aria-label="Open Database License (ODbL) (opens in new tab)"
-              className="underline underline-offset-2 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 rounded-sm"
+              className="underline underline-offset-2 hover:text-foreground focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring rounded-sm"
             >
               Open Database License (ODbL)
             </a>
@@ -519,7 +609,7 @@ export default function AboutPage() {
               target="_blank"
               rel="noreferrer noopener"
               aria-label="Epoch AI datasets (opens in new tab)"
-              className="underline underline-offset-2 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 rounded-sm"
+              className="underline underline-offset-2 hover:text-foreground focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring rounded-sm"
             >
               Epoch AI
             </a>{" "}
@@ -529,23 +619,50 @@ export default function AboutPage() {
               target="_blank"
               rel="noreferrer noopener"
               aria-label="Creative Commons Attribution 4.0 (CC-BY) license (opens in new tab)"
-              className="underline underline-offset-2 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 rounded-sm"
+              className="underline underline-offset-2 hover:text-foreground focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring rounded-sm"
             >
               Creative Commons Attribution 4.0 (CC-BY)
             </a>{" "}
             license.
           </li>
           <li>
-            The Compute Atlas codebase and original data are published at{" "}
+            The Compute Atlas codebase is published under the{" "}
+            <a
+              href="https://opensource.org/licenses/MIT"
+              target="_blank"
+              rel="noreferrer noopener"
+              aria-label="MIT license (opens in new tab)"
+              className="underline underline-offset-2 hover:text-foreground focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring rounded-sm"
+            >
+              MIT license
+            </a>{" "}
+            and the dataset is published under{" "}
+            <a
+              href="https://creativecommons.org/licenses/by/4.0/"
+              target="_blank"
+              rel="noreferrer noopener"
+              aria-label="Creative Commons Attribution 4.0 (CC-BY) license (opens in new tab)"
+              className="underline underline-offset-2 hover:text-foreground focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring rounded-sm"
+            >
+              Creative Commons Attribution 4.0 (CC-BY)
+            </a>
+            . The code is published at{" "}
             <a
               href={siteConfig.repoUrl}
               target="_blank"
               rel="noreferrer noopener"
-              aria-label="View the Compute Atlas repository on GitHub (opens in new tab)"
-              className="underline underline-offset-2 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 rounded-sm"
+              aria-label={`${siteConfig.repoUrl} (opens in new tab)`}
+              className="underline underline-offset-2 hover:text-foreground focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring rounded-sm"
             >
               {siteConfig.repoUrl}
             </a>
+            . When reusing the data, credit Compute Atlas as described in{" "}
+            <Link
+              href="/data#cite-heading"
+              className="underline underline-offset-2 hover:text-foreground focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring rounded-sm"
+            >
+              how to cite the data
+            </Link>
             .
           </li>
         </ul>
@@ -562,7 +679,7 @@ export default function AboutPage() {
         <p className="text-sm leading-relaxed text-muted-foreground">
           I build open-source tools &mdash; some for AI-assisted engineering,
           some for making public-interest data verifiable. Compute Atlas is the
-          latter: an open atlas of the AI-datacenter buildout across the United
+          latter: an atlas of the AI-datacenter buildout across the United
           States &mdash; where these facilities are going up, by whom, and at
           what cost to the grid, the water, and the communities nearby. The
           record is public but scattered across permit filings, tax-abatement
@@ -575,15 +692,13 @@ export default function AboutPage() {
           the same across everything I build: tools that are verifiable,
           community-stewarded, and honest about their limits.
         </p>
-        <a
-          href={siteConfig.sponsorUrl}
-          target="_blank"
-          rel="noreferrer noopener"
-          aria-label="Sponsor Compute Atlas on GitHub Sponsors (opens in new tab)"
-          className="inline-flex h-11 items-center gap-2 rounded-md border border-primary bg-primary/10 px-5 font-mono text-sm font-semibold uppercase tracking-wider text-primary transition-colors hover:bg-primary/20 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
-        >
-          Sponsor on GitHub <span aria-hidden="true">↗</span>
-        </a>
+        <SupportCta />
+        <p className="max-w-2xl text-sm leading-relaxed text-muted-foreground">
+          <Link href="/support" className="underline underline-offset-4 hover:text-foreground focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring rounded-sm">
+            More on how Compute Atlas is funded
+          </Link>{" "}
+          &mdash; including what support does not buy.
+        </p>
       </section>
 
       {/* Contribute / corrections */}
@@ -606,7 +721,7 @@ export default function AboutPage() {
         <Link
           href="/contribute"
           aria-label="Suggest a facility or correction using the in-app form"
-          className="inline-flex h-11 items-center gap-2 rounded-md border border-primary bg-primary/10 px-5 font-mono text-sm font-semibold uppercase tracking-wider text-primary transition-colors hover:bg-primary/20 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+          className="inline-flex h-11 items-center gap-2 rounded-md border border-primary bg-primary/10 px-5 font-mono text-sm font-semibold uppercase tracking-wider text-primary transition-colors hover:bg-primary/20 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"
         >
           Suggest a facility →
         </Link>
@@ -616,8 +731,8 @@ export default function AboutPage() {
             href={`${siteConfig.repoUrl}/issues/new/choose`}
             target="_blank"
             rel="noreferrer noopener"
-            aria-label="Open an issue on GitHub to suggest a correction or new facility (opens in new tab)"
-            className="underline underline-offset-2 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 rounded-sm"
+            aria-label="or open an issue on GitHub to suggest a correction or new facility (opens in new tab)"
+            className="underline underline-offset-2 hover:text-foreground focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring rounded-sm"
           >
             or open an issue on GitHub
           </a>

@@ -1,11 +1,15 @@
 # CI — the pull-request gate for compute-atlas.
 #
 # Runs typecheck + eslint + vitest (jsdom; the suite is self-contained and needs
-# NO DATABASE_URL / API_ADMIN_TOKEN — the API/auth tests manage their own env)
-# and the discovery + seo-runner BATS suites. The Vercel preview build still covers the
-# production `next build` separately, so this workflow deliberately omits it
-# (and the Playwright e2e suite, which needs browsers + a live server + external
-# basemap tiles).
+# NO DATABASE_URL / API_ADMIN_TOKEN — the API/auth tests manage their own env),
+# the discovery, vercel ignore-gate and workflow-script BATS suites, and the
+# Playwright e2e suite. The Vercel preview build still
+# covers the production `next build` separately.
+#
+# WHICH JOBS CAN BLOCK A MERGE is decided by branch protection on `main`, NOT by
+# anything in this file. As of 2026-09-11 the required contexts are exactly
+# "typecheck · lint · test", "BATS tests", and "Playwright e2e" — see the note
+# on the e2e job below for why it was added and what changed.
 name: CI
 
 on:
@@ -13,6 +17,8 @@ on:
     branches: [main]
   push:
     branches: [main]
+  # Keeps CI runnable on demand.
+  workflow_dispatch:
 
 # Least privilege: CI only needs to read the checked-out code.
 permissions:
@@ -26,23 +32,101 @@ jobs:
   quality:
     name: typecheck · lint · test
     runs-on: ubuntu-latest
+    # ⛔ DO NOT put DATABASE_URL in a job-level `env:` here. Doing so exposes it to
+    # EVERY step, including `npm test`, and the vitest suite is self-contained by
+    # design: app/api/facilities/route.test.ts and app/api/stats/route.test.ts
+    # assert against the bundled data/facilities.json snapshot. With a live
+    # DATABASE_URL present they read Neon instead and fail on the count
+    # (`expected 1137 to be 1116` — CI, 2026-08-25). The secret belongs on the one
+    # step that needs it, and nowhere else.
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "22"
           cache: npm
       - run: npm ci
+      - name: Seed snapshot and generate hero artifacts
+        run: npm run prebuild
+        env:
+          # Non-secret: lets ensure-data-snapshot fill data/ from the fixture.
+          # Step-scoped so no later step (e.g. test:dataset) can silently run on it.
+          ALLOW_FIXTURE_SNAPSHOT: "1"
       - run: npm run typecheck
       - run: npm run lint
+
+      # Blocks the eighth site of the raw-error-log class. drizzle-orm's
+      # `DrizzleQueryError.message` is literally `Failed query: <sql> params:
+      # <bound values>`, so logging the error object writes the query's bound
+      # params — an IP hash, a subscriber's plaintext email, a live bearer
+      # token — into Vercel Runtime Logs. A 2026-09-27 audit found SEVEN such
+      # sites; all seven now use `redactedErrorCode()` (lib/db-error.ts), and
+      # nothing stopped a new one.
+      #
+      # WHY A STEP HERE AND NOT AN ESLINT RULE: an `eslint-rules/` entry would
+      # be the tidier home (the repo already has one, no-internal-codenames)
+      # and is the better eventual shape. It is not this change: it needs
+      # `eslint.config.mjs`, and this script needs a `package.json` script
+      # entry to ride `npm run lint` at all. Landing it as a step inside the
+      # job that branch protection already requires ("typecheck · lint · test")
+      # makes it block a merge TODAY rather than after a second edit — a
+      # correct check wired into nothing is the failure mode this repo has hit
+      # twice (see the Playwright and drift-classifier notes below).
+      # ⛔ Do not move this to an `actionlint`-style standalone job: a job that
+      # is not a required context can go red while the merge stays available.
+      #
+      # `node` directly, not `npx`: the script is plain ESM importing only
+      # `typescript`, which `npm ci` above already installed.
+      - name: Lint for raw error logs in lib/ and app/
+        run: node scripts/lint-no-raw-error-logs.mjs
+
       - run: npm test
 
   discovery-shell:
     name: BATS tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # WHY THIS EXISTS: automation-health.yml — the watchdog added the day
+      # before to catch dead scheduled workflows — shipped on 2026-09-09 with
+      # `${{ runner.temp }}` inside a job-level `env:`, where the `runner`
+      # context is not available. GitHub rejects that at PARSE time, so the
+      # file never ran at all: zero jobs, a 0-second red run on every push, the
+      # 13:00 UTC schedule never firing, and the workflow registered under its
+      # path instead of its `name:`. Nothing in CI could catch it, because CI
+      # only ever exercised the workflows that already parsed. A workflow that
+      # cannot start is invisible to every test written inside it.
+      #
+      # WHY IT LIVES IN THIS JOB AND NOT ITS OWN: `name: BATS tests` is one of
+      # exactly two required status-check contexts in main's branch protection
+      # ("typecheck · lint · test" is the other). A separate `actionlint` job
+      # would be the tidier home and the wrong one — not being a required
+      # context, it could go red while the merge stayed available, which is the
+      # same "correct check that gates nothing" trap described on the e2e job
+      # below. ⛔ Do not rename this job to match its widened scope; the name
+      # IS the branch-protection contract.
+      #
+      # Pinned by version and verified by checksum, matching the full-SHA
+      # pinning used for every action in this repo. 1.7.12 is also the version
+      # on the maintainer's machine, so a local `actionlint .github/workflows/*.yml`
+      # returns the same verdict as CI instead of a version-skew disagreement.
+      # ubuntu-latest ships shellcheck, which actionlint auto-detects for `run:`
+      # blocks; that matches the local setup too, and no workflow here uses
+      # python, so pyflakes being absent changes nothing either way.
+      - name: Lint GitHub Actions workflow files
+        run: |
+          set -euo pipefail
+          VERSION=1.7.12
+          SHA256=8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+          TARBALL="actionlint_${VERSION}_linux_amd64.tar.gz"
+          curl -fsSL -o "$RUNNER_TEMP/$TARBALL" \
+            "https://github.com/rhysd/actionlint/releases/download/v${VERSION}/${TARBALL}"
+          echo "${SHA256}  ${RUNNER_TEMP}/${TARBALL}" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/$TARBALL" -C "$RUNNER_TEMP" actionlint
+          "$RUNNER_TEMP/actionlint" -color .github/workflows/*.yml
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "22"
           cache: npm
@@ -51,5 +135,70 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y bats
       - name: discovery BATS
         run: bats tests/discovery/run.bats
-      - name: seo-runner BATS
-        run: bats tests/seo-runner/run.bats
+      - name: vercel ignore-gate BATS
+        run: bats tests/vercel/run.bats
+      # Covers scripts/classify-digest-output.sh.
+      # Wired in deliberately: a correct test that runs in no workflow is
+      # indistinguishable from no test — see the Playwright note below for the
+      # same lesson learned the same way.
+      - name: workflows BATS
+        run: bats tests/workflows/run.bats
+
+  # Playwright covers what vitest structurally cannot: vitest calls page functions
+  # directly and never exercises Next's HTTP layer, so it is blind to status-code
+  # bugs. `e2e/facility.spec.ts` correctly caught the soft-404 regression fixed in
+  # PR #180 — and nobody saw it, because Playwright ran in no workflow at all. A
+  # correct test that never runs is indistinguishable from no test.
+  #
+  # ⛔ REQUIRED SINCE 2026-09-11 — a red e2e now blocks the merge. Before this
+  # date the job was deliberately absent from main's required-status-check
+  # contexts, on the theory that a red run stayed visible in the PR checks list
+  # even though the merge button stayed available. In practice a red Playwright
+  # run merged to main unnoticed under that design, which is how two WCAG
+  # violations reached main. It was added to the required contexts to close that
+  # gap.
+  #
+  # BLOCKING IS STILL EXPRESSED VIA BRANCH PROTECTION, NOT `continue-on-error`,
+  # and that part of the design is unchanged and still load-bearing:
+  # `continue-on-error: true` would report this job GREEN on failure, which
+  # recreates the exact invisibility this job exists to end — now worse, since a
+  # green-on-failure job would also silently defeat the new required-context
+  # gate instead of merely looking fine in the checks list. If e2e should ever
+  # go back to non-blocking, remove it from the required contexts in branch
+  # protection — do not express that here.
+  #
+  # No build step: playwright.config.ts's `webServer` runs `npm run build && npm
+  # run start` itself. The build needs no DATABASE_URL — server reads fall back to
+  # the bundled data/facilities.json snapshot.
+  #
+  # ⚠️ MEASURED, and the margin is the thing to watch: that webServer builds every
+  # prerendered route inside `webServer.timeout` on a cold runner — this job caches
+  # no `.next`, so CI always pays the cold path. Read from the real CI log on #287:
+  # build 02:49:42 → `Running 87 tests` 02:52:49 = 187s, against what was then a
+  # 240s budget (78% consumed) at 2,402 routes. The county lens pushed the build to
+  # 3,039 routes (+26.5%) and `webServer.timeout` is now 600_000 in
+  # playwright.config.ts. If this job goes red with a webServer timeout rather than
+  # assertion failures, the fix is raising that timeout — not "fixing" the tests.
+  # That matters more than it did before this job was required: a webServer timeout
+  # here blocks every merge to main, not just this job's own status.
+  #
+  # ⇒ Re-measure this margin after any change that adds a batch of prerendered
+  # routes, and read it from a CI log's STEP timestamps — never a local build, and
+  # never the job duration (which includes `npm ci` and the browser install).
+  e2e:
+    name: Playwright e2e
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+          cache: npm
+      - run: npm ci
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps chromium
+      # `github` reporter annotates failures inline on the PR diff; `list` keeps
+      # the run readable in the raw log. Both override the config's `html`
+      # default, which produces no useful stdout in CI.
+      - name: Run Playwright e2e tests
+        run: npm run test:e2e -- --reporter=github,list

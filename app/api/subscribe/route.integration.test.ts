@@ -1,0 +1,878 @@
+// @vitest-environment node
+import { beforeAll, beforeEach, afterAll, afterEach, describe, it, expect, vi } from "vitest";
+
+vi.mock("next/cache", () => ({
+  revalidateTag: vi.fn(),
+  revalidatePath: vi.fn(),
+  unstable_cache: (fn: unknown) => fn,
+}));
+vi.mock("@/lib/db/client");
+
+// `after()` throws "called outside a request scope" unless invoked inside a
+// real Next.js request lifecycle, which this suite (calling POST directly)
+// never sets up. Mocked to run the task immediately and capture its promise
+// in `pendingAfter` so tests can deterministically await the email-send
+// phase. Mirrors app/api/access/request/route's identical mock.
+let pendingAfter: Promise<unknown> | undefined;
+vi.mock("next/server", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("next/server")>();
+  return {
+    ...actual,
+    after: (task: () => unknown) => {
+      pendingAfter = Promise.resolve().then(task);
+    },
+  };
+});
+
+const resendSendMock = vi.fn();
+vi.mock("resend", () => ({
+  Resend: vi.fn().mockImplementation(function MockResend() {
+    return { emails: { send: resendSendMock } };
+  }),
+}));
+
+import { eq } from "drizzle-orm";
+
+import * as dbClient from "@/lib/db/client";
+import { makeTestDb, seedFacility, type TestDbHandle } from "@/test/pglite-db";
+import { emailSendsTable, subscribeAttemptsTable, subscriptionsTable } from "@/lib/db/schema";
+import { CONFIRM_CAP_MAX } from "@/lib/email-sends";
+import { hashNotifyEmail } from "@/lib/rate-limit";
+import { EMAIL_SEND_CAP_MAX, hashIp, RATE_LIMIT_MAX } from "@/lib/rate-limit";
+import { CONSENT_COOKIE_NAME, createConsentValue } from "@/lib/subscribe-consent";
+import facilitiesRaw from "@/data/facilities.json";
+import type { Facility } from "@/lib/schema";
+
+// Imported after the mocks above so the mocked modules are in effect.
+import { POST } from "./route";
+
+const seedDoc = facilitiesRaw[0] as unknown as Facility; // xai-colossus-memphis-tn
+
+// cf-connecting-ip is honoured only alongside a valid edge secret
+// (lib/edge-secret.ts), so these tests present one like Cloudflare would.
+process.env.EDGE_SHARED_SECRET = "test-edge-secret";
+const EDGE_HEADER = { "x-edge-shared-secret": "test-edge-secret" };
+
+function req(body: unknown, headers?: HeadersInit): Request {
+  return new Request("http://localhost/api/subscribe", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...EDGE_HEADER, ...headers },
+    body: JSON.stringify(body),
+  });
+}
+
+async function flushAfter(): Promise<void> {
+  await pendingAfter;
+}
+
+/** Rows in `subscribe_attempts` — the per-IP subscribe budget is spent by ATTEMPTS, not by successful inserts. */
+async function countAttempts(): Promise<number> {
+  return (await tdb.db.select().from(subscribeAttemptsTable)).length;
+}
+
+/** Seeds `n` prior attempt rows for `ipHash`, i.e. spends `n` units of that IP's budget. */
+async function seedAttempts(ipHash: string, n: number): Promise<void> {
+  for (let i = 0; i < n; i++) {
+    await tdb.db.insert(subscribeAttemptsTable).values({ submitterIpHash: ipHash });
+  }
+}
+
+let tdb: TestDbHandle;
+
+beforeAll(async () => {
+  tdb = await makeTestDb();
+  vi.mocked(dbClient.getDb).mockReturnValue(tdb.db as never);
+  vi.mocked(dbClient.hasDatabaseUrl).mockReturnValue(true);
+  // subscribeToTarget resolves the target facility via getFacilityById ->
+  // loadFacilities, which gates on readsUseDatabase() (see lib/db/client.ts)
+  // rather than hasDatabaseUrl() directly.
+  vi.mocked(dbClient.readsUseDatabase).mockReturnValue(true);
+});
+
+beforeEach(async () => {
+  await tdb.reset();
+  pendingAfter = undefined;
+  resendSendMock.mockReset();
+  resendSendMock.mockResolvedValue({ data: { id: "email-1" }, error: null });
+});
+
+afterEach(() => {
+  vi.unstubAllEnvs();
+});
+
+afterAll(async () => {
+  await tdb.client.close();
+});
+
+describe("POST /api/subscribe", () => {
+  it("stages a pending subscription with 201, and sends nothing when RESEND_API_KEY is unset", async () => {
+    await seedFacility(tdb.db, seedDoc);
+
+    const res = await POST(req({ email: "reader@example.com", targetType: "facility", targetId: seedDoc.id }));
+    expect(res.status).toBe(201);
+    const body = await res.json();
+    expect(body.ok).toBe(true);
+    await flushAfter();
+
+    const rows = await tdb.db.select().from(subscriptionsTable);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].status).toBe("pending");
+    expect(resendSendMock).not.toHaveBeenCalled();
+  });
+
+  it("sends the confirm email once RESEND_API_KEY is set", async () => {
+    await seedFacility(tdb.db, seedDoc);
+    vi.stubEnv("RESEND_API_KEY", "test-key");
+
+    const res = await POST(req({ email: "reader@example.com", targetType: "facility", targetId: seedDoc.id }));
+    expect(res.status).toBe(201);
+    await flushAfter();
+
+    expect(resendSendMock).toHaveBeenCalledTimes(1);
+    const args = resendSendMock.mock.calls[0][0];
+    expect(args.to).toBe("reader@example.com");
+  });
+
+  // Pairs with "sends the confirm email once RESEND_API_KEY is set" above:
+  // the auto-confirm (notice) branch must return the exact same {ok:true}/201
+  // shape as the ordinary pending (confirm) branch — the two must be
+  // indistinguishable from the response alone.
+  it("auto-confirms and sends a watch-started notice for an address with a confirmed row elsewhere, same 201 {ok:true} shape", async () => {
+    await seedFacility(tdb.db, seedDoc);
+    const email = "route-already-confirmed@example.com";
+    await tdb.db.insert(subscriptionsTable).values({
+      email,
+      targetType: "state",
+      targetId: "TN",
+      status: "confirmed",
+      confirmedAt: new Date(),
+      confirmToken: "route-seed-tok",
+      unsubscribeToken: "route-seed-unsub",
+    });
+    vi.stubEnv("RESEND_API_KEY", "test-key");
+    // The shortcut also needs the requester to prove they hold the address —
+    // a signed cookie from GET /api/subscribe/confirm (security review
+    // 2026-09-27). Without the salt there is no signing key and the cookie is
+    // never valid, so both stubs are required for this to exercise the branch.
+    vi.stubEnv("CONTRIBUTE_IP_SALT", "route-auto-confirm-test-salt");
+
+    const res = await POST(
+      req(
+        { email, targetType: "facility", targetId: seedDoc.id },
+        { cookie: `${CONSENT_COOKIE_NAME}=${createConsentValue(email)}` }
+      )
+    );
+    expect(res.status).toBe(201);
+    const body = await res.json();
+    expect(body).toEqual({ ok: true });
+    await flushAfter();
+
+    expect(resendSendMock).toHaveBeenCalledTimes(1);
+    const args = resendSendMock.mock.calls[0][0];
+    expect(args.to).toBe(email);
+    expect(args.subject).toContain(seedDoc.name);
+
+    const rows = await tdb.db.select().from(subscriptionsTable);
+    const newRow = rows.find((r) => r.targetId === seedDoc.id);
+    expect(newRow?.status).toBe("confirmed");
+  });
+
+  it("rejects a malformed JSON body with 400", async () => {
+    const badReq = new Request("http://localhost/api/subscribe", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{not valid json",
+    });
+    const res = await POST(badReq);
+    expect(res.status).toBe(400);
+  });
+
+  it("rejects an invalid email with 400 and writes nothing", async () => {
+    const res = await POST(req({ email: "not-an-email", targetType: "facility", targetId: seedDoc.id }));
+    expect(res.status).toBe(400);
+    expect(await tdb.db.select().from(subscriptionsTable)).toHaveLength(0);
+  });
+
+  it("honeypot: returns 201 ok but inserts zero rows and never sends", async () => {
+    await seedFacility(tdb.db, seedDoc);
+    vi.stubEnv("RESEND_API_KEY", "test-key");
+    const res = await POST(
+      req({ email: "spammer@example.com", targetType: "facility", targetId: seedDoc.id, website: "spam" })
+    );
+    expect(res.status).toBe(201);
+    expect(await tdb.db.select().from(subscriptionsTable)).toHaveLength(0);
+    expect(resendSendMock).not.toHaveBeenCalled();
+  });
+
+  it("rate-limits a 6th request from the same ip within the window", async () => {
+    await seedFacility(tdb.db, seedDoc);
+    const ip = "203.0.113.14";
+    await seedAttempts(hashIp(ip), RATE_LIMIT_MAX);
+
+    const res = await POST(
+      req({ email: "reader@example.com", targetType: "facility", targetId: seedDoc.id }, { "x-forwarded-for": ip })
+    );
+    expect(res.status).toBe(429);
+
+    const rows = await tdb.db.select().from(subscriptionsTable);
+    expect(rows).toHaveLength(0); // the 6th attempt must not have landed
+  });
+
+  it("buckets by cf-connecting-ip, not a spoofed leftmost x-forwarded-for", async () => {
+    await seedFacility(tdb.db, seedDoc);
+    const trustedIp = "203.0.113.15";
+    await seedAttempts(hashIp(trustedIp), RATE_LIMIT_MAX);
+
+    // A different leftmost x-forwarded-for entry on every request is exactly
+    // what defeated the naive leftmost-x-forwarded-for extraction
+    // lib/rate-limit.ts once had, in production (see lib/rate-limit.ts's
+    // extractTrustedClientIp doc comment); cf-connecting-ip must still win.
+    const res = await POST(
+      req(
+        { email: "reader@example.com", targetType: "facility", targetId: seedDoc.id },
+        { "x-forwarded-for": "198.51.100.10", "cf-connecting-ip": trustedIp }
+      )
+    );
+    expect(res.status).toBe(429);
+
+    // The spoofed-XFF request landed in the TRUSTED ip's bucket, so it was
+    // refused there — it did not get a fresh budget of its own.
+    const rows = await tdb.db.select().from(subscriptionsTable);
+    expect(rows).toHaveLength(0); // the spoofed-XFF attempt must not have landed
+  });
+});
+
+/**
+ * The cap counts ATTEMPTS, not successful inserts. It previously counted
+ * `subscriptions` rows, which only a successful INSERT can raise — so every
+ * request that terminated without inserting was free and an attacker who never
+ * succeeded was never limited.
+ *
+ * The property under test is stronger than "rejections are counted": EVERY
+ * terminating path must write EXACTLY ONE attempt row, so no branch is
+ * distinguishable from another by side effect. `subscribeToTarget` deliberately
+ * returns an identical generic `{ok:true}` for the honeypot / duplicate /
+ * over-cap paths, and the confirm email is sent after the response so latency
+ * can't separate them either; a rate-limit write that fired on some of those
+ * paths but not others would put the distinction straight back.
+ */
+describe("POST /api/subscribe — attempt accounting", () => {
+  interface TerminatingPath {
+    name: string;
+    /** Runs against the already-seeded DB, before the measured request. */
+    prepare?: () => Promise<void>;
+    makeRequest: () => Request;
+    expectedStatus: number;
+    /**
+     * Subscription rows the request is expected to add. Pins WHICH branch ran,
+     * not just its status code — several distinct paths share `201`, and
+     * without this the honeypot / over-cap / duplicate cases would still pass
+     * if they had quietly fallen through to the insert.
+     */
+    expectedSubscriptionDelta: 0 | 1;
+  }
+
+  const terminatingPaths: TerminatingPath[] = [
+    {
+      name: "unparseable JSON body",
+      makeRequest: () =>
+        new Request("http://localhost/api/subscribe", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: "{not valid json",
+        }),
+      expectedStatus: 400,
+      expectedSubscriptionDelta: 0,
+    },
+    {
+      name: "Zod-invalid email",
+      makeRequest: () => req({ email: "not-an-email", targetType: "facility", targetId: seedDoc.id }),
+      expectedStatus: 400,
+      expectedSubscriptionDelta: 0,
+    },
+    {
+      name: "missing targetId (Zod refine)",
+      makeRequest: () => req({ email: "reader@example.com", targetType: "facility" }),
+      expectedStatus: 400,
+      expectedSubscriptionDelta: 0,
+    },
+    {
+      name: "honeypot filled",
+      makeRequest: () =>
+        req({ email: "spammer@example.com", targetType: "facility", targetId: seedDoc.id, website: "spam" }),
+      expectedStatus: 201,
+      expectedSubscriptionDelta: 0,
+    },
+    {
+      name: "unknown facility id",
+      makeRequest: () => req({ email: "reader@example.com", targetType: "facility", targetId: "no-such-facility" }),
+      expectedStatus: 400,
+      expectedSubscriptionDelta: 0,
+    },
+    {
+      name: "unknown state code",
+      makeRequest: () => req({ email: "reader@example.com", targetType: "state", targetId: "ZZ" }),
+      expectedStatus: 400,
+      expectedSubscriptionDelta: 0,
+    },
+    {
+      name: "over the per-address send cap",
+      prepare: async () => {
+        // Distinct targets, so the partial unique index doesn't fire first —
+        // the send cap is what must terminate this request.
+        for (let i = 0; i < EMAIL_SEND_CAP_MAX; i++) {
+          await tdb.db.insert(subscriptionsTable).values({
+            email: "capped@example.com",
+            targetType: "facility",
+            targetId: `other-facility-${i}`,
+            status: "pending",
+            confirmToken: `cap-tok-${i}`,
+            unsubscribeToken: `cap-unsub-${i}`,
+          });
+        }
+      },
+      makeRequest: () => req({ email: "capped@example.com", targetType: "facility", targetId: seedDoc.id }),
+      expectedStatus: 201,
+      expectedSubscriptionDelta: 0,
+    },
+    {
+      name: "duplicate of an existing active subscription",
+      prepare: async () => {
+        await tdb.db.insert(subscriptionsTable).values({
+          email: "dupe@example.com",
+          targetType: "facility",
+          targetId: seedDoc.id,
+          status: "pending",
+          confirmToken: "dupe-tok",
+          unsubscribeToken: "dupe-unsub",
+        });
+      },
+      makeRequest: () => req({ email: "dupe@example.com", targetType: "facility", targetId: seedDoc.id }),
+      expectedStatus: 201,
+      expectedSubscriptionDelta: 0,
+    },
+    {
+      name: "clean success",
+      makeRequest: () => req({ email: "reader@example.com", targetType: "facility", targetId: seedDoc.id }),
+      expectedStatus: 201,
+      expectedSubscriptionDelta: 1,
+    },
+    {
+      name: "state subscription success",
+      makeRequest: () => req({ email: "reader@example.com", targetType: "state", targetId: "TN" }),
+      expectedStatus: 201,
+      expectedSubscriptionDelta: 1,
+    },
+  ];
+
+  it.each(terminatingPaths)(
+    "writes exactly one attempt row on the $name path",
+    async ({ prepare, makeRequest, expectedStatus, expectedSubscriptionDelta }) => {
+      await seedFacility(tdb.db, seedDoc);
+      await prepare?.();
+
+      const attemptsBefore = await countAttempts();
+      const subscriptionsBefore = (await tdb.db.select().from(subscriptionsTable)).length;
+
+      const res = await POST(makeRequest());
+      expect(res.status).toBe(expectedStatus);
+      await flushAfter();
+
+      // Confirms the intended branch actually ran (several share a 201), so a
+      // case can't pass by quietly falling through to the insert.
+      expect((await tdb.db.select().from(subscriptionsTable)).length).toBe(
+        subscriptionsBefore + expectedSubscriptionDelta
+      );
+      // The property itself: one request, one attempt row — whatever it did.
+      expect(await countAttempts()).toBe(attemptsBefore + 1);
+    }
+  );
+
+  it("attributes the attempt row to the trusted client ip's hash", async () => {
+    await seedFacility(tdb.db, seedDoc);
+    const ip = "203.0.113.22";
+
+    await POST(
+      req({ email: "reader@example.com", targetType: "facility", targetId: seedDoc.id }, { "cf-connecting-ip": ip })
+    );
+
+    const rows = await tdb.db.select().from(subscribeAttemptsTable);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].submitterIpHash).toBe(hashIp(ip));
+  });
+
+  // THE DEFECT, stated as a test: this fails against the pre-fix implementation,
+  // where the cap counted `subscriptions` rows and five rejections cost nothing.
+  it("429s a 6th request even when all five prior requests were rejections that wrote no subscription", async () => {
+    await seedFacility(tdb.db, seedDoc);
+    const ip = "203.0.113.23";
+
+    for (let i = 0; i < RATE_LIMIT_MAX; i++) {
+      const rejected = await POST(
+        req(
+          { email: `attacker${i}@example.com`, targetType: "facility", targetId: "no-such-facility" },
+          { "cf-connecting-ip": ip }
+        )
+      );
+      expect(rejected.status).toBe(400);
+    }
+    // Not one of them inserted anything — that is precisely why they used to be free.
+    expect(await tdb.db.select().from(subscriptionsTable)).toHaveLength(0);
+
+    const res = await POST(
+      req({ email: "reader@example.com", targetType: "facility", targetId: seedDoc.id }, { "cf-connecting-ip": ip })
+    );
+    expect(res.status).toBe(429);
+    expect(await tdb.db.select().from(subscriptionsTable)).toHaveLength(0);
+  });
+
+  // The refused request is the ONE path that must not record. Recording it
+  // would mean the rolling window never drains under sustained traffic: a shared
+  // IPv4 egress (CGNAT, corporate NAT, VPN, campus) would be locked out
+  // indefinitely instead of for an hour, and a blocked client retrying would
+  // extend its own block forever. Oracle-safe, because the 429 branch is decided
+  // purely by the prior count — never by request content — and already announces
+  // itself in the status code.
+  it("does NOT record the already-refused 429 request, so the rolling window can drain", async () => {
+    await seedFacility(tdb.db, seedDoc);
+    const ip = "203.0.113.24";
+    await seedAttempts(hashIp(ip), RATE_LIMIT_MAX);
+
+    const res = await POST(
+      req({ email: "reader@example.com", targetType: "facility", targetId: seedDoc.id }, { "cf-connecting-ip": ip })
+    );
+    expect(res.status).toBe(429);
+    expect(await countAttempts()).toBe(RATE_LIMIT_MAX); // unchanged — the refusal cost nothing
+    expect(await tdb.db.select().from(subscriptionsTable)).toHaveLength(0);
+  });
+
+  // Both halves of the rate-limit accounting — the gate SELECT and the record
+  // INSERT — bind the same ip hash and fail under the same conditions (42P01
+  // when the migration has not been applied). Each must fail closed, answer 503
+  // rather than 429, and keep the hash out of the log.
+  // `break`/`restore` return the driver's result object, not void — typed
+  // `Promise<unknown>` so tdb.client.exec() can be used point-free.
+  //
+  // `sqlstate` is the code the log must carry. Pinning the REAL code matters:
+  // without it both cases pass just as happily if `redactedErrorCode` always
+  // returned "unknown" — which is a false proxy, since "unknown" is exactly what
+  // a redaction that extracted nothing would print. The code is the operator's
+  // whole diagnostic (42P01 = the migration has not been applied), so asserting
+  // it is asserting that redaction kept the useful half, not just dropped the
+  // dangerous half.
+  const accountingFailures: {
+    name: string;
+    sqlstate: string;
+    break: () => Promise<unknown>;
+    restore: () => Promise<unknown>;
+  }[] = [
+    {
+      // Blocks INSERT while leaving SELECT working. NOT VALID skips the check
+      // against existing rows, which is what makes it reversible.
+      name: "the attempt INSERT fails",
+      sqlstate: "23514", // check_violation
+      break: () =>
+        tdb.client.exec(
+          `ALTER TABLE "subscribe_attempts" ADD CONSTRAINT tmp_block_inserts CHECK (false) NOT VALID`
+        ),
+      restore: () =>
+        tdb.client.exec(`ALTER TABLE "subscribe_attempts" DROP CONSTRAINT tmp_block_inserts`),
+    },
+    {
+      // Breaks the gate SELECT itself (42P01), which runs FIRST — the exact
+      // "migration not applied" case the redaction exists for. With the gate
+      // outside the try this throws uncaught, 500s, and Next logs the query
+      // with the ip hash in its params.
+      name: "the gate SELECT fails",
+      sqlstate: "42P01", // undefined_table
+      break: () =>
+        tdb.client.exec(`ALTER TABLE "subscribe_attempts" RENAME TO "subscribe_attempts_hidden"`),
+      restore: () =>
+        tdb.client.exec(`ALTER TABLE "subscribe_attempts_hidden" RENAME TO "subscribe_attempts"`),
+    },
+  ];
+
+  it.each(accountingFailures)(
+    "fails closed with a 503 (not a 429) when $name, logging no ip hash",
+    async ({ break: breakIt, sqlstate, restore }) => {
+      await seedFacility(tdb.db, seedDoc);
+      const ip = "203.0.113.26";
+
+      await breakIt();
+      // Spied AFTER breakIt(), deliberately: a throw from breakIt() skips the
+      // finally below, and `clearMocks` only clears call history — it does not
+      // restore an implementation — so the stub would leak into every later test
+      // in this file and present as unrelated flakiness.
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      try {
+        const res = await POST(
+          req({ email: "reader@example.com", targetType: "facility", targetId: seedDoc.id }, { "cf-connecting-ip": ip })
+        );
+
+        // An uncounted request must not be allowed to proceed...
+        expect(res.status).toBe(503);
+        // ...and an outage must not hide inside ordinary rate limiting, or a
+        // deploy that precedes its migration looks like normal traffic shaping.
+        expect(res.status).not.toBe(429);
+        expect((await res.json()).error).toMatch(/temporarily unavailable/i);
+        expect(await tdb.db.select().from(subscriptionsTable)).toHaveLength(0);
+
+        // Logged — but with the ip hash redacted out. drizzle's DrizzleQueryError
+        // embeds the bound params in its own `.message`, so logging the error
+        // object would leak the pseudonymized IP into the log.
+        const logged = errorSpy.mock.calls.flat().map(String).join(" ");
+        expect(logged).toContain("subscribe rate-limit accounting failed");
+        expect(logged).not.toContain(hashIp(ip));
+        // The real SQLSTATE, not "unknown" — see the note on `sqlstate` above.
+        expect(logged).toContain(`sqlstate: ${sqlstate}`);
+      } finally {
+        // mockRestore() FIRST: it is synchronous and cannot throw, whereas
+        // restore() is DDL that can. Restoring the spy after it would re-open
+        // the same leak the spy's placement above closes, by the other door.
+        errorSpy.mockRestore();
+        await restore();
+      }
+    }
+  );
+
+  // `hashIp` throws by design when CONTRIBUTE_IP_SALT is unset in production. It
+  // used to sit OUTSIDE the try that carries the 503, so that one
+  // misconfiguration was the single infrastructure failure here answered with an
+  // uncaught 500 — i.e. a stack trace to the caller — while the comments claimed
+  // all three were answered as infrastructure failures.
+  it("fails closed with a 503 (not a 500) when CONTRIBUTE_IP_SALT is unset in production", async () => {
+    await seedFacility(tdb.db, seedDoc);
+    const ip = "203.0.113.27";
+    vi.stubEnv("CONTRIBUTE_IP_SALT", undefined);
+    vi.stubEnv("VERCEL_ENV", "production");
+
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      // If this rejects rather than resolving, that IS the regression: an
+      // uncaught throw out of a route handler is Next's 500 path.
+      const res = await POST(
+        req(
+          { email: "reader@example.com", targetType: "facility", targetId: seedDoc.id },
+          { "cf-connecting-ip": ip }
+        )
+      );
+
+      expect(res.status).toBe(503);
+      expect(res.status).not.toBe(500);
+      expect((await res.json()).error).toMatch(/temporarily unavailable/i);
+      expect(await tdb.db.select().from(subscriptionsTable)).toHaveLength(0);
+      expect(await countAttempts()).toBe(0);
+
+      const logged = errorSpy.mock.calls.flat().map(String).join(" ");
+      expect(logged).toContain("subscribe rate-limit accounting failed");
+      // Redacted like any other failure. A plain Error carries no `code`, hence
+      // "unknown" — and crucially neither the thrown message nor the caller's IP
+      // (which this path has in the clear, the hash having never been computed)
+      // reaches the log.
+      expect(logged).toContain("sqlstate: unknown");
+      expect(logged).not.toContain("CONTRIBUTE_IP_SALT");
+      expect(logged).not.toContain(ip);
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
+  it("lets exactly RATE_LIMIT_MAX requests through before refusing, unchanged from the old counter", async () => {
+    await seedFacility(tdb.db, seedDoc);
+    const ip = "203.0.113.25";
+
+    for (let i = 0; i < RATE_LIMIT_MAX; i++) {
+      const res = await POST(
+        req(
+          { email: `reader${i}@example.com`, targetType: "facility", targetId: seedDoc.id },
+          { "cf-connecting-ip": ip }
+        )
+      );
+      expect(res.status).toBe(201);
+      await flushAfter();
+    }
+
+    const refused = await POST(
+      req({ email: "sixth@example.com", targetType: "facility", targetId: seedDoc.id }, { "cf-connecting-ip": ip })
+    );
+    expect(refused.status).toBe(429);
+    expect(await tdb.db.select().from(subscriptionsTable)).toHaveLength(RATE_LIMIT_MAX);
+  });
+});
+
+// CONSENT GATE end-to-end (security review, 2026-09-27): the auto-confirm
+// shortcut used to fire on any address that had ever confirmed anything, with
+// nothing in the request proving the requester held it. The route now forwards
+// the signed `sub_consent` cookie minted by GET /api/subscribe/confirm, and
+// subscribeToTarget requires it for that branch.
+describe("POST /api/subscribe — auto-confirm requires the consent cookie", () => {
+  const email = "proven@example.com";
+  const CONSENT_SALT = "subscribe-route-test-salt";
+
+  /** Seeds the history half of eligibility: one confirmed row on another target. */
+  async function seedConfirmedElsewhere(): Promise<void> {
+    await tdb.db.insert(subscriptionsTable).values({
+      email,
+      targetType: "state",
+      targetId: "CA",
+      status: "confirmed",
+      confirmedAt: new Date(),
+      confirmToken: "route-consent-seed-tok",
+      unsubscribeToken: "route-consent-seed-unsub",
+    });
+  }
+
+  async function subscribeTN(headers: HeadersInit) {
+    const res = await POST(
+      req({ email, targetType: "state", targetId: "TN" }, headers)
+    );
+    await flushAfter();
+    const rows = await tdb.db
+      .select()
+      .from(subscriptionsTable)
+      .where(eq(subscriptionsTable.targetId, "TN"));
+    return { res, row: rows[0] };
+  }
+
+  it("with a valid cookie: the new row goes live immediately and the watch-started notice is sent", async () => {
+    vi.stubEnv("CONTRIBUTE_IP_SALT", CONSENT_SALT);
+    vi.stubEnv("RESEND_API_KEY", "test-key");
+    await seedConfirmedElsewhere();
+    const consent = createConsentValue(email);
+
+    const { res, row } = await subscribeTN({
+      "x-real-ip": "203.0.113.41",
+      cookie: `${CONSENT_COOKIE_NAME}=${consent}`,
+    });
+
+    expect(res.status).toBe(201);
+    expect(row.status).toBe("confirmed");
+    expect(row.confirmedAt).not.toBeNull();
+    expect(resendSendMock).toHaveBeenCalledTimes(1);
+    const sent = resendSendMock.mock.calls[0][0] as { subject: string };
+    expect(sent.subject).not.toMatch(/confirm/i); // the notice, not a confirm gate
+  });
+
+  // THE case. Drop the cookie requirement and this must fail.
+  it("with NO cookie: the row stays pending and a confirm email is sent instead", async () => {
+    vi.stubEnv("CONTRIBUTE_IP_SALT", CONSENT_SALT);
+    vi.stubEnv("RESEND_API_KEY", "test-key");
+    await seedConfirmedElsewhere();
+
+    const { res, row } = await subscribeTN({ "x-real-ip": "203.0.113.42" });
+
+    expect(res.status).toBe(201);
+    expect(row.status).toBe("pending");
+    expect(row.confirmedAt).toBeNull();
+    expect(resendSendMock).toHaveBeenCalledTimes(1);
+    const sent = resendSendMock.mock.calls[0][0] as { subject: string };
+    expect(sent.subject).toMatch(/confirm/i);
+  });
+
+  it("with a cookie for a different address: the row stays pending", async () => {
+    vi.stubEnv("CONTRIBUTE_IP_SALT", CONSENT_SALT);
+    await seedConfirmedElsewhere();
+    const consent = createConsentValue("attacker@example.com");
+
+    const { row } = await subscribeTN({
+      "x-real-ip": "203.0.113.43",
+      cookie: `${CONSENT_COOKIE_NAME}=${consent}`,
+    });
+
+    expect(row.status).toBe("pending");
+  });
+});
+
+// The response body must not become an oracle. Every path that sends no new
+// confirm email — honeypot, duplicate, over the per-address cap — already
+// returns the same generic success as a genuine new subscription; the consent
+// gate adds two more (no cookie, cookie for another address) and must not be
+// distinguishable either.
+describe("POST /api/subscribe — the generic success body is byte-identical across every path", () => {
+  async function bodyOf(body: unknown, headers: HeadersInit): Promise<{ status: number; text: string }> {
+    const res = await POST(req(body, headers));
+    await flushAfter();
+    return { status: res.status, text: await res.text() };
+  }
+
+  it("is the same status and the same bytes for new, honeypot, duplicate, over-cap, and consent-denied", async () => {
+    vi.stubEnv("CONTRIBUTE_IP_SALT", "generic-body-test-salt");
+    const email = "generic@example.com";
+
+    // 1. a genuine new subscription
+    const fresh = await bodyOf(
+      { email, targetType: "state", targetId: "TN" },
+      { "x-real-ip": "203.0.113.51" }
+    );
+
+    // 2. the honeypot
+    const honeypot = await bodyOf(
+      { email: "bot@example.com", targetType: "state", targetId: "TN", website: "http://spam" },
+      { "x-real-ip": "203.0.113.52" }
+    );
+
+    // 3. a duplicate of (1) — the active-target unique index rejects the insert
+    const duplicate = await bodyOf(
+      { email, targetType: "state", targetId: "TN" },
+      { "x-real-ip": "203.0.113.53" }
+    );
+
+    // 4. over the per-address send cap
+    for (let i = 0; i < EMAIL_SEND_CAP_MAX; i++) {
+      await tdb.db.insert(subscriptionsTable).values({
+        email: "capped@example.com",
+        targetType: "state",
+        targetId: `cap-${i}`,
+        status: "pending",
+        confirmToken: `generic-cap-tok-${i}`,
+        unsubscribeToken: `generic-cap-unsub-${i}`,
+      });
+    }
+    const overCap = await bodyOf(
+      { email: "capped@example.com", targetType: "state", targetId: "TX" },
+      { "x-real-ip": "203.0.113.54" }
+    );
+
+    // 5. eligible for auto-confirm but with no consent cookie
+    await tdb.db.insert(subscriptionsTable).values({
+      email: "eligible@example.com",
+      targetType: "state",
+      targetId: "CA",
+      status: "confirmed",
+      confirmedAt: new Date(),
+      confirmToken: "generic-eligible-tok",
+      unsubscribeToken: "generic-eligible-unsub",
+    });
+    const consentDenied = await bodyOf(
+      { email: "eligible@example.com", targetType: "state", targetId: "TX" },
+      { "x-real-ip": "203.0.113.55" }
+    );
+
+    // 6. auto-confirmed with a valid cookie — even the path that DOES something
+    //    different answers identically.
+    const autoConfirmed = await bodyOf(
+      { email: "eligible@example.com", targetType: "state", targetId: "NV" },
+      {
+        "x-real-ip": "203.0.113.56",
+        cookie: `${CONSENT_COOKIE_NAME}=${createConsentValue("eligible@example.com")}`,
+      }
+    );
+
+    for (const other of [honeypot, duplicate, overCap, consentDenied, autoConfirmed]) {
+      expect(other.status).toBe(fresh.status);
+      expect(other.text).toBe(fresh.text);
+    }
+    expect(fresh.text).toBe('{"ok":true}');
+  });
+});
+
+// The send gate (lib/email-gate.ts) runs after the response, so no gate
+// outcome may change what the requester sees: byte-identical status and body.
+describe("POST /api/subscribe: gate outcomes are invisible to the requester", () => {
+  let n = 0;
+  async function call(email: string) {
+    n++;
+    const res = await POST(
+      req({ email, targetType: "state", targetId: "TN" }, { "x-real-ip": `198.51.100.${n}` })
+    );
+    const text = await res.text();
+    await flushAfter();
+    pendingAfter = undefined;
+    return { status: res.status, text };
+  }
+  const sends = () => tdb.db.select().from(emailSendsTable);
+
+  it("sent, capped, send-log down and Resend failing all answer the same bytes", async () => {
+    process.env.CONTRIBUTE_IP_SALT ??= "route-gate-test-salt";
+    vi.stubEnv("RESEND_API_KEY", "test-key");
+
+    const sent = await call("sent@example.com");
+    expect(resendSendMock).toHaveBeenCalledTimes(1);
+    expect((await sends()).map((r) => r.outcome)).toEqual(["sent"]);
+
+    resendSendMock.mockClear();
+    const capHash = hashNotifyEmail("capped@example.com");
+    for (let i = 0; i < CONFIRM_CAP_MAX; i++) {
+      await tdb.db.insert(emailSendsTable).values({ kind: "confirm", emailHash: capHash, outcome: "sent" });
+    }
+    const capped = await call("capped@example.com");
+    expect(resendSendMock).not.toHaveBeenCalled();
+    expect((await sends()).filter((r) => r.outcome === "skipped_capped")).toHaveLength(1);
+
+    resendSendMock.mockResolvedValue({ data: null, error: { name: "validation_error", message: "x" } });
+    const failing = await call("failing@example.com");
+    expect((await sends()).filter((r) => r.outcome === "error" && r.errorCode === "validation_error")).toHaveLength(1);
+
+    resendSendMock.mockClear();
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    await tdb.client.exec("alter table email_sends rename to email_sends_away");
+    let logDown;
+    try {
+      logDown = await call("logdown@example.com");
+    } finally {
+      await tdb.client.exec("alter table email_sends_away rename to email_sends");
+    }
+    expect(resendSendMock).not.toHaveBeenCalled();
+
+    for (const other of [capped, failing, logDown]) {
+      expect(other).toEqual(sent);
+    }
+    expect(sent).toEqual({ status: 201, text: '{"ok":true}' });
+  });
+
+  it("getDb() throwing inside the after() task escapes nowhere and logs a code only", async () => {
+    vi.stubEnv("RESEND_API_KEY", "test-key");
+    const getDbMock = vi.mocked(dbClient.getDb);
+
+    // Baseline: how many getDb() calls one fresh subscribe makes, the last being the gated send's.
+    getDbMock.mockClear();
+    const baseline = await call("baseline@example.com");
+    const total = getDbMock.mock.calls.length;
+    resendSendMock.mockClear();
+
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    let calls = 0;
+    getDbMock.mockImplementation((() => {
+      calls++;
+      if (calls >= total) throw new Error("boom for victim@example.com");
+      return tdb.db;
+    }) as never);
+    try {
+      const res = await call("victim@example.com"); // call() awaits the after task: a rejection would fail here
+      expect(res).toEqual(baseline);
+    } finally {
+      getDbMock.mockReturnValue(tdb.db as never);
+    }
+    const logged = errSpy.mock.calls.flat().map(String).join(" ");
+    expect(logged).toContain("gated send failed (sqlstate: unknown)");
+    expect(logged).not.toContain("victim@example.com");
+    expect(resendSendMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("POST /api/subscribe: the WATCH_AREAS_ENABLED kill switch is invisible", () => {
+  async function post(body: unknown) {
+    const res = await POST(req(body));
+    return { status: res.status, text: await res.text() };
+  }
+  const bad = { email: "reader@example.com", targetType: "zzz", targetId: "x" };
+  const county = { email: "reader@example.com", targetType: "county", targetId: "loudoun-va" };
+
+  it("answers an invalid targetType byte-identically with the flag on and off", async () => {
+    vi.stubEnv("WATCH_AREAS_ENABLED", "true");
+    const on = await post(bad);
+    vi.stubEnv("WATCH_AREAS_ENABLED", "false");
+    const off = await post(bad);
+    expect(on.status).toBe(400);
+    expect(off).toEqual(on);
+    // No echoed input and no enum members in the body.
+    expect(off.text).not.toMatch(/zzz|facility|state|county|metro|values|options|received/);
+  });
+
+  it("answers a county request with the flag off exactly like an invalid type", async () => {
+    vi.stubEnv("WATCH_AREAS_ENABLED", "false");
+    const invalid = await post(bad);
+    const areas = await post(county);
+    expect(areas).toEqual(invalid);
+  });
+});

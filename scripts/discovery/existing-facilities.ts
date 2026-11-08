@@ -4,25 +4,34 @@
  * status changes without needing the full facility doc for every record.
  *
  * One line per facility: `id | name | operator | status | <latest
- * statusHistory date> | <first source url>`. Kept compact (~100 chars/line)
- * so a large state (TX, ~43 facilities) stays well under 5KB.
+ * statusHistory date> | <first source url> | missing:<comma-separated
+ * enrichable families, or "none">`. Kept compact (~100-150 chars/line) so a
+ * large state (TX, ~43 facilities) stays well under 5KB.
+ *
+ * Also appends an optional dead-source block (`projectDeadSources`) sourced
+ * from the most recent check-sources.ts report — facilities in the target
+ * state with a `gone` (404/410/451) source, flagged for re-sourcing.
  *
  * Run via: tsx scripts/discovery/existing-facilities.ts --state=TX
  *
- * Uses relative imports throughout — tsx does not resolve the `@/*` path
- * alias, matching scripts/discovery/submit-candidates.ts.
+ * Uses relative imports throughout, matching scripts/discovery/submit-candidates.ts.
  */
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 
+import { missingEnrichableFamilies } from "../../lib/enrichment-update";
 import type { Facility } from "../../lib/schema";
+import type { SourceCheckResult, SourceHealthReport } from "./check-sources";
+import { loadFacilities } from "./load-facilities";
+import { isEntrypoint } from "../is-entrypoint";
+import { formatFatalError } from "../../lib/db-error";
 
 /**
  * Latest statusHistory date, or lastUpdated if statusHistory is empty/absent.
  * Defensive against raw (non-zod-parsed) JSON where `statusHistory` may be
  * missing entirely — the schema's `.default([])` only applies via `.parse()`,
- * and the CLI's file fallback reads `data/facilities.json` with a bare
- * `JSON.parse`, matching submit-candidates.ts's loadExistingFacilities.
+ * and the shared loader's guarded file fallback validates the snapshot with
+ * the schema but returns the raw parsed JSON, not the schema's parsed output.
  */
 function latestStatusDate(facility: Facility): string {
   const history = facility.statusHistory ?? [];
@@ -76,10 +85,69 @@ export function projectExisting(facilities: Facility[], state: string): string {
         facility.status,
         latestStatusDate(facility),
         firstSourceUrl(facility),
+        `missing:${missingEnrichableFamilies(facility).join(",") || "none"}`,
       ]
         .map(sanitizeField)
         .join(" | ")
     )
+    .join("\n");
+}
+
+/**
+ * Loads the most recent check-sources.ts report from `logDir` (or
+ * `DISCOVERY_LOG_DIR`, or `<cwd>/discovery-logs`). Fail-open: returns `null`
+ * on a missing directory, no matching report file, a parse error, or a
+ * parsed value that isn't a well-formed `SourceHealthReport` envelope (e.g. a
+ * pre-envelope legacy report that is a bare `SourceCheckResult[]`) — a
+ * missing/corrupt/wrong-shape report must never break the
+ * {{EXISTING_FACILITIES}} build.
+ * Report filenames (`source-health-<ISO-timestamp-with-dashes>.json`) sort
+ * chronologically as strings, so the lexicographically-greatest name is the
+ * newest report.
+ */
+export function loadLatestSourceHealth(logDir?: string): SourceHealthReport | null {
+  try {
+    const dir = logDir ?? process.env.DISCOVERY_LOG_DIR ?? path.join(process.cwd(), "discovery-logs");
+    const files = readdirSync(dir)
+      .filter((name) => name.startsWith("source-health-") && name.endsWith(".json"))
+      .sort();
+    if (files.length === 0) {
+      return null;
+    }
+    const latest = files[files.length - 1];
+    const raw = readFileSync(path.join(dir, latest), "utf-8");
+    const parsed = JSON.parse(raw) as unknown;
+    if (
+      !parsed ||
+      typeof parsed !== "object" ||
+      Array.isArray(parsed) ||
+      !Array.isArray((parsed as { results?: unknown }).results)
+    ) {
+      return null;
+    }
+    return parsed as SourceHealthReport;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Renders a `id | url` line for every `gone` (404/410/451, genuinely dead)
+ * source belonging to a facility in `state`, from the most recent
+ * check-sources.ts report. Returns `""` when `report` is `null` or there are
+ * no matches — the caller only prints the "DEAD SOURCES" header when this is
+ * non-empty.
+ */
+export function projectDeadSources(facilities: Facility[], state: string, report: SourceHealthReport | null): string {
+  if (!report || !Array.isArray(report.results)) {
+    return "";
+  }
+  const stateIds = new Set(
+    facilities.filter((facility) => facility.location?.state === state).map((facility) => facility.id)
+  );
+  return report.results
+    .filter((result: SourceCheckResult) => result.classification === "gone" && stateIds.has(result.facilityId))
+    .map((result) => [result.facilityId, result.url].map(sanitizeField).join(" | "))
     .join("\n");
 }
 
@@ -95,28 +163,6 @@ function parseArgs(argv: string[]): { state?: string } {
   return { state };
 }
 
-/**
- * Loads the live facility set — read API first, JSON file fallback.
- * Duplicated from scripts/discovery/submit-candidates.ts's
- * loadExistingFacilities (not refactored into a shared module — out of
- * scope for this feature, see plan Task A2).
- */
-async function loadExistingFacilities(baseUrl: string): Promise<Facility[]> {
-  try {
-    const res = await fetch(`${baseUrl}/api/facilities`);
-    if (res.ok) {
-      const body = (await res.json()) as { facilities: Facility[] };
-      return body.facilities;
-    }
-  } catch {
-    // fall through to file fallback
-  }
-
-  const jsonPath = path.join(process.cwd(), "data", "facilities.json");
-  const raw = readFileSync(jsonPath, "utf-8");
-  return JSON.parse(raw) as Facility[];
-}
-
 async function main(): Promise<void> {
   const { state } = parseArgs(process.argv.slice(2));
   if (!state) {
@@ -124,18 +170,25 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  const baseUrl = process.env.API_BASE_URL ?? "http://localhost:3000";
-  const facilities = await loadExistingFacilities(baseUrl);
+  const { facilities } = await loadFacilities();
   const projection = projectExisting(facilities, state);
-  console.log(projection);
+
+  const report = loadLatestSourceHealth();
+  const deadBlock = projectDeadSources(facilities, state, report);
+
+  if (deadBlock) {
+    console.log(`${projection}\n\n=== DEAD SOURCES (re-source these) ===\n${deadBlock}`);
+  } else {
+    console.log(projection);
+  }
 }
 
 // Only run main() when executed directly (not when imported by tests).
 // Matches scripts/discovery/submit-candidates.ts's isMain guard.
-const isMain = process.argv[1] && import.meta.url === `file://${process.argv[1]}`;
+const isMain = isEntrypoint(import.meta.url);
 if (isMain) {
   main().catch((err) => {
-    console.error(err);
+    console.error(formatFatalError(err));
     process.exit(1);
   });
 }

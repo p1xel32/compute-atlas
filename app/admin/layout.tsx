@@ -2,6 +2,7 @@ import type { Metadata } from "next";
 import Link from "next/link";
 
 import { logout } from "@/app/admin/login/actions";
+import { RefreshSiteSlot } from "@/app/admin/refresh-site-slot";
 import { Button } from "@/components/ui/button";
 
 // Defense-in-depth: the admin area is cookie-gated, but it must never be
@@ -30,18 +31,39 @@ export default function AdminLayout({
               Submissions
             </Link>
             <Link
+              href="/admin/leads"
+              className="text-sm text-muted-foreground hover:text-foreground"
+            >
+              Leads
+            </Link>
+            <Link
               href="/admin/facilities"
               className="text-sm text-muted-foreground hover:text-foreground"
             >
               Facilities
             </Link>
+            <Link
+              href="/admin/contact"
+              className="text-sm text-muted-foreground hover:text-foreground"
+            >
+              Contact
+            </Link>
+            <Link
+              href="/admin/email-sends"
+              className="text-sm text-muted-foreground hover:text-foreground"
+            >
+              Email sends
+            </Link>
           </nav>
         </div>
-        <form action={logout}>
-          <Button type="submit" variant="outline" size="sm">
-            Log out
-          </Button>
-        </form>
+        <div className="flex items-center gap-2">
+          <RefreshSiteSlot />
+          <form action={logout}>
+            <Button type="submit" variant="outline" size="sm">
+              Log out
+            </Button>
+          </form>
+        </div>
       </header>
       <div className="flex-1 px-6 py-6">{children}</div>
     </div>

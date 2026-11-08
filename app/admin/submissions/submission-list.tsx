@@ -6,6 +6,7 @@ import { useRouter } from "next/navigation";
 import { toast } from "sonner";
 
 import type { SubmissionRow } from "@/lib/db/schema";
+import type { SubmissionWithWatchers } from "@/lib/submissions";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -79,6 +80,15 @@ function getKindBadge(kind: string): KindBadgeInfo {
   return { label: "Update", variant: "secondary" };
 }
 
+/**
+ * Approving a non-`create` submission emails every confirmed facility-watcher
+ * of its target (`watcherCount`, computed server-side). Only the count crosses
+ * to the client — never an address.
+ */
+function pluralizeWatchers(count: number): string {
+  return `${count} watcher${count === 1 ? "" : "s"}`;
+}
+
 function getProvenance(row: SubmissionRow): ProvenanceShape {
   const raw = row.provenance as Partial<ProvenanceShape> | null | undefined;
   return {
@@ -95,11 +105,12 @@ function SubmissionRowCard({
   submission,
   detail,
 }: {
-  submission: SubmissionRow;
+  submission: SubmissionWithWatchers;
   detail: ReactNode;
 }) {
   const router = useRouter();
   const [expanded, setExpanded] = useState(false);
+  const [approveOpen, setApproveOpen] = useState(false);
   const [rejectOpen, setRejectOpen] = useState(false);
   const [reason, setReason] = useState("");
   const [isPending, startTransition] = useTransition();
@@ -117,12 +128,26 @@ function SubmissionRowCard({
     : payloadName;
   const isReviewable = submission.status === "pending";
   const kindBadge = getKindBadge(submission.kind);
+  // Only a pending row's approval is still ahead of the reviewer; on an
+  // already-reviewed row "emails N watchers" would describe the future.
+  const watchersToEmail = isReviewable ? submission.watcherCount : 0;
 
   function handleApprove() {
     startTransition(async () => {
       const result = await approveSubmissionAction(submission.id);
       if (result.ok) {
-        toast.success(`Approved "${facilityLabel}" — now live.`);
+        // historyRecorded is strictly false only when the facility write
+        // itself succeeded but its facility_history audit row failed to
+        // insert (lib/facility-write.ts) — surface that instead of letting
+        // it disappear into the server log. `undefined` (unknown) reads the
+        // same as a clean success.
+        if (result.historyRecorded === false) {
+          toast.warning(
+            `Approved "${facilityLabel}" — now live, but its audit log entry failed to record.`
+          );
+        } else {
+          toast.success(`Approved "${facilityLabel}" — now live.`);
+        }
         router.refresh();
       } else {
         toast.error(formatActionError(result));
@@ -152,6 +177,9 @@ function SubmissionRowCard({
         <div className="flex flex-col gap-1.5">
           <div className="flex flex-wrap items-center gap-2">
             <Badge variant={kindBadge.variant}>{kindBadge.label}</Badge>
+            {watchersToEmail > 0 ? (
+              <Badge variant="outline">Emails {pluralizeWatchers(watchersToEmail)}</Badge>
+            ) : null}
             <span className="text-sm font-medium">{facilityLabel}</span>
             {submission.targetFacilityId && !usesTargetIdLabel ? (
               <span className="text-xs text-muted-foreground">({submission.targetFacilityId})</span>
@@ -178,7 +206,11 @@ function SubmissionRowCard({
           </Button>
           {isReviewable ? (
             <>
-              <Button size="sm" disabled={isPending} onClick={handleApprove}>
+              <Button
+                size="sm"
+                disabled={isPending}
+                onClick={watchersToEmail > 0 ? () => setApproveOpen(true) : handleApprove}
+              >
                 Approve
               </Button>
               <Button
@@ -199,6 +231,38 @@ function SubmissionRowCard({
         </div>
       ) : null}
 
+      {watchersToEmail > 0 ? (
+        <Dialog open={approveOpen} onOpenChange={setApproveOpen}>
+          <DialogContent>
+            <DialogHeader>
+              <DialogTitle>Approve &ldquo;{facilityLabel}&rdquo;</DialogTitle>
+              <DialogDescription>
+                Approving this emails {watchersToEmail} confirmed{" "}
+                {watchersToEmail === 1 ? "watcher" : "watchers"} of this facility.
+              </DialogDescription>
+            </DialogHeader>
+            <DialogFooter>
+              <DialogClose
+                render={
+                  <Button variant="outline">
+                    Cancel
+                  </Button>
+                }
+              />
+              <Button
+                disabled={isPending}
+                onClick={() => {
+                  setApproveOpen(false);
+                  handleApprove();
+                }}
+              >
+                Confirm approve
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+      ) : null}
+
       <Dialog open={rejectOpen} onOpenChange={setRejectOpen}>
         <DialogContent>
           <DialogHeader>
@@ -214,7 +278,7 @@ function SubmissionRowCard({
               id={`reject-reason-${submission.id}`}
               value={reason}
               onChange={(e) => setReason(e.target.value)}
-              className="min-h-20 rounded-md border border-input bg-transparent px-3 py-2 text-sm outline-none focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50"
+              className="min-h-20 rounded-md border border-input bg-transparent px-3 py-2 text-sm outline-none focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50 focus-visible:outline-2 focus-visible:outline-solid focus-visible:outline-transparent"
               autoFocus
             />
           </div>
@@ -241,7 +305,7 @@ export function SubmissionList({
   activeStatus,
   details,
 }: {
-  submissions: SubmissionRow[];
+  submissions: SubmissionWithWatchers[];
   activeStatus: StatusTab;
   details: Record<string, ReactNode>;
 }) {

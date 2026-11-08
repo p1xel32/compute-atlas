@@ -9,7 +9,9 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { Toaster } from "@/components/ui/sonner";
 import { SiteHeader } from "@/components/site-header";
 import { SiteFooter } from "@/components/site-footer";
-import { siteConfig } from "@/lib/site";
+import { FooterGate, HeaderGate } from "@/components/footer-gate";
+import { SupportBanner } from "@/components/support-banner";
+import { DATASET_LICENSE_URL, siteConfig } from "@/lib/site";
 import { siteJsonLdString } from "@/lib/seo";
 
 const fraunces = Fraunces({
@@ -25,25 +27,33 @@ export const metadata: Metadata = {
     default: siteConfig.name + " — " + siteConfig.tagline,
     template: "%s · " + siteConfig.name,
   },
-  description: siteConfig.description,
+  description: siteConfig.metaDescription,
   openGraph: {
     title: siteConfig.name,
-    description: siteConfig.description,
+    description: siteConfig.metaDescription,
     siteName: siteConfig.name,
     type: "website",
   },
   twitter: {
     card: "summary_large_image",
     title: siteConfig.name,
-    description: siteConfig.description,
+    description: siteConfig.metaDescription,
   },
-  alternates: {
-    types: {
-      "application/rss+xml": [
-        { url: "/activity/feed.xml", title: `${siteConfig.name} — Recent activity` },
-      ],
-    },
+  icons: {
+    icon: [
+      { url: "/icon.svg", type: "image/svg+xml" },
+      { url: "/favicon-16.png", sizes: "16x16", type: "image/png" },
+      { url: "/favicon-32.png", sizes: "32x32", type: "image/png" },
+      { url: "/favicon-48.png", sizes: "48x48", type: "image/png" },
+    ],
+    apple: [{ url: "/apple-icon", sizes: "180x180", type: "image/png" }],
   },
+  // No `alternates.types` here: Next.js metadata merging REPLACES (not
+  // deep-merges) `alternates` per route segment, and every route in this app
+  // sets its own `alternates.canonical`, so an RSS link declared here would
+  // never survive to any actual page. Declared as a real <link> in <head>
+  // below instead, which renders unconditionally regardless of what any
+  // route does to its `alternates`.
 };
 
 export default function RootLayout({
@@ -57,6 +67,27 @@ export default function RootLayout({
       suppressHydrationWarning
       className={`${GeistSans.variable} ${GeistMono.variable} ${fraunces.variable} h-full antialiased`}
     >
+      <head>
+        {/* Rendered directly (not via the metadata API's `alternates.types`)
+            so it survives on every route regardless of that route's own
+            `alternates.canonical` — see the comment on `metadata` above. */}
+        <link
+          rel="alternate"
+          type="application/rss+xml"
+          title={`${siteConfig.name} — Recent activity`}
+          href="/activity/feed.xml"
+        />
+        {/* The HTML-document twin of the JSON API's `Link: <…>;
+            rel="license"` header (lib/api-response.ts) and the Dataset
+            JSON-LD's `license` (lib/seo.ts). All three read
+            DATASET_LICENSE_URL from lib/site.ts, so they cannot drift apart.
+            Rendered directly because
+            Next's Metadata API has no rel="license" slot: `alternates.types`
+            emits rel="alternate" and `metadata.other` emits <meta>, not
+            <link>. It would also hit the per-segment `alternates` replacement
+            described above. */}
+        <link rel="license" href={DATASET_LICENSE_URL} />
+      </head>
       <body className="min-h-full flex flex-col bg-background text-foreground">
         <script
           type="application/ld+json"
@@ -67,15 +98,20 @@ export default function RootLayout({
             {/* Skip to main content — first focusable element */}
             <a
               href="#main-content"
-              className="sr-only focus:not-sr-only focus:fixed focus:top-4 focus:left-4 focus:z-50 focus:rounded-md focus:bg-background focus:px-4 focus:py-2 focus:text-sm focus:font-medium focus:shadow-md focus:ring-2 focus:ring-ring"
+              className="sr-only focus:not-sr-only focus:fixed focus:top-4 focus:left-4 focus:z-50 focus:rounded-md focus:bg-background focus:px-4 focus:py-2 focus:text-sm focus:font-medium focus:shadow-md focus:outline-2 focus:outline-offset-2 focus:outline-ring"
             >
               Skip to main content
             </a>
-            <SiteHeader />
+            <HeaderGate>
+              <SiteHeader />
+            </HeaderGate>
             <main id="main-content" className="flex-1">
               {children}
             </main>
-            <SiteFooter />
+            <FooterGate>
+              <SiteFooter />
+            </FooterGate>
+            <SupportBanner />
             <Toaster />
           </TooltipProvider>
         </NuqsAdapter>

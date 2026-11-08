@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
-import { facilitySchema, sourceSchema } from "@/lib/schema";
+import { facilitySchema, sourceSchema, emissionsSchema, OFFTAKER_LABEL_PATTERN, stakeholderKind } from "@/lib/schema";
+import facilitiesRaw from "@/data/facilities.json";
 
 const baseSource = {
   url: "https://en.wikipedia.org/wiki/Test",
@@ -352,8 +353,19 @@ describe("facilitySchema — location.precision", () => {
     }
   });
 
-  it("defaults location.precision to exact when omitted", () => {
+  it("defaults location.precision to approximate when omitted", () => {
     const result = facilitySchema.safeParse(baseFacility);
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.location.precision).toBe("approximate");
+    }
+  });
+
+  it("keeps an explicit exact precision", () => {
+    const result = facilitySchema.safeParse({
+      ...baseFacility,
+      location: { ...baseFacility.location, precision: "exact" as const },
+    });
     expect(result.success).toBe(true);
     if (result.success) {
       expect(result.data.location.precision).toBe("exact");
@@ -385,6 +397,39 @@ describe("facilitySchema — location.street / location.postalCode", () => {
       expect(result.data.location.street).toBeUndefined();
       expect(result.data.location.postalCode).toBeUndefined();
     }
+  });
+});
+
+describe("facilitySchema — jurisdiction codes", () => {
+  const withState = (state: string) => ({
+    ...baseFacility,
+    location: { ...baseFacility.location, state },
+  });
+  const withMultiSite = (states: string[]) => ({
+    ...baseFacility,
+    location: { ...baseFacility.location, multiSite: { states } },
+  });
+
+  it.each(["CA", "DC", "PR", "GU"])("accepts %s", (code) => {
+    expect(facilitySchema.safeParse(withState(code)).success).toBe(true);
+    expect(facilitySchema.safeParse(withMultiSite([code])).success).toBe(true);
+  });
+
+  it("refuses an unknown 2-letter state code", () => {
+    const r = facilitySchema.safeParse(withState("XX"));
+    expect(r.success).toBe(false);
+    if (!r.success) expect(r.error.issues[0].message).toMatch(/known US state/);
+  });
+
+  it("refuses an unknown code in multiSite.states", () => {
+    expect(facilitySchema.safeParse(withMultiSite(["CA", "XX"])).success).toBe(false);
+  });
+
+  it("refuses lowercase codes so stored codes are canonical", () => {
+    const state = facilitySchema.safeParse(withState("ca"));
+    expect(state.success).toBe(false);
+    if (!state.success) expect(state.error.issues[0].message).toMatch(/uppercase/);
+    expect(facilitySchema.safeParse(withMultiSite(["ca"])).success).toBe(false);
   });
 });
 
@@ -534,6 +579,14 @@ describe("sourceSchema — url protocol restriction", () => {
     expect(sourceSchema.safeParse({ ...valid, url: "data:text/html,<script>alert(1)</script>" }).success).toBe(false);
   });
 
+  it("rejects an ftp: uri", () => {
+    expect(sourceSchema.safeParse({ ...valid, url: "ftp://example.com/doc.pdf" }).success).toBe(false);
+  });
+
+  it("rejects a file: uri", () => {
+    expect(sourceSchema.safeParse({ ...valid, url: "file:///etc/passwd" }).success).toBe(false);
+  });
+
   it("rejects a javascript: uri at the facility level (sources[0].url)", () => {
     // reuse the existing baseFacility fixture defined above in this file
     const result = facilitySchema.safeParse({
@@ -541,5 +594,529 @@ describe("sourceSchema — url protocol restriction", () => {
       sources: [{ ...baseSource, url: "javascript:alert(1)" }],
     });
     expect(result.success).toBe(false);
+  });
+});
+
+describe("facilitySchema — stakeholders", () => {
+  it("parses a facility with a valid stakeholders entry, and the field survives the parse", () => {
+    const result = facilitySchema.safeParse({
+      ...baseFacility,
+      stakeholders: [
+        {
+          name: "Jane Doe",
+          role: "founder",
+          via: "xAI",
+          note: "Co-founded the company that operates this site.",
+          sourceIndex: 0,
+          asOf: "2026-07-05",
+        },
+      ],
+    });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect("stakeholders" in result.data).toBe(true);
+      expect(result.data.stakeholders?.[0].name).toBe("Jane Doe");
+      expect(result.data.stakeholders?.[0].role).toBe("founder");
+    }
+  });
+
+  it("fails when stakeholders[0].sourceIndex is out of range, with issue path [\"stakeholders\", 0, \"sourceIndex\"]", () => {
+    const result = facilitySchema.safeParse({
+      ...baseFacility,
+      stakeholders: [
+        {
+          name: "Jane Doe",
+          role: "founder",
+          sourceIndex: 5,
+          asOf: "2026-07-05",
+        },
+      ],
+    });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues).toContainEqual(
+        expect.objectContaining({ path: ["stakeholders", 0, "sourceIndex"] })
+      );
+    }
+  });
+
+  it("fails when stakeholders[0] is missing sourceIndex or asOf", () => {
+    const missingSourceIndex = facilitySchema.safeParse({
+      ...baseFacility,
+      stakeholders: [
+        { name: "Jane Doe", role: "founder", asOf: "2026-07-05" },
+      ],
+    });
+    expect(missingSourceIndex.success).toBe(false);
+
+    const missingAsOf = facilitySchema.safeParse({
+      ...baseFacility,
+      stakeholders: [{ name: "Jane Doe", role: "founder", sourceIndex: 0 }],
+    });
+    expect(missingAsOf.success).toBe(false);
+  });
+
+  const withStakeholder = (entry: Record<string, unknown>) =>
+    facilitySchema.safeParse({
+      ...baseFacility,
+      stakeholders: [{ name: "Example Fund", sourceIndex: 0, asOf: "2026-11-04", ...entry }],
+    });
+
+  it("accepts an organization investor", () => {
+    const result = withStakeholder({ kind: "organization", role: "investor" });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.stakeholders?.[0].kind).toBe("organization");
+    }
+  });
+
+  it("accepts a legacy entry without kind, and leaves kind unset on the parsed record", () => {
+    const result = withStakeholder({ name: "Jane Doe", role: "founder" });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.stakeholders?.[0]).not.toHaveProperty("kind");
+    }
+  });
+
+  it("accepts an organization lender", () => {
+    expect(withStakeholder({ kind: "organization", role: "lender" }).success).toBe(true);
+  });
+
+  it("rejects a lender with kind person or no kind", () => {
+    for (const entry of [{ kind: "person", role: "lender" }, { role: "lender" }]) {
+      const result = withStakeholder(entry);
+      expect(result.success).toBe(false);
+      if (!result.success) {
+        expect(result.error.issues).toContainEqual(
+          expect.objectContaining({ path: ["stakeholders", 0, "role"] })
+        );
+      }
+    }
+  });
+
+  it("rejects an organization public_official but accepts a person one", () => {
+    const org = withStakeholder({ kind: "organization", role: "public_official" });
+    expect(org.success).toBe(false);
+    if (!org.success) {
+      expect(org.error.issues).toContainEqual(
+        expect.objectContaining({ path: ["stakeholders", 0, "role"] })
+      );
+    }
+    expect(withStakeholder({ kind: "person", role: "public_official" }).success).toBe(true);
+    expect(withStakeholder({ role: "public_official" }).success).toBe(true);
+  });
+
+  it("stakeholderKind reads an absent kind as person", () => {
+    expect(stakeholderKind({})).toBe("person");
+    expect(stakeholderKind({ kind: "organization" })).toBe("organization");
+  });
+});
+
+describe("facilitySchema — emissions", () => {
+  const fullEmissions = {
+    permittedTpy: {
+      nox: 45.2,
+      co: 12.1,
+      pm: 5.6,
+      pm25: 3.4,
+      pm10: 4.1,
+      so2: 0.5,
+      voc: 8.9,
+      co2e: 125000,
+      h2so4: 2.1,
+      nh3: 1.3,
+      formaldehyde: 0.8,
+      hapsTotal: 6.4,
+    },
+    basis: "facility_wide" as const,
+    averagingPeriod: "rolling_12_month" as const,
+    unitsCovered: "Units 1-4 (combustion turbines)",
+    permitNumber: "P0123456",
+    permitType: "psd" as const,
+    issuingAgency: "Texas Commission on Environmental Quality",
+    issuedDate: "2025-03-01",
+    notes: "Backup diesel generator fleet.",
+    sourceIndex: 0,
+  };
+
+  it("parses a facility with a full emissions block, and every field survives the round-trip", () => {
+    const result = facilitySchema.safeParse({
+      ...baseFacility,
+      emissions: fullEmissions,
+    });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.emissions).toEqual(fullEmissions);
+    }
+  });
+
+  it("emissions is optional — a record without it still parses", () => {
+    const result = facilitySchema.safeParse(baseFacility);
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.emissions).toBeUndefined();
+    }
+  });
+
+  it("strips unknown keys inside emissions", () => {
+    const result = facilitySchema.safeParse({
+      ...baseFacility,
+      emissions: { ...fullEmissions, madeUpField: "should not survive" },
+    });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.emissions).not.toHaveProperty("madeUpField");
+    }
+  });
+
+  it("rejects a negative permittedTpy value", () => {
+    const result = facilitySchema.safeParse({
+      ...baseFacility,
+      emissions: { permittedTpy: { nox: -1 } },
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it("fails when emissions.sourceIndex is out of range, with issue path [\"emissions\", \"sourceIndex\"]", () => {
+    const result = facilitySchema.safeParse({
+      ...baseFacility,
+      emissions: { sourceIndex: 5 },
+    });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues).toContainEqual(
+        expect.objectContaining({ path: ["emissions", "sourceIndex"] })
+      );
+    }
+  });
+
+  it("accepts an in-range emissions.sourceIndex", () => {
+    const result = facilitySchema.safeParse({
+      ...baseFacility,
+      emissions: { sourceIndex: 0 },
+    });
+    expect(result.success).toBe(true);
+  });
+
+  // basis: real permits don't uniformly cap emissions facility-wide (the
+  // xAI/MZX permit caps every pollutant PER TURBINE) — a tonnage with no
+  // `basis` is ambiguous, so it's required whenever a pollutant is defined.
+  //
+  // Two tests cover this rule deliberately, at two different levels:
+  // - This one pins the exact refinement message/path in isolation, on
+  //   `emissionsSchema` directly.
+  // - The next one parses through `facilitySchema` — the ONLY path real
+  //   data ever takes (db:sync, db:export, lib/facility-write.ts all parse
+  //   the full facility, never `emissionsSchema` alone) — because wrapping
+  //   `emissionsSchema` in `.superRefine()` makes it a ZodEffects nested
+  //   inside a `z.discriminatedUnion` that itself carries a `.superRefine`,
+  //   and Zod composition in that shape is not something to assume works
+  //   without a direct test. A pass on the first test alone cannot rule out
+  //   the refinement silently being dropped when nested; only the second
+  //   test can.
+  it('rejects permittedTpy with a defined pollutant but no basis, with issue path ["basis"]', () => {
+    const result = emissionsSchema.safeParse({
+      permittedTpy: { nox: 10 },
+    });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues).toContainEqual(
+        expect.objectContaining({ path: ["basis"] })
+      );
+    }
+  });
+
+  it('enforces the basis requirement through facilitySchema, the path real data takes, with issue path ["emissions", "basis"]', () => {
+    const result = facilitySchema.safeParse({
+      ...baseFacility,
+      emissions: { permittedTpy: { nox: 10 } },
+    });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues).toContainEqual(
+        expect.objectContaining({ path: ["emissions", "basis"] })
+      );
+    }
+  });
+
+  it("accepts permit metadata alone (no permittedTpy) without basis", () => {
+    const result = emissionsSchema.safeParse({
+      permitNumber: "P0123456",
+      permitType: "psd",
+      issuingAgency: "Texas Commission on Environmental Quality",
+      issuedDate: "2025-03-01",
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it("accepts an empty permittedTpy object without basis — no defined value, so nothing is ambiguous", () => {
+    const result = emissionsSchema.safeParse({ permittedTpy: {} });
+    expect(result.success).toBe(true);
+  });
+
+  it("rejects basis and averagingPeriod values outside their enums", () => {
+    const badBasis = emissionsSchema.safeParse({
+      permittedTpy: { nox: 10 },
+      basis: "site_wide",
+    });
+    expect(badBasis.success).toBe(false);
+
+    const badAveragingPeriod = emissionsSchema.safeParse({
+      permittedTpy: { nox: 10 },
+      basis: "facility_wide",
+      averagingPeriod: "monthly",
+    });
+    expect(badAveragingPeriod.success).toBe(false);
+  });
+});
+
+// unitGroups: real permits cap pollutants PER EQUIPMENT GROUP with DIFFERENT
+// limits per group — Crusoe Abilene's TCEQ Standard Permit 177263 covers two
+// turbine models (Solar Titan 350 vs GE LM2500) with different per-unit NOx
+// limits, and a single top-level `permittedTpy.nox` cannot represent both.
+// The original Aug-2024 registration was 6 Titan 350 + 6 LM2500; TCEQ's
+// January 2025 modification reduced both counts to 5 + 5 (10 turbines
+// total), per the Technical Review for Registration No. 177263. Table 1(a)
+// of the application labels the units TURBINE-1 through TURBINE-5 (Titan
+// 350) and TURBINE-6 through TURBINE-10 (GE LM2500) — don't "correct" this
+// fixture back to 6/4 from a stale (pre-modification) source.
+describe("emissionsSchema — unitGroups", () => {
+  const crusoeGroups = [
+    {
+      label: "Solar Titan 350 turbines (TURBINE-1 through TURBINE-5)",
+      unitCount: 5,
+      basis: "per_unit" as const,
+      permittedTpy: { nox: 14.98 },
+    },
+    {
+      label: "GE LM2500 turbines (TURBINE-6 through TURBINE-10)",
+      unitCount: 5,
+      basis: "per_unit" as const,
+      permittedTpy: { nox: 13.44 },
+    },
+  ];
+
+  it("parses a valid two-group emissions object modeled on Crusoe Abilene", () => {
+    const result = emissionsSchema.safeParse({
+      permitNumber: "177263",
+      permitType: "state_construction",
+      basis: "facility_wide",
+      unitGroups: crusoeGroups,
+    });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.unitGroups).toEqual(crusoeGroups);
+    }
+  });
+
+  it("rejects a group missing label", () => {
+    const result = emissionsSchema.safeParse({
+      unitGroups: [{ basis: "per_unit", permittedTpy: { nox: 10 } }],
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it("rejects a group missing basis", () => {
+    const result = emissionsSchema.safeParse({
+      unitGroups: [{ label: "Turbines", permittedTpy: { nox: 10 } }],
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it("rejects a group missing permittedTpy", () => {
+    const result = emissionsSchema.safeParse({
+      unitGroups: [{ label: "Turbines", basis: "per_unit" }],
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it('rejects a group whose permittedTpy has every key undefined, with issue path ["unitGroups", 0, "permittedTpy"]', () => {
+    const result = emissionsSchema.safeParse({
+      unitGroups: [{ label: "Turbines", basis: "per_unit", permittedTpy: {} }],
+    });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues).toContainEqual(
+        expect.objectContaining({ path: ["unitGroups", 0, "permittedTpy"] })
+      );
+    }
+  });
+
+  it('rejects two groups whose labels differ only by case/whitespace, with issue path ["unitGroups", 1, "label"]', () => {
+    const result = emissionsSchema.safeParse({
+      unitGroups: [
+        { label: "Solar Titan 350 turbines", basis: "per_unit", permittedTpy: { nox: 14.98 } },
+        { label: "  solar titan 350 turbines  ", basis: "per_unit", permittedTpy: { nox: 13.44 } },
+      ],
+    });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues).toContainEqual(
+        expect.objectContaining({ path: ["unitGroups", 1, "label"] })
+      );
+    }
+  });
+
+  it('rejects unitGroups present with top-level basis "per_unit", with issue path ["basis"]', () => {
+    const result = emissionsSchema.safeParse({
+      basis: "per_unit",
+      unitGroups: crusoeGroups,
+    });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues).toContainEqual(
+        expect.objectContaining({ path: ["basis"] })
+      );
+    }
+  });
+
+  it("accepts unitGroups present with top-level basis facility_wide and a facility-wide permittedTpy", () => {
+    const result = emissionsSchema.safeParse({
+      basis: "facility_wide",
+      permittedTpy: { co2e: 125000 },
+      unitGroups: crusoeGroups,
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it("rejects an empty unitGroups array", () => {
+    const result = emissionsSchema.safeParse({ unitGroups: [] });
+    expect(result.success).toBe(false);
+  });
+
+  it("accepts a 0 value for a pollutant inside a group, and counts it as defined (not a truthiness bug)", () => {
+    const result = emissionsSchema.safeParse({
+      unitGroups: [{ label: "Turbines", basis: "per_unit", permittedTpy: { so2: 0 } }],
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it("REGRESSION: an emissions object with no unitGroups (Homer City shape) still parses exactly as before", () => {
+    const result = emissionsSchema.safeParse({
+      permittedTpy: { nox: 45.2, co2e: 125000 },
+      basis: "facility_wide",
+      averagingPeriod: "rolling_12_month",
+      permitNumber: "P0123456",
+      permitType: "psd",
+    });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.unitGroups).toBeUndefined();
+    }
+  });
+});
+
+describe("sourceSchema — retrievedAt format", () => {
+  it("accepts a full ISO date", () => {
+    expect(sourceSchema.safeParse({ ...baseSource, retrievedAt: "2026-07-06" }).success).toBe(true);
+  });
+
+  // Regression: the rule was `z.string().min(4)`, which accepted every value below.
+  // Month-precision and bare-year values reached the published dataset, and because
+  // nothing rejected them, article PUBLICATION dates were entered in this field too —
+  // 26 such entries were corrected on 2026-09-03. Loosening this rule reopens that.
+  it.each(["2026-07", "2026", "26-07-06", "2026-7-6", "not-a-date", ""])(
+    "rejects %j",
+    (retrievedAt) => {
+      expect(sourceSchema.safeParse({ ...baseSource, retrievedAt }).success).toBe(false);
+    },
+  );
+});
+
+describe("notRecorded marker", () => {
+  const REASON = "Only backup-generator nameplate is published, not IT load.";
+
+  it("accepts a valid marker", () => {
+    const r = facilitySchema.safeParse({ ...baseFacility, notRecorded: { "capacityMw.operational": REASON } });
+    expect(r.success).toBe(true);
+  });
+
+  it("rejects an unknown field key", () => {
+    const r = facilitySchema.safeParse({ ...baseFacility, notRecorded: { "capacityMw.bogus": REASON } });
+    expect(r.success).toBe(false);
+  });
+
+  it("rejects a reason under 10 characters", () => {
+    const r = facilitySchema.safeParse({ ...baseFacility, notRecorded: { "energy.utility": "too short" } });
+    expect(r.success).toBe(false);
+  });
+
+  it("rejects a field that is both set and marked, on the notRecorded path", () => {
+    const r = facilitySchema.safeParse({
+      ...baseFacility,
+      capacityMw: { operational: 100 },
+      notRecorded: { "capacityMw.operational": REASON },
+    });
+    expect(r.success).toBe(false);
+    if (!r.success) {
+      expect(r.error.issues.map((i) => i.path.join("."))).toContain("notRecorded.capacityMw.operational");
+    }
+  });
+
+  it("enforces set+marked on the other facility types too", () => {
+    const r = facilitySchema.safeParse({
+      ...baseCryptoMiningFacility,
+      water: { coolingType: "air" },
+      notRecorded: { "water.coolingType": REASON },
+    });
+    expect(r.success).toBe(false);
+  });
+
+  it("allows marking one capacity sub-field while the other is set", () => {
+    const r = facilitySchema.safeParse({
+      ...baseFacility,
+      capacityMw: { planned: 300 },
+      notRecorded: { "capacityMw.operational": REASON },
+    });
+    expect(r.success).toBe(true);
+  });
+});
+
+describe("generation.offtaker label shape", () => {
+  const parse = (offtaker: string) =>
+    facilitySchema.safeParse({
+      ...basePowerGenerationFacility,
+      generation: { offtaker },
+    });
+
+  const accepted = [
+    "Amazon (AWS)",
+    "Google (Project Tembo, via Jupiter Star Holdings)",
+    "Nine Mile Data, LLC",
+    "Meta (via Pacific Power)",
+    "Meta (renewable energy credits; energy sold to Central Electric Power Cooperative)",
+    "Meta",
+  ];
+
+  const rejected = [
+    "Meta (Facebook), via Pacific Power",
+    "Central Electric Power Cooperative (energy); Meta (renewable energy credits)",
+    "Foo (bar); We Energies acquisition pending",
+    "A (b (c))",
+    "Meta)",
+    "()",
+    "(via X)",
+    " (AWS)",
+    "",
+  ];
+
+  it.each(accepted)("accepts %j", (label) => {
+    expect(parse(label).success).toBe(true);
+  });
+
+  it.each(rejected)("rejects %j with an actionable message", (label) => {
+    const r = parse(label);
+    expect(r.success).toBe(false);
+    if (!r.success) {
+      expect(r.error.issues[0].message).toMatch(/ONE trailing parenthetical/);
+    }
+  });
+
+  it("every offtaker in data/facilities.json matches the pattern", () => {
+    const bad = (facilitiesRaw as unknown as Array<{ id: string; generation?: { offtaker?: string } }>)
+      .filter((f) => typeof f.generation?.offtaker === "string")
+      .filter((f) => !OFFTAKER_LABEL_PATTERN.test(f.generation!.offtaker!))
+      .map((f) => `${f.id}: ${f.generation!.offtaker}`);
+    expect(bad).toEqual([]);
   });
 });

@@ -1,5 +1,7 @@
 import type { Facility } from "@/lib/schema";
-import { siteConfig } from "@/lib/site";
+import { DATASET_LICENSE_URL, siteConfig } from "@/lib/site";
+import { STATUS_META } from "@/lib/status";
+import { ENERGY_SOURCE_ENTRIES } from "@/lib/energy";
 
 export interface FacilityJsonLd {
   "@context": "https://schema.org";
@@ -19,7 +21,39 @@ export interface FacilityJsonLd {
     latitude: number;
     longitude: number;
   };
+  additionalProperty?: FacilityJsonLdProperty[];
 }
+
+/**
+ * One `schema.org/PropertyValue` entry on a facility's `Place`.
+ *
+ * `additionalProperty` is the documented schema.org mechanism for facts a type
+ * has no dedicated property for — `Place` has no `operator`, `status` or
+ * `capacity`, and inventing those keys would emit invalid structured data.
+ * Capacity entries also carry `unitCode: "MAW"` (the UN/CEFACT code for
+ * megawatt) so a consumer never has to infer the unit from the name.
+ */
+export interface FacilityJsonLdProperty {
+  "@type": "PropertyValue";
+  name: string;
+  value: string | number;
+  unitCode?: "MAW";
+  unitText?: "MW";
+}
+
+/** Human-readable label for a `facilityType`, matching the rendered page. */
+const FACILITY_TYPE_LABELS: Record<Facility["facilityType"], string> = {
+  data_center: "Data center",
+  crypto_mining: "Crypto mining",
+  power_generation: "Power generation",
+};
+
+/** Human-readable label for an `aiClassification` tier. */
+const AI_CLASSIFICATION_LABELS: Record<"confirmed" | "likely" | "mixed_use", string> = {
+  confirmed: "Confirmed AI-specific",
+  likely: "Likely AI-specific",
+  mixed_use: "Mixed use",
+};
 
 /**
  * Builds a schema.org Place JSON-LD object for a facility.
@@ -41,6 +75,76 @@ export function buildFacilityJsonLd(facility: Facility): FacilityJsonLd {
     address.postalCode = facility.location.postalCode;
   }
 
+  // Every fact the project exists to publish lived only in prose until
+  // 2026-09-15:
+  // the Place carried name/url/address/geo, so a retrieval model learned that
+  // a pin existed and nothing about it. These entries put the same facts a
+  // reader sees into machine-extractable form. Labels are read from the
+  // canonical maps (STATUS_META, ENERGY_SOURCE_ENTRIES) rather than retyped,
+  // so the structured data cannot drift from the rendered page.
+  const additionalProperty: FacilityJsonLdProperty[] = [
+    { "@type": "PropertyValue", name: "Operator", value: facility.operator },
+    {
+      "@type": "PropertyValue",
+      name: "Status",
+      value: STATUS_META[facility.status].label,
+    },
+    {
+      "@type": "PropertyValue",
+      name: "Facility type",
+      value: FACILITY_TYPE_LABELS[facility.facilityType],
+    },
+  ];
+
+  if (facility.capacityMw?.operational !== undefined) {
+    additionalProperty.push({
+      "@type": "PropertyValue",
+      name: "Operational capacity",
+      value: facility.capacityMw.operational,
+      unitCode: "MAW",
+      unitText: "MW",
+    });
+  }
+  if (facility.capacityMw?.planned !== undefined) {
+    additionalProperty.push({
+      "@type": "PropertyValue",
+      name: "Planned capacity",
+      value: facility.capacityMw.planned,
+      unitCode: "MAW",
+      unitText: "MW",
+    });
+  }
+  // `aiClassification` is absent from the `power_generation` arm of the
+  // discriminated union, so narrow on facilityType rather than casting — a
+  // power plant has no AI classification by construction, not by omission.
+  if (
+    facility.facilityType !== "power_generation" &&
+    facility.aiClassification
+  ) {
+    additionalProperty.push({
+      "@type": "PropertyValue",
+      name: "AI classification",
+      value: AI_CLASSIFICATION_LABELS[facility.aiClassification],
+    });
+  }
+  if (facility.energy?.source) {
+    const source = facility.energy.source;
+    const label =
+      ENERGY_SOURCE_ENTRIES.find((e) => e.key === source)?.label ?? source;
+    additionalProperty.push({
+      "@type": "PropertyValue",
+      name: "Energy source",
+      value: label,
+    });
+  }
+  if (facility.energy?.utility) {
+    additionalProperty.push({
+      "@type": "PropertyValue",
+      name: "Utility",
+      value: facility.energy.utility,
+    });
+  }
+
   return {
     "@context": "https://schema.org",
     "@type": "Place",
@@ -52,6 +156,7 @@ export function buildFacilityJsonLd(facility: Facility): FacilityJsonLd {
       latitude: facility.location.lat,
       longitude: facility.location.lon,
     },
+    additionalProperty,
   };
 }
 
@@ -71,7 +176,6 @@ export interface DatasetJsonLd {
   name: string;
   description: string;
   url: string;
-  sameAs: string;
   keywords: string[];
   license: string;
   isAccessibleForFree: true;
@@ -91,17 +195,18 @@ export interface DatasetJsonLd {
   };
   measurementTechnique: string;
   variableMeasured: string[];
-  distribution: {
-    "@type": "DataDownload";
-    encodingFormat: string;
-    contentUrl: string;
-  }[];
   dateModified?: string;
 }
 
 /**
  * Builds a schema.org Dataset JSON-LD object describing the whole facility
  * dataset (not a single facility) — enables Google Dataset Search eligibility.
+ *
+ * Deliberately omits `temporalCoverage`: it would need an honest start date
+ * for the period the data covers, and nothing available to this builder
+ * supplies one — `getDatasetEdition()` (`lib/dataset-edition.ts`) exposes
+ * only `asOf`, a single point-in-time export timestamp, not a range. Add it
+ * only when a real start date becomes available; don't invent one.
  * Pure function — unit-testable without any DOM or Next.js dependencies.
  */
 export function buildDatasetJsonLd(opts: { dateModified?: string } = {}): DatasetJsonLd {
@@ -111,7 +216,6 @@ export function buildDatasetJsonLd(opts: { dateModified?: string } = {}): Datase
     name: "Compute Atlas — U.S. Data Center & Compute Infrastructure Dataset",
     description: siteConfig.description,
     url: siteConfig.url,
-    sameAs: siteConfig.repoUrl,
     keywords: [
       "data centers",
       "AI infrastructure",
@@ -123,7 +227,7 @@ export function buildDatasetJsonLd(opts: { dateModified?: string } = {}): Datase
       "subsidies",
       "United States",
     ],
-    license: "https://creativecommons.org/licenses/by/4.0/",
+    license: DATASET_LICENSE_URL,
     isAccessibleForFree: true,
     creator: { "@type": "Person", name: "Edward Kubiak", url: siteConfig.url },
     publisher: { "@type": "Organization", name: siteConfig.name, url: siteConfig.url },
@@ -141,13 +245,6 @@ export function buildDatasetJsonLd(opts: { dateModified?: string } = {}): Datase
       "subsidies",
       "jobs",
       "community reception",
-    ],
-    distribution: [
-      {
-        "@type": "DataDownload",
-        encodingFormat: "application/json",
-        contentUrl: `${siteConfig.url}/api/facilities`,
-      },
     ],
     ...(opts.dateModified ? { dateModified: opts.dateModified } : {}),
   };
@@ -227,7 +324,7 @@ export function buildOrganizationJsonLd(): OrganizationJsonLd {
     "@type": "Organization",
     name: siteConfig.name,
     url: siteConfig.url,
-    sameAs: [siteConfig.repoUrl],
+    sameAs: [siteConfig.repoUrl, siteConfig.blueskyUrl],
   };
 }
 
@@ -279,6 +376,7 @@ export function siteJsonLdString(): string {
 export interface ItemListJsonLd {
   "@context": "https://schema.org";
   "@type": "ItemList";
+  numberOfItems: number;
   itemListElement: {
     "@type": "ListItem";
     position: number;
@@ -289,9 +387,13 @@ export interface ItemListJsonLd {
 
 /**
  * Builds a schema.org ItemList JSON-LD object for a directory/hub page
- * (e.g. /states, /operators). `position` is 1-based (`i + 1`). Contract:
- * callers pass already-absolute `url`s (typically `${siteConfig.url}/...`);
- * this builder only assigns positions, it does not resolve relative paths.
+ * (e.g. /states, /operators). `position` is 1-based (`i + 1`).
+ * `numberOfItems` is derived from `items.length` — the same array
+ * `itemListElement` is built from — so it can never drift from the actual
+ * element count; there is no separate caller-supplied count to fall out of
+ * sync. Contract: callers pass already-absolute `url`s (typically
+ * `${siteConfig.url}/...`); this builder only assigns positions, it does not
+ * resolve relative paths.
  * Pure function — unit-testable without any DOM or Next.js dependencies.
  */
 export function buildItemListJsonLd(
@@ -300,6 +402,7 @@ export function buildItemListJsonLd(
   return {
     "@context": "https://schema.org",
     "@type": "ItemList",
+    numberOfItems: items.length,
     itemListElement: items.map((item, i) => ({
       "@type": "ListItem",
       position: i + 1,

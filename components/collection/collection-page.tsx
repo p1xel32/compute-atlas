@@ -3,15 +3,25 @@ import Link from "next/link";
 
 import type { Facility } from "@/lib/schema";
 import { formatCapacity, formatLocation } from "@/lib/format";
-import { breadcrumbJsonLdString, itemListJsonLdString } from "@/lib/seo";
-import { siteConfig } from "@/lib/site";
 import { StatusBadge } from "@/components/status-badge";
 import { Breadcrumb, type Crumb } from "@/components/breadcrumb";
+import { CollectionJsonLd } from "@/components/collection/collection-json-ld";
 import { ShowMoreList } from "@/components/collection/show-more-list";
+import {
+  StatFootnotes,
+  StatLabel,
+  assignFootnoteMarkers,
+} from "@/components/stat-footnote";
 
 export interface CollectionStat {
   label: string;
   value: string;
+  /**
+   * Optional qualifier the caption cannot carry — rendered as a footnote
+   * under the row behind a `*` marker. Same contract as `SurveyStat.note`;
+   * see that comment for why the caption no longer grows instead.
+   */
+  note?: string;
 }
 
 export interface CollectionPageProps {
@@ -22,6 +32,8 @@ export interface CollectionPageProps {
   facilities: Facility[];
   /** Shown in place of the card grid when `facilities` is empty. */
   emptyMessage?: string;
+  /** Extra sections rendered between the stat row and the card grid. */
+  beforeGrid?: ReactNode;
 }
 
 const DEFAULT_EMPTY_MESSAGE = "No facilities currently match this view.";
@@ -39,9 +51,9 @@ function CollectionFacilityCard({ facility }: { facility: Facility }) {
   return (
     <Link
       href={`/facilities/${facility.id}`}
-      className="neatline group flex flex-col gap-2 rounded-sm border border-border p-4 transition-colors hover:border-primary/50 hover:bg-muted/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+      className="neatline group flex flex-col gap-2 rounded-sm border border-border p-4 transition-colors motion-reduce:transition-none hover:border-primary/50 hover:bg-muted/40 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"
     >
-      <span className="font-display text-base leading-snug text-foreground group-hover:text-primary transition-colors">
+      <span className="font-display text-base leading-snug text-foreground group-hover:text-primary transition-colors motion-reduce:transition-none">
         {facility.name}
       </span>
 
@@ -71,9 +83,9 @@ function CollectionFacilityCard({ facility }: { facility: Facility }) {
  * this component only renders, so it stays trivially testable without
  * mocking the data layer.
  *
- * Injects two JSON-LD graphs via the shared lib/seo builders: BreadcrumbList
- * (from `crumbs`) and ItemList (from `facilities`) — collection pages don't
- * hand-roll structured data.
+ * Injects the shared BreadcrumbList + ItemList JSON-LD pair via
+ * `CollectionJsonLd` (from `crumbs` and `facilities`) — collection pages
+ * don't hand-roll structured data.
  */
 export function CollectionPage({
   title,
@@ -82,34 +94,16 @@ export function CollectionPage({
   statRow,
   facilities,
   emptyMessage = DEFAULT_EMPTY_MESSAGE,
+  beforeGrid,
 }: CollectionPageProps) {
+  const { markerAt, footnotes } = assignFootnoteMarkers(statRow);
+
   return (
     <div className="mx-auto max-w-6xl px-4 py-8 sm:py-12 space-y-8">
-      <script
-        type="application/ld+json"
-        dangerouslySetInnerHTML={{
-          __html: breadcrumbJsonLdString(
-            crumbs.map((c) => ({ name: c.label, url: c.href }))
-          ),
-        }}
-      />
-      <script
-        type="application/ld+json"
-        dangerouslySetInnerHTML={{
-          __html: itemListJsonLdString(
-            facilities.map((f) => ({
-              name: f.name,
-              url: `${siteConfig.url}/facilities/${f.id}`,
-            }))
-          ),
-        }}
-      />
+      <CollectionJsonLd crumbs={crumbs} facilities={facilities} />
 
       <Breadcrumb items={crumbs} />
 
-      {/* ------------------------------------------------------------------ */}
-      {/* Masthead                                                            */}
-      {/* ------------------------------------------------------------------ */}
       <header className="space-y-4 pb-2">
         <h1 className="font-display text-4xl leading-[1.05] text-foreground sm:text-5xl">
           {title}
@@ -120,27 +114,24 @@ export function CollectionPage({
         <div className="border-t border-border" />
       </header>
 
-      {/* ------------------------------------------------------------------ */}
-      {/* Survey stats row                                                    */}
-      {/* ------------------------------------------------------------------ */}
       {statRow.length > 0 && (
         <div className="flex flex-wrap gap-8 border-b border-border pb-8">
-          {statRow.map((stat) => (
+          {statRow.map((stat, i) => (
             <div key={stat.label} className="flex flex-col items-center gap-1 text-center">
               <span className="font-mono tabular-nums text-4xl font-semibold text-foreground">
                 {stat.value}
               </span>
               <span className="font-mono text-xs uppercase tracking-widest text-muted-foreground">
-                {stat.label}
+                <StatLabel label={stat.label} marker={markerAt(i)} />
               </span>
             </div>
           ))}
+          <StatFootnotes footnotes={footnotes} className="-mt-4" />
         </div>
       )}
 
-      {/* ------------------------------------------------------------------ */}
-      {/* Facility grid                                                       */}
-      {/* ------------------------------------------------------------------ */}
+      {beforeGrid}
+
       {facilities.length === 0 ? (
         <p className="text-base text-muted-foreground">{emptyMessage}</p>
       ) : (

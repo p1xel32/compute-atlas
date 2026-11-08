@@ -1,15 +1,27 @@
 import Link from "next/link";
 import type { Metadata } from "next";
 
-import { getAiClassificationByState, getAiClassificationCounts } from "@/lib/data";
-import { stateNameFromCode, stateSlugFromCode } from "@/lib/us-states";
+import {
+  getAiClassificationByState,
+  getAiClassificationCounts,
+  getFacilityTypeCounts,
+} from "@/lib/data";
+import {
+  stateNameFromCode,
+  stateSlugFromCode,
+  statesPhrase,
+  statesStat,
+} from "@/lib/us-states";
 import { Breadcrumb } from "@/components/breadcrumb";
+import { PageMasthead } from "@/components/page-masthead";
+import { SurveyStatRow } from "@/components/survey-stat-row";
 import { breadcrumbJsonLdString, itemListJsonLdString } from "@/lib/seo";
 import { siteConfig } from "@/lib/site";
 import { AI_CLASSIFICATION_CONFIDENCE_LABELS } from "@/lib/format";
+import { AI_CLASSIFICATION_ENTRIES } from "@/lib/ai-classification";
 import { aiClassificationEnum } from "@/lib/schema";
 
-export const revalidate = 3600;
+export const revalidate = 86400;
 
 type AiClassification = (typeof aiClassificationEnum.options)[number];
 
@@ -39,13 +51,20 @@ export const metadata: Metadata = {
  * classification explainer, block-Link state list).
  */
 export default async function AiPage() {
-  const [aiCounts, statesData] = await Promise.all([
+  const [aiCounts, statesData, facilityTypeCounts] = await Promise.all([
     getAiClassificationCounts(),
     getAiClassificationByState(),
+    getFacilityTypeCounts(),
   ]);
 
   const totalAiClassified =
     aiCounts.confirmed + aiCounts.likely + aiCounts.mixed_use;
+  // getAiClassificationCounts() covers data-center facilities only, so pair
+  // it with the data-center total (not all tracked facilities) for an
+  // honest coverage figure — mirrors app/stats/page.tsx's unclassifiedCount.
+  const dataCenterCount = facilityTypeCounts.data_center;
+  const classifiedPct =
+    dataCenterCount > 0 ? (totalAiClassified / dataCenterCount) * 100 : 0;
 
   const stateRows = statesData.map(({ state, counts }) => ({
     code: state,
@@ -54,6 +73,8 @@ export default async function AiPage() {
     counts,
     total: counts.confirmed + counts.likely + counts.mixed_use,
   }));
+  const stateRowCodes = stateRows.map((s) => s.code);
+  const statesTile = statesStat(stateRowCodes);
 
   return (
     <div
@@ -84,22 +105,11 @@ export default async function AiPage() {
 
       <Breadcrumb items={CRUMBS} />
 
-      {/* ------------------------------------------------------------------ */}
-      {/* Masthead                                                            */}
-      {/* ------------------------------------------------------------------ */}
-      <header className="space-y-4 pb-2">
-        <p className="font-mono text-xs uppercase tracking-widest text-primary">
-          AI classification
-        </p>
-        <h1 className="font-display text-4xl leading-[1.05] text-foreground sm:text-5xl">
-          AI data centers by state
-        </h1>
-        <p className="max-w-2xl text-base text-muted-foreground">
-          Where AI/GPU compute is concentrated across the tracked data-center
-          layer, state by state.
-        </p>
-        <div className="border-t border-border" />
-      </header>
+      <PageMasthead
+        eyebrow="AI classification"
+        title="AI data centers by state"
+        dek="Where AI/GPU compute is concentrated across the tracked data-center layer, state by state."
+      />
 
       {totalAiClassified === 0 ? (
         <p className="text-base text-muted-foreground">
@@ -107,92 +117,42 @@ export default async function AiPage() {
         </p>
       ) : (
         <>
-          {/* ------------------------------------------------------------------ */}
-          {/* Overview prose + classification explainer                          */}
-          {/* ------------------------------------------------------------------ */}
           <div className="max-w-2xl space-y-4">
             <p className="text-base leading-relaxed text-muted-foreground">
               Compute Atlas flags data-center records with a discernible AI or
               machine-learning angle, distinguishing them from traditional
               enterprise and general-purpose facilities. {totalAiClassified}{" "}
               data {totalAiClassified === 1 ? "center carries" : "centers carry"}{" "}
-              an AI classification today, across {stateRows.length}{" "}
-              {stateRows.length === 1 ? "state" : "states"}.
+              an AI classification today, across{" "}
+              {statesPhrase(stateRowCodes)}.
             </p>
             <dl className="space-y-3 text-sm">
-              <div>
-                <dt className="font-medium text-foreground">Confirmed</dt>
-                <dd className="text-muted-foreground">
-                  The operator or a credible primary source explicitly
-                  describes the facility as an AI or GPU cluster.
-                </dd>
-              </div>
-              <div>
-                <dt className="font-medium text-foreground">Likely</dt>
-                <dd className="text-muted-foreground">
-                  The facility exhibits strong indicators — hyperscale GPU
-                  procurement, AI-specific power agreements — but has not been
-                  explicitly confirmed as AI-primary.
-                </dd>
-              </div>
-              <div>
-                <dt className="font-medium text-foreground">Mixed use</dt>
-                <dd className="text-muted-foreground">
-                  A multi-purpose campus where AI workloads are a known
-                  component but not necessarily the primary or exclusive use.
-                </dd>
-              </div>
+              {AI_CLASSIFICATION_ENTRIES.map((entry) => (
+                <div key={entry.key}>
+                  <dt className="font-medium text-foreground">{entry.label}</dt>
+                  <dd className="text-muted-foreground">{entry.description}</dd>
+                </div>
+              ))}
             </dl>
             <p className="text-base leading-relaxed text-muted-foreground">
-              Not every data center has a classification — general-purpose
-              facilities with no discernible AI angle carry none, which is
-              itself meaningful information, not a gap in the data. Each
-              record below links through to its full facility list and cited
-              sources.
+              An AI classification is on file for {totalAiClassified} of the{" "}
+              {dataCenterCount} tracked data centers ({classifiedPct.toFixed(0)}%).
+              Absence is not itself a finding — it usually means the record
+              is thinner, with no sourced basis yet for a classification, not
+              that the site was reviewed and found non-AI. Each record below
+              links through to its full facility list and cited sources.
             </p>
           </div>
 
-          {/* ------------------------------------------------------------------ */}
-          {/* Survey stats row                                                    */}
-          {/* ------------------------------------------------------------------ */}
-          <div className="flex flex-wrap gap-8 border-b border-border pb-10">
-            <div className="flex flex-col items-center gap-1 text-center">
-              <span className="font-mono tabular-nums text-4xl font-semibold text-foreground">
-                {totalAiClassified}
-              </span>
-              <span className="font-mono text-xs uppercase tracking-widest text-muted-foreground">
-                AI-classified
-              </span>
-            </div>
-            <div className="flex flex-col items-center gap-1 text-center">
-              <span className="font-mono tabular-nums text-4xl font-semibold text-foreground">
-                {aiCounts.confirmed}
-              </span>
-              <span className="font-mono text-xs uppercase tracking-widest text-muted-foreground">
-                Confirmed
-              </span>
-            </div>
-            <div className="flex flex-col items-center gap-1 text-center">
-              <span className="font-mono tabular-nums text-4xl font-semibold text-foreground">
-                {aiCounts.likely}
-              </span>
-              <span className="font-mono text-xs uppercase tracking-widest text-muted-foreground">
-                Likely
-              </span>
-            </div>
-            <div className="flex flex-col items-center gap-1 text-center">
-              <span className="font-mono tabular-nums text-4xl font-semibold text-foreground">
-                {stateRows.length}
-              </span>
-              <span className="font-mono text-xs uppercase tracking-widest text-muted-foreground">
-                States
-              </span>
-            </div>
-          </div>
+          <SurveyStatRow
+            stats={[
+              { value: totalAiClassified, label: "AI-classified" },
+              { value: aiCounts.confirmed, label: "Confirmed" },
+              { value: aiCounts.likely, label: "Likely" },
+              { ...statesTile },
+            ]}
+          />
 
-          {/* ------------------------------------------------------------------ */}
-          {/* § States                                                            */}
-          {/* ------------------------------------------------------------------ */}
           <section
             aria-labelledby="states-heading"
             className="space-y-4 border-t border-border pt-10"
@@ -209,7 +169,7 @@ export default async function AiPage() {
                   {s.slug ? (
                     <Link
                       href={`/states/${s.slug}`}
-                      className="flex min-h-11 flex-col gap-1 py-3 sm:flex-row sm:items-center sm:justify-between sm:gap-4 transition-colors hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 rounded-sm"
+                      className="flex min-h-11 flex-col gap-1 py-3 sm:flex-row sm:items-center sm:justify-between sm:gap-4 transition-colors hover:bg-muted/50 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring rounded-sm"
                     >
                       <span className="flex flex-col gap-0.5 min-w-0">
                         <span className="text-sm text-foreground truncate">

@@ -10,22 +10,16 @@ import {
   type OperatorCapacityRanking,
   type StateCapacityRanking,
 } from "@/lib/data";
-import { formatCapacity, formatLocation } from "@/lib/format";
-import { stateNameFromCode, stateSlugFromCode } from "@/lib/us-states";
-import { StatusBadge } from "@/components/status-badge";
+import { formatLocation, formatPower } from "@/lib/format";
+import { stateNameFromCode, stateSlugFromCode, statesStat } from "@/lib/us-states";
 import { Breadcrumb } from "@/components/breadcrumb";
-import { breadcrumbJsonLdString, itemListJsonLdString } from "@/lib/seo";
-import { siteConfig } from "@/lib/site";
+import { CollectionJsonLd } from "@/components/collection/collection-json-ld";
+import { FacilityListRow } from "@/components/facility-list-row";
+import { PageMasthead } from "@/components/page-masthead";
+import { SurveyStatRow } from "@/components/survey-stat-row";
+import { SectionHeading } from "@/components/section-heading";
 
-export const revalidate = 3600;
-
-/** Formats a MW figure as GW (1 decimal) above 1000, else whole MW. Avoids "0.0 GW" for small totals. */
-function formatPower(mw: number): string {
-  if (mw >= 1000) {
-    return `${(mw / 1000).toFixed(1)} GW`;
-  }
-  return `${Math.round(mw)} MW`;
-}
+export const revalidate = 86400;
 
 /** A state capacity ranking row enriched with display name + route slug. */
 type StateRow = StateCapacityRanking & { name: string; slug: string | undefined };
@@ -35,7 +29,7 @@ const CRUMBS = [{ label: "Explore", href: "/explore" }, { label: "Rankings" }];
 export const metadata: Metadata = {
   title: "Data center rankings",
   description:
-    "The biggest tracked data center projects, largest operators, and states with the most capacity — ranked by tracked capacity, each entry source-cited.",
+    "The biggest tracked data center projects, and the operators and states with the most disclosed capacity — ranked by tracked megawatts, each entry source-cited.",
   alternates: { canonical: "/rankings" },
 };
 
@@ -43,8 +37,11 @@ export const metadata: Metadata = {
  * /rankings — capacity rankings hub. Static server component.
  *
  * Three ranked dimensions over the same dataset: biggest individual projects
- * by planned capacity, largest operators by combined capacity, and states
- * with the most tracked capacity. Deliberately a single page (not
+ * by disclosed planned capacity, and the operators and states with the most
+ * disclosed capacity. Note the operator/state rankings sum only the sites
+ * that publish a figure (capacity is disclosed on ~52% of records), so they
+ * rank disclosure as much as size — the headings say "disclosed" for exactly
+ * that reason; do not retitle them back. Deliberately a single page (not
  * /rankings/[dimension] routes) — mirrors /power's masthead + stat-row +
  * repeated-section structure rather than /ai's single-dimension shape.
  */
@@ -64,48 +61,22 @@ export default async function RankingsPage() {
     slug: stateSlugFromCode(s.state),
   }));
 
+  const statesTile = statesStat(stats.stateCodes);
+
   return (
     <div
       data-content-width="4xl"
       className="mx-auto max-w-4xl px-4 py-8 sm:px-6 sm:py-12 space-y-10"
     >
-      <script
-        type="application/ld+json"
-        dangerouslySetInnerHTML={{
-          __html: breadcrumbJsonLdString(
-            CRUMBS.map((c) => ({ name: c.label, url: c.href }))
-          ),
-        }}
-      />
-      <script
-        type="application/ld+json"
-        dangerouslySetInnerHTML={{
-          __html: itemListJsonLdString(
-            topProjects.map((f) => ({
-              name: f.name,
-              url: `${siteConfig.url}/facilities/${f.id}`,
-            }))
-          ),
-        }}
-      />
+      <CollectionJsonLd crumbs={CRUMBS} facilities={topProjects} />
 
       <Breadcrumb items={CRUMBS} />
 
-      {/* ------------------------------------------------------------------ */}
-      {/* Masthead                                                            */}
-      {/* ------------------------------------------------------------------ */}
-      <header className="space-y-4 pb-2">
-        <p className="font-mono text-xs uppercase tracking-widest text-primary">
-          Rankings
-        </p>
-        <h1 className="font-display text-4xl leading-[1.05] text-foreground sm:text-5xl">
-          Biggest data center projects, largest operators, top states
-        </h1>
-        <p className="max-w-2xl text-base text-muted-foreground">
-          The compute buildout, ranked by tracked capacity.
-        </p>
-        <div className="border-t border-border" />
-      </header>
+      <PageMasthead
+        eyebrow="Rankings"
+        title="Biggest data center projects, operators and states by disclosed capacity"
+        dek="The compute buildout, ranked by tracked capacity."
+      />
 
       {stats.count === 0 ? (
         <p className="text-base text-muted-foreground">
@@ -113,18 +84,21 @@ export default async function RankingsPage() {
         </p>
       ) : (
         <>
-          {/* ------------------------------------------------------------------ */}
-          {/* Overview prose                                                      */}
-          {/* ------------------------------------------------------------------ */}
           <div className="max-w-2xl space-y-4">
             <p className="text-base leading-relaxed text-muted-foreground">
-              Three views over the same {stats.count}-facility dataset: the
+              Three views over the same{" "}
+              {stats.count.toLocaleString("en-US")}-facility dataset: the
               single largest projects by disclosed planned capacity, the
-              operators with the most capacity across all their sites, and
-              the states hosting the most capacity overall. Each ranking is
+              operators with the most disclosed capacity across their sites,
+              and the states with the most disclosed capacity. Each ranking is
               ordered by tracked megawatts — not by press coverage or
               announcement size — and reflects only what a cited source
-              discloses.
+              discloses. These rankings cover only the facilities that disclose
+              a capacity figure — a site absent from them may be large but
+              undisclosed, not small. In the operator and state rankings
+              below, a large facility count beside a modest megawatt total
+              usually means most of that operator&apos;s or state&apos;s
+              sites publish no figure at all, not that they are small.
             </p>
             <p className="text-base leading-relaxed text-muted-foreground">
               Every entry below links through to its full facility, operator,
@@ -132,58 +106,21 @@ export default async function RankingsPage() {
             </p>
           </div>
 
-          {/* ------------------------------------------------------------------ */}
-          {/* Survey stats row                                                    */}
-          {/* ------------------------------------------------------------------ */}
-          <div className="flex flex-wrap gap-8 border-b border-border pb-10">
-            <div className="flex flex-col items-center gap-1 text-center">
-              <span className="font-mono tabular-nums text-4xl font-semibold text-foreground">
-                {stats.count}
-              </span>
-              <span className="font-mono text-xs uppercase tracking-widest text-muted-foreground">
-                Facilities
-              </span>
-            </div>
-            <div className="flex flex-col items-center gap-1 text-center">
-              <span className="font-mono tabular-nums text-4xl font-semibold text-foreground">
-                {stats.states}
-              </span>
-              <span className="font-mono text-xs uppercase tracking-widest text-muted-foreground">
-                States
-              </span>
-            </div>
-            <div className="flex flex-col items-center gap-1 text-center">
-              <span className="font-mono tabular-nums text-4xl font-semibold text-foreground">
-                {formatPower(stats.operationalMw)}
-              </span>
-              <span className="font-mono text-xs uppercase tracking-widest text-muted-foreground">
-                Operational
-              </span>
-            </div>
-            <div className="flex flex-col items-center gap-1 text-center">
-              <span className="font-mono tabular-nums text-4xl font-semibold text-foreground">
-                {formatPower(stats.plannedMw)}
-              </span>
-              <span className="font-mono text-xs uppercase tracking-widest text-muted-foreground">
-                Pipeline
-              </span>
-            </div>
-          </div>
+          <SurveyStatRow
+            stats={[
+              { value: stats.count, label: "Facilities" },
+              { ...statesTile },
+              { value: formatPower(stats.operationalMw), label: "Operational" },
+              { value: formatPower(stats.plannedMw), label: "Pipeline" },
+            ]}
+          />
 
-          {/* ------------------------------------------------------------------ */}
-          {/* § Biggest projects                                                  */}
-          {/* ------------------------------------------------------------------ */}
           <section
             aria-labelledby="projects-heading"
             className="space-y-4 border-t border-border pt-10"
           >
             <div className="space-y-2">
-              <p className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
-                § Biggest projects
-              </p>
-              <h2 id="projects-heading" className="font-display text-2xl text-foreground">
-                Biggest data center projects
-              </h2>
+              <SectionHeading kicker="Biggest projects" id="projects-heading" title="Biggest data center projects" />
             </div>
             <p className="max-w-2xl text-base leading-relaxed text-muted-foreground">
               Individual facilities ranked by tracked capacity — planned
@@ -194,25 +131,10 @@ export default async function RankingsPage() {
               <ol className="divide-y divide-border">
                 {topProjects.map((f) => (
                   <li key={f.id}>
-                    <Link
-                      href={`/facilities/${f.id}`}
-                      className="flex min-h-11 flex-col gap-1 py-3 sm:flex-row sm:items-center sm:justify-between sm:gap-4 transition-colors hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 rounded-sm"
-                    >
-                      <span className="flex flex-col gap-0.5 min-w-0">
-                        <span className="text-sm text-foreground truncate">
-                          {f.name}
-                        </span>
-                        <span className="text-xs text-muted-foreground truncate">
-                          {f.operator} &middot; {formatLocation(f)}
-                        </span>
-                      </span>
-                      <span className="flex shrink-0 items-center gap-3">
-                        <StatusBadge status={f.status} />
-                        <span className="font-mono tabular-nums text-xs text-muted-foreground">
-                          {formatCapacity(f)}
-                        </span>
-                      </span>
-                    </Link>
+                    <FacilityListRow
+                      facility={f}
+                      secondary={<>{f.operator} &middot; {formatLocation(f)}</>}
+                    />
                   </li>
                 ))}
               </ol>
@@ -223,24 +145,17 @@ export default async function RankingsPage() {
             )}
           </section>
 
-          {/* ------------------------------------------------------------------ */}
-          {/* § Largest operators                                                */}
-          {/* ------------------------------------------------------------------ */}
           <section
             aria-labelledby="operators-heading"
             className="space-y-4 border-t border-border pt-10"
           >
             <div className="space-y-2">
-              <p className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
-                § Largest operators
-              </p>
-              <h2 id="operators-heading" className="font-display text-2xl text-foreground">
-                Largest data center operators
-              </h2>
+              <SectionHeading kicker="Operators with the most disclosed capacity" id="operators-heading" title="Operators with the most disclosed capacity" />
             </div>
             <p className="max-w-2xl text-base leading-relaxed text-muted-foreground">
               Operators ranked by combined capacity — operational plus
-              planned — summed across every site they run in the dataset.
+              planned — summed across the sites they run that disclose a
+              figure.
             </p>
             {operatorRows.length > 0 ? (
               <ol className="divide-y divide-border">
@@ -248,14 +163,16 @@ export default async function RankingsPage() {
                   <li key={o.operator}>
                     <Link
                       href={`/operators/${operatorSlug(o.operator)}`}
-                      className="flex min-h-11 flex-col gap-1 py-3 sm:flex-row sm:items-center sm:justify-between sm:gap-4 transition-colors hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 rounded-sm"
+                      className="flex min-h-11 flex-col gap-1 py-3 sm:flex-row sm:items-center sm:justify-between sm:gap-4 transition-colors hover:bg-muted/50 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring rounded-sm"
                     >
                       <span className="flex flex-col gap-0.5 min-w-0">
                         <span className="text-sm text-foreground truncate">
                           {o.operator}
                         </span>
                         <span className="text-xs text-muted-foreground truncate">
-                          {o.count} {o.count === 1 ? "facility" : "facilities"} tracked
+                          {o.count} {o.count === 1 ? "facility" : "facilities"} tracked{" "}
+                          &middot; {o.disclosedCount}{" "}
+                          {o.disclosedCount === 1 ? "discloses" : "disclose"} capacity
                         </span>
                       </span>
                       <span className="font-mono tabular-nums text-xs text-muted-foreground shrink-0">
@@ -272,24 +189,17 @@ export default async function RankingsPage() {
             )}
           </section>
 
-          {/* ------------------------------------------------------------------ */}
-          {/* § States with the most capacity                                    */}
-          {/* ------------------------------------------------------------------ */}
           <section
             aria-labelledby="states-heading"
             className="space-y-4 border-t border-border pt-10"
           >
             <div className="space-y-2">
-              <p className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
-                § States with the most capacity
-              </p>
-              <h2 id="states-heading" className="font-display text-2xl text-foreground">
-                States with the most data center capacity
-              </h2>
+              <SectionHeading kicker="States with the most disclosed capacity" id="states-heading" title="States with the most disclosed capacity" />
             </div>
             <p className="max-w-2xl text-base leading-relaxed text-muted-foreground">
               States ranked by combined capacity — operational plus planned —
-              summed across every facility tracked there.
+              summed across the facilities tracked there that disclose a
+              figure.
             </p>
             {stateRows.length > 0 ? (
               <ol className="divide-y divide-border">
@@ -298,14 +208,16 @@ export default async function RankingsPage() {
                     {s.slug ? (
                       <Link
                         href={`/states/${s.slug}`}
-                        className="flex min-h-11 flex-col gap-1 py-3 sm:flex-row sm:items-center sm:justify-between sm:gap-4 transition-colors hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 rounded-sm"
+                        className="flex min-h-11 flex-col gap-1 py-3 sm:flex-row sm:items-center sm:justify-between sm:gap-4 transition-colors hover:bg-muted/50 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring rounded-sm"
                       >
                         <span className="flex flex-col gap-0.5 min-w-0">
                           <span className="text-sm text-foreground truncate">
                             {s.name}
                           </span>
                           <span className="text-xs text-muted-foreground truncate">
-                            {s.count} {s.count === 1 ? "facility" : "facilities"} tracked
+                            {s.count} {s.count === 1 ? "facility" : "facilities"} tracked{" "}
+                            &middot; {s.disclosedCount}{" "}
+                            {s.disclosedCount === 1 ? "discloses" : "disclose"} capacity
                           </span>
                         </span>
                         <span className="font-mono tabular-nums text-xs text-muted-foreground shrink-0">
@@ -319,7 +231,9 @@ export default async function RankingsPage() {
                             {s.name}
                           </span>
                           <span className="text-xs text-muted-foreground truncate">
-                            {s.count} {s.count === 1 ? "facility" : "facilities"} tracked
+                            {s.count} {s.count === 1 ? "facility" : "facilities"} tracked{" "}
+                            &middot; {s.disclosedCount}{" "}
+                            {s.disclosedCount === 1 ? "discloses" : "disclose"} capacity
                           </span>
                         </span>
                         <span className="font-mono tabular-nums text-xs text-muted-foreground shrink-0">

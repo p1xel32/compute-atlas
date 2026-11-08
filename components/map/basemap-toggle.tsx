@@ -19,12 +19,13 @@ export function BasemapToggle({ isSatellite, onToggle }: BasemapToggleProps) {
       onClick={onToggle}
       aria-pressed={isSatellite}
       aria-label="Toggle satellite imagery"
+      title="Satellite / map"
       className={[
         "flex h-11 w-11 items-center justify-center",
         "rounded-sm bg-popover border border-border",
         "shadow-[0_1px_4px_rgba(0,0,0,0.12)]",
         "cursor-pointer transition-colors",
-        "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1",
+        "focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-ring",
         isSatellite ? "ring-1 ring-primary/50" : "",
       ]
         .filter(Boolean)

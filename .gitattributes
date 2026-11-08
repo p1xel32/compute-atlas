@@ -1,0 +1,8 @@
+# Keep tests and CI config out of source archives. They stay in the
+# repository; they are only left out of `git archive` and GitHub's release ZIPs.
+*.test.ts export-ignore
+*.test.tsx export-ignore
+*.test.mjs export-ignore
+/e2e export-ignore
+/tests export-ignore
+/.github export-ignore

@@ -15,6 +15,22 @@ import {
 import { siteConfig } from "@/lib/site";
 import type { Facility } from "@/lib/schema";
 
+/**
+ * Hostile input for the five `*JsonLdString` serializers' breakout assertions.
+ *
+ * Each serializer applies `JSON.stringify(...).replace(/</g, "\\u003c")`, so the
+ * guarantee is that ZERO `<` survives — not merely that the literal `</script>`
+ * doesn't. These tests used to assert `not.toContain("</script>")`, which a
+ * mutation narrowing the replace to `/<\/script/g` passes while leaving
+ * `<script src=…>`, `<!--` and `<svg onload=…>` free to break out of the
+ * surrounding `<script type="application/ld+json">` block.
+ *
+ * `]]>` is here because it terminates a CDATA section; the `<` escape does not
+ * neutralize it, so these tests assert only that it survives the round trip
+ * intact rather than claiming it is defanged.
+ */
+const SCRIPT_BREAKOUT_PAYLOAD = '</script><script src="x"><!-- ]]> <svg onload=alert(1)>';
+
 const baseFacility: Facility = {
   id: "test-facility-ny",
   name: "Test Datacenter",
@@ -35,7 +51,7 @@ const baseFacility: Facility = {
     {
       url: "https://example.com/source",
       label: "Example source",
-      retrievedAt: "2025-01",
+      retrievedAt: "2025-01-01",
       kind: "press",
     },
   ],
@@ -48,6 +64,95 @@ describe("buildFacilityJsonLd", () => {
     expect(ld["@context"]).toBe("https://schema.org");
     expect(ld["@type"]).toBe("Place");
     expect(ld.name).toBe("Test Datacenter");
+  });
+
+  // Measured 2026-09-15: the Place carried name/url/address/geo only, so a
+  // retrieval model learned a pin existed and nothing about it. Every fact a
+  // reader sees must now also be machine-extractable.
+  describe("additionalProperty (the citable facts)", () => {
+    const propsOf = (f: Facility) =>
+      Object.fromEntries(
+        (buildFacilityJsonLd(f).additionalProperty ?? []).map((p) => [
+          p.name,
+          p.value,
+        ])
+      );
+
+    it("carries operator, status and facility type as PropertyValue entries", () => {
+      const props = buildFacilityJsonLd(baseFacility).additionalProperty ?? [];
+      expect(props.length).toBeGreaterThan(0);
+      props.forEach((p) => expect(p["@type"]).toBe("PropertyValue"));
+
+      const byName = propsOf(baseFacility);
+      expect(byName["Operator"]).toBe("Acme Corp");
+      expect(byName["Facility type"]).toBe("Data center");
+    });
+
+    it("uses the canonical STATUS_META label, not a retyped string", () => {
+      // Mutation coverage: emitting the raw enum yields "operational" and
+      // fails here. Guards against the structured data drifting from the
+      // rendered page the way title/H1 once did.
+      expect(propsOf(baseFacility)["Status"]).toBe("Operational");
+    });
+
+    it("tags capacity with the megawatt unit code, not a bare number", () => {
+      const ld = buildFacilityJsonLd({
+        ...baseFacility,
+        capacityMw: { planned: 4500, operational: 120 },
+      } as Facility);
+      const planned = (ld.additionalProperty ?? []).find(
+        (p) => p.name === "Planned capacity"
+      );
+      const operational = (ld.additionalProperty ?? []).find(
+        (p) => p.name === "Operational capacity"
+      );
+      expect(planned).toMatchObject({ value: 4500, unitCode: "MAW", unitText: "MW" });
+      expect(operational).toMatchObject({ value: 120, unitCode: "MAW" });
+    });
+
+    it("omits capacity, AI classification and energy entries when unset", () => {
+      // Absent must mean absent — never an entry with an empty or
+      // "undefined" value, which would read as a published fact.
+      const names = (buildFacilityJsonLd(baseFacility).additionalProperty ?? []).map(
+        (p) => p.name
+      );
+      expect(names).not.toContain("Planned capacity");
+      expect(names).not.toContain("Operational capacity");
+      expect(names).not.toContain("Energy source");
+      expect(names).not.toContain("Utility");
+      names.forEach((n) => expect(n).toBeTruthy());
+    });
+
+    it("maps the energy source through ENERGY_SOURCE_ENTRIES, not the raw enum", () => {
+      const props = propsOf({
+        ...baseFacility,
+        energy: { source: "on_site_gas", utility: "Duke Energy" },
+      } as Facility);
+      expect(props["Energy source"]).toBe("On-site gas");
+      expect(props["Utility"]).toBe("Duke Energy");
+    });
+
+    it("emits no AI classification for a power_generation facility", () => {
+      // That arm of the discriminated union has no such field; the absence is
+      // structural, so this must hold without a cast.
+      const names = (
+        buildFacilityJsonLd({
+          ...baseFacility,
+          facilityType: "power_generation",
+          capacityMw: { operational: 800 },
+        } as Facility).additionalProperty ?? []
+      ).map((p) => p.name);
+      expect(names).not.toContain("AI classification");
+      expect(names).toContain("Operational capacity");
+    });
+
+    it("survives serialization through facilityJsonLdString", () => {
+      const parsed = JSON.parse(
+        facilityJsonLdString(baseFacility).replace(/\\u003c/g, "<")
+      );
+      expect(parsed.additionalProperty).toBeInstanceOf(Array);
+      expect(parsed.additionalProperty[0]["@type"]).toBe("PropertyValue");
+    });
   });
 
   it("includes geo coordinates matching the facility location", () => {
@@ -114,14 +219,16 @@ describe("facilityJsonLdString", () => {
     expect(str).not.toContain("<");
   });
 
-  it("escapes < as \\u003c and removes </script> when name contains script-injection payload", () => {
+  it("escapes every < as \\u003c when the name carries a script-breakout payload", () => {
     const xssFacility: Facility = {
       ...baseFacility,
-      name: "</script><x>",
+      name: SCRIPT_BREAKOUT_PAYLOAD,
     };
     const str = facilityJsonLdString(xssFacility);
     expect(str).toContain("\\u003c");
-    expect(str).not.toContain("</script>");
+    expect(str).not.toContain("<");
+    // The escape must not corrupt the data it protects.
+    expect(JSON.parse(str).name).toBe(SCRIPT_BREAKOUT_PAYLOAD);
   });
 
   it("produces valid JSON after escaping", () => {
@@ -149,14 +256,26 @@ describe("buildDatasetJsonLd", () => {
     expect(ld["@type"]).toBe("Dataset");
   });
 
-  it("points distribution[0].contentUrl at the facilities API route", () => {
+  it("carries no sameAs and no distribution", () => {
     const ld = buildDatasetJsonLd();
-    expect(ld.distribution[0].contentUrl).toMatch(/\/api\/facilities$/);
+    expect(ld).not.toHaveProperty("sameAs");
+    expect(ld).not.toHaveProperty("distribution");
+  });
+
+  it("carries no distribution entry while bulk access is paused", () => {
+    const ld = buildDatasetJsonLd();
+    expect(ld).not.toHaveProperty("distribution");
+    expect(JSON.stringify(ld)).not.toMatch(/\/api\/facilities|facilities\.(csv|json)/);
   });
 
   it("sets license to the CC-BY-4.0 URL", () => {
     const ld = buildDatasetJsonLd();
     expect(ld.license).toBe("https://creativecommons.org/licenses/by/4.0/");
+  });
+
+  it("carries no identifier", () => {
+    const ld = buildDatasetJsonLd();
+    expect(ld).not.toHaveProperty("identifier");
   });
 
   it("includes dateModified when provided", () => {
@@ -176,11 +295,20 @@ describe("datasetJsonLdString", () => {
     expect(str).not.toContain("<");
   });
 
+  it("escapes every < as \\u003c when dateModified carries a script-breakout payload", () => {
+    // `dateModified` is this serializer's only caller-supplied input — every
+    // other value is a module constant — so it is the whole injectable surface.
+    const str = datasetJsonLdString({ dateModified: SCRIPT_BREAKOUT_PAYLOAD });
+    expect(str).toContain("\\u003c");
+    expect(str).not.toContain("<");
+    expect(JSON.parse(str).dateModified).toBe(SCRIPT_BREAKOUT_PAYLOAD);
+  });
+
   it("produces valid JSON that round-trips to a Dataset shape", () => {
     const str = datasetJsonLdString();
     const parsed = JSON.parse(str);
     expect(parsed["@type"]).toBe("Dataset");
-    expect(parsed.distribution[0].contentUrl).toMatch(/\/api\/facilities$/);
+    expect(parsed).not.toHaveProperty("distribution");
   });
 });
 
@@ -229,13 +357,14 @@ describe("breadcrumbJsonLdString", () => {
     expect(str).not.toContain("<");
   });
 
-  it("escapes < as \\u003c and removes </script> when a crumb name contains script-injection payload", () => {
+  it("escapes every < as \\u003c when a crumb name carries a script-breakout payload", () => {
     const str = breadcrumbJsonLdString([
       { name: "Map", url: "/map" },
-      { name: "</script><x>" },
+      { name: SCRIPT_BREAKOUT_PAYLOAD },
     ]);
     expect(str).toContain("\\u003c");
-    expect(str).not.toContain("</script>");
+    expect(str).not.toContain("<");
+    expect(JSON.parse(str).itemListElement[1].name).toBe(SCRIPT_BREAKOUT_PAYLOAD);
   });
 
   it("produces valid JSON that round-trips to a BreadcrumbList shape", () => {
@@ -260,9 +389,9 @@ describe("buildOrganizationJsonLd", () => {
     expect(ld.url).toBe(siteConfig.url);
   });
 
-  it("sets sameAs to the repo URL", () => {
+  it("sets sameAs to the repo and Bluesky URLs", () => {
     const ld = buildOrganizationJsonLd();
-    expect(ld.sameAs).toEqual([siteConfig.repoUrl]);
+    expect(ld.sameAs).toEqual([siteConfig.repoUrl, siteConfig.blueskyUrl]);
   });
 
   it("omits logo (no asset exists yet)", () => {
@@ -297,6 +426,15 @@ describe("buildWebSiteJsonLd", () => {
 });
 
 describe("siteJsonLdString", () => {
+  /**
+   * ⚠️ Honest limit: this serializer takes NO arguments — every value in the
+   * graph comes from `siteConfig` module constants, none of which contain a
+   * `<`. So there is nothing to inject, and this assertion CANNOT distinguish
+   * "the `<` escape is applied" from "the escape was deleted": both produce a
+   * `<`-free string. It pins the output invariant only. The escape itself is
+   * pinned by the four sibling serializers' breakout cases, which do have an
+   * injectable surface. Do not read a pass here as coverage of the escape.
+   */
   it("returns a string with no raw < characters", () => {
     const str = siteJsonLdString();
     expect(str).not.toContain("<");
@@ -347,6 +485,22 @@ describe("buildItemListJsonLd", () => {
     const ld = buildItemListJsonLd([]);
     expect(ld.itemListElement).toEqual([]);
   });
+
+  it("sets numberOfItems to the element count for a multi-item list", () => {
+    const ld = buildItemListJsonLd(ITEMS);
+    expect(ld.numberOfItems).toBe(2);
+    expect(ld.numberOfItems).toBe(ld.itemListElement.length);
+  });
+
+  it("sets numberOfItems to 0 for an empty list", () => {
+    const ld = buildItemListJsonLd([]);
+    expect(ld.numberOfItems).toBe(0);
+  });
+
+  it("sets numberOfItems to the element count for a single-item list", () => {
+    const ld = buildItemListJsonLd([ITEMS[0]]);
+    expect(ld.numberOfItems).toBe(1);
+  });
 });
 
 describe("itemListJsonLdString", () => {
@@ -357,12 +511,13 @@ describe("itemListJsonLdString", () => {
     expect(str).not.toContain("<");
   });
 
-  it("escapes < as \\u003c and removes </script> when a name contains script-injection payload", () => {
+  it("escapes every < as \\u003c when an item name carries a script-breakout payload", () => {
     const str = itemListJsonLdString([
-      { name: "</script><x>", url: "https://www.compute-atlas.com/states/x" },
+      { name: SCRIPT_BREAKOUT_PAYLOAD, url: "https://www.compute-atlas.com/states/x" },
     ]);
     expect(str).toContain("\\u003c");
-    expect(str).not.toContain("</script>");
+    expect(str).not.toContain("<");
+    expect(JSON.parse(str).itemListElement[0].name).toBe(SCRIPT_BREAKOUT_PAYLOAD);
   });
 
   it("produces valid JSON that round-trips to an ItemList shape", () => {
@@ -372,11 +527,13 @@ describe("itemListJsonLdString", () => {
     const parsed = JSON.parse(str);
     expect(parsed["@type"]).toBe("ItemList");
     expect(parsed.itemListElement[0].position).toBe(1);
+    expect(parsed.numberOfItems).toBe(1);
   });
 
   it("produces valid JSON for an empty array", () => {
     const str = itemListJsonLdString([]);
     const parsed = JSON.parse(str);
     expect(parsed.itemListElement).toEqual([]);
+    expect(parsed.numberOfItems).toBe(0);
   });
 });

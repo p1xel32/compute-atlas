@@ -1,55 +1,429 @@
 import { createHash } from "node:crypto";
+import { isIPv6 } from "node:net";
 import { and, eq, gt, sql } from "drizzle-orm";
 
 import { getDb } from "@/lib/db/client";
-import { submissionsTable, subscriptionsTable } from "@/lib/db/schema";
+import { hasValidEdgeSecret } from "@/lib/edge-secret";
+import {
+  submissionNotifyRequestsTable,
+  submissionNotifySendsTable,
+  subscriptionsTable,
+  subscribeAttemptsTable,
+  intakeAttemptsTable,
+  apiAccessGrantsTable,
+  type IntakeSurface,
+} from "@/lib/db/schema";
 
 export const RATE_LIMIT_MAX = 5;
 export const RATE_LIMIT_WINDOW_MS = 60 * 60 * 1000;
 
-export function extractClientIp(request: Request): string {
-  const forwardedFor = request.headers.get("x-forwarded-for");
-  if (forwardedFor) {
-    const first = forwardedFor.split(",")[0]?.trim();
-    if (first) return first;
+/**
+ * Derives the client IP by avoiding the naive leftmost-x-forwarded-for
+ * extraction this module once had: on Vercel the leftmost `x-forwarded-for`
+ * entry is client-suppliable (Vercel appends the real client IP rather than
+ * replacing one the client already sent), so an attacker can rotate XFF per
+ * request to get a fresh `ipHash` bucket every request and bypass any
+ * limiter keyed on that naive extraction's result entirely.
+ *
+ * Precedence, most to least trusted:
+ *  1. `cf-connecting-ip` — ONLY when the same request carries a valid edge
+ *     shared secret (`hasValidEdgeSecret`; unset `EDGE_SHARED_SECRET` means
+ *     never trusted), so this no longer depends solely on `proxy.ts` gating
+ *     /api and /admin. On the production path (Cloudflare in front of
+ *     Vercel), Cloudflare always overwrites this header with the real
+ *     connecting client's IP rather than passing through a client-supplied
+ *     value, so it's trustworthy there. It is NOT unspoofable in general: a
+ *     request that reaches the Vercel origin directly, bypassing Cloudflare,
+ *     can set this header itself like any other. That's not an incremental
+ *     weakness versus the alternatives below, though — the same direct-to-
+ *     origin caller could already forge `x-real-ip` (precedence #2) too, and
+ *     the burst limiter (`lib/api-rate-limit.ts`) plus the DB-backed daily
+ *     volume gate remain as further defense regardless of which header wins.
+ *     Confirmed live 2026-09-03: production's `x-forwarded-for` leftmost
+ *     entry was rotating per request (21 requests from one stable IPv4
+ *     egress produced 20 distinct buckets), which is exactly the spoofing
+ *     this precedence exists to close.
+ *  2. `x-real-ip` — assumed set by Vercel's edge to the true
+ *     client-connection IP, single-valued and not attacker-controllable; the
+ *     fallback for non-Cloudflare paths (local dev, direct Vercel access).
+ *  3. The RIGHTMOST `x-forwarded-for` entry (the one appended by the trusted
+ *     proxy, on the same assumption), if neither of the above is present.
+ *  4. A fixed sentinel ("unknown").
+ *
+ * Prefer this over the naive leftmost-x-forwarded-for extraction this module
+ * once had, for any path where a spoofed bucket defeats the limiter's
+ * purpose — auth lockout, anything that sends email or
+ * costs money on every accepted request (e.g. the contact endpoint), durable
+ * per-IP volume caps (e.g. the daily API-read gate), and the in-memory burst
+ * limiter (`lib/api-rate-limit.ts`) guarding the read API's
+ * `checkApiRateLimit` buckets. The burst limiter was switched over
+ * deliberately, at all five read-API routes (`facilities`,
+ * `facilities/[id]`, `search`, `stats`, `schema`): the production incident
+ * this precedence exists to close (above) hits an in-memory
+ * per-request-count bucket exactly the same way it hits a DB-backed one — a
+ * rotating leftmost XFF entry defeats either kind of counter regardless of
+ * where the count is stored.
+ *
+ * The `cf-connecting-ip` precedence is a strict improvement for every
+ * existing caller (`app/api/contact/route.ts`, `app/admin/login/actions.ts`)
+ * too — it only takes effect on requests that carry a valid edge secret,
+ * i.e. that actually traversed Cloudflare, and when present it is strictly
+ * more trustworthy than
+ * `x-real-ip`/XFF, so no caller becomes less safe.
+ *
+ * Takes `Headers` directly (not a `Request`) so both a route handler
+ * (`request.headers`) and a Server Action (`await headers()` from
+ * `next/headers`, whose `ReadonlyHeaders` type is a structural superset of
+ * `Headers`) can call this without wrapping or casting.
+ */
+export function extractTrustedClientIp(headers: Headers): string {
+  // Only honour cf-connecting-ip on a request that also proves it traversed
+  // Cloudflare; a direct-to-origin caller can set the header to anything.
+  const cfConnectingIp = hasValidEdgeSecret(headers)
+    ? headers.get("cf-connecting-ip")
+    : null;
+  if (cfConnectingIp) {
+    const trimmed = cfConnectingIp.trim();
+    if (trimmed) return trimmed;
   }
-  const realIp = request.headers.get("x-real-ip");
-  if (realIp) return realIp.trim();
+  const realIp = headers.get("x-real-ip");
+  if (realIp) {
+    const trimmed = realIp.trim();
+    if (trimmed) return trimmed;
+  }
+  const forwardedFor = headers.get("x-forwarded-for");
+  if (forwardedFor) {
+    const parts = forwardedFor
+      .split(",")
+      .map((p) => p.trim())
+      .filter((p) => p.length > 0);
+    if (parts.length > 0) return parts[parts.length - 1];
+  }
   return "unknown";
 }
 
+/**
+ * Collapses an IPv6 address to its /64 network prefix for use as a rate-limit
+ * bucket key; IPv4 addresses (and the "unknown" sentinel) pass through
+ * unchanged. A residential IPv6 client is routinely delegated a whole /64 and
+ * rotates its source address within it automatically (privacy extensions,
+ * RFC 4941), so hashing the full address would hand any such client
+ * effectively unlimited buckets against a per-IP cap — standard practice is
+ * to rate-limit IPv6 at the /64 boundary instead. `::ffff:1.2.3.4`
+ * (IPv4-mapped IPv6) is treated as plain IPv4.
+ *
+ * Handles `::` zero-compression by expanding it properly: the compressed run
+ * can sit anywhere in the address (start, middle, or end), and the groups
+ * that carry the /64 prefix can live on either side of it — e.g.
+ * `::2001:db8:1:2:3:4:5` expands to `0:2001:db8:1:2:3:4:5`, so its /64 is
+ * `0:2001:db8:1`, not `0:0:0:0` (naively taking only the pre-"::" head gets
+ * this wrong whenever the compressed run sits early and the tail carries the
+ * prefix groups). We split on `::` into head and tail group lists, insert
+ * `8 - head.length - tail.length` zero groups between them to get the full
+ * 8-group address, then take the first four groups as the /64 prefix (e.g.
+ * `2001:db8::1` -> head `["2001","db8"]`, tail `["1"]` -> prefix
+ * `2001:db8:0:0`).
+ */
+export function normaliseIpForBucketing(ip: string): string {
+  if (!ip.includes(":")) return ip; // IPv4, or the "unknown" sentinel
+
+  const withoutZone = ip.split("%")[0]; // strip zone id (e.g. "%eth0")
+
+  // Canonical form first, so `2001:DB8::1`, `2001:0db8::1` and `2001:db8::1`
+  // share one bucket. An embedded dotted-quad tail becomes two hex groups.
+  let text = withoutZone.toLowerCase();
+  const dotted = text.match(/^(.*:)(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (dotted) {
+    const o = dotted.slice(2).map(Number);
+    if (o.some((n) => n > 255)) return text; // not an address; leave as-is
+    const hex = (hi: number, lo: number) => ((hi << 8) | lo).toString(16);
+    text = `${dotted[1]}${hex(o[0], o[1])}:${hex(o[2], o[3])}`;
+  }
+  if (!isIPv6(text)) return text; // unparseable: no bucketing guarantee, but never throw
+
+  let groups: string[];
+  if (text.includes("::")) {
+    const [headPart, tailPart] = text.split("::");
+    const head = headPart ? headPart.split(":") : [];
+    const tail = tailPart ? tailPart.split(":") : [];
+    const missing = Math.max(0, 8 - head.length - tail.length);
+    groups = [...head, ...Array(missing).fill("0"), ...tail];
+  } else {
+    groups = text.split(":");
+  }
+  groups = groups.map((g) => g.replace(/^0+(?=.)/, "")); // drop leading zeros per group
+
+  // IPv4-mapped (::ffff:a.b.c.d, in either notation) is the plain IPv4 bucket.
+  if (groups.slice(0, 5).every((g) => g === "0") && groups[5] === "ffff") {
+    const hi = parseInt(groups[6], 16);
+    const lo = parseInt(groups[7], 16);
+    return `${hi >> 8}.${hi & 255}.${lo >> 8}.${lo & 255}`;
+  }
+
+  return groups.slice(0, 4).join(":");
+}
+
+const FALLBACK_CONTRIBUTE_IP_SALT = "compute-atlas-contribute-v1";
+
+/**
+ * `CONTRIBUTE_IP_SALT` is optional locally but REQUIRED in production. The
+ * fallback salt above is public (this repo is open source), so hashes made
+ * with it are brute-forceable over the full input space — production must
+ * fail loudly rather than silently pseudonymize submitter IPs (or, below,
+ * notify-request email addresses) with a known salt. Preview deployments do
+ * not inherit Production-scoped env vars, so previews (like local dev and
+ * tests) intentionally keep the fallback.
+ *
+ * Shared by every salted hash in this file (`hashIp`, `hashNotifyEmail`)
+ * rather than each resolving+guarding its own copy, so there is exactly one
+ * place this guard can drift. Deliberately does NOT introduce a second env
+ * var for the email-hash path — every additional variable is one more thing
+ * that must be configured correctly before its feature can be enabled.
+ */
+function resolveContributeSalt(): string {
+  const salt = process.env.CONTRIBUTE_IP_SALT;
+  if (!salt && process.env.VERCEL_ENV === "production") {
+    throw new Error(
+      "CONTRIBUTE_IP_SALT must be set in production — refusing to hash with the repo-public default salt."
+    );
+  }
+  return salt ?? FALLBACK_CONTRIBUTE_IP_SALT;
+}
+
+/**
+ * NOTE ON STABILITY: this must keep producing the exact same digest for the
+ * exact same (ip, salt) pair as before the `resolveContributeSalt` refactor —
+ * every `submitter_ip_hash` value already stored in production was computed
+ * by this expression, and a changed output would silently orphan every
+ * stored row. Pinned by a literal-output regression test in
+ * `lib/rate-limit.test.ts`; do not change this function's hashed input
+ * without updating stored data.
+ */
 export function hashIp(ip: string): string {
-  const salt = process.env.CONTRIBUTE_IP_SALT ?? "compute-atlas-contribute-v1";
-  return createHash("sha256").update(ip + salt).digest("hex");
+  return createHash("sha256").update(ip + resolveContributeSalt()).digest("hex");
+}
+
+/**
+ * Hashes a notify-request email address for `submission_notify_sends`
+ * (see that table's doc comment in lib/db/schema.ts for why this exists).
+ * Reuses `hashIp`'s salt and production guard via `resolveContributeSalt` —
+ * deliberately, so this feature needs no env var of its own — but prefixes a
+ * domain separator (`"notify-email:"`) so an email hash can never collide
+ * with an IP hash of the same literal input string. `email` is expected
+ * pre-normalized (lowercased/trimmed) by the caller, same convention as
+ * every other per-address cap in this file.
+ */
+export function hashNotifyEmail(email: string): string {
+  return createHash("sha256")
+    .update("notify-email:" + email + resolveContributeSalt())
+    .digest("hex");
 }
 
 export function rateLimitDecision(count: number): { ok: boolean } {
   return { ok: count < RATE_LIMIT_MAX };
 }
 
-export async function checkRateLimit(ipHash: string): Promise<{ ok: boolean }> {
+/**
+ * Records one request against `intake_attempts` for `surface`.
+ *
+ * MUST be called exactly once per request to the surface's endpoint that gets
+ * past the rate-limit gate, BEFORE any content-dependent branch — so invalid
+ * JSON, Zod failure, honeypot, unknown facility/target, over-cap, duplicate and
+ * success all cost exactly one row. Exact sibling of `recordSubscribeAttempt`
+ * below; read that function and `intakeAttemptsTable`'s doc comment
+ * (lib/db/schema.ts) together before changing either.
+ *
+ * WHY BEFORE THE BRANCH, NOT AFTER THE OUTCOME: these four endpoints answer a
+ * tripped honeypot with the SAME `201 {ok:true}` as a real submission, and
+ * `requestAccessGrant` answers honeypot / over-cap / existing-grant with the
+ * same generic `{ok:true}` (all prior security-review fixes). A rate-limit side
+ * effect that fired on some of those paths but not others is observable as a
+ * difference in remaining budget, which reintroduces exactly the
+ * branch-distinguishing oracle that response symmetry exists to close.
+ * (`/api/access/request` no longer creates grants or records attempts, and
+ * `requestAccessGrant` has no production caller; the paragraph describes the
+ * original design.)
+ *
+ * The already-refused (429) request deliberately does NOT record — see the
+ * routes' comments and `recordSubscribeAttempt`: that branch is decided purely
+ * by the prior count, never by request content, so it carries no information
+ * the status code did not already give away, and recording it would stop the
+ * rolling window ever draining for a shared egress IP (CGNAT, corporate NAT,
+ * VPN, campus), turning an hour-long limit into an indefinite lockout.
+ *
+ * Deliberately does NOT swallow errors: if the attempt cannot be recorded the
+ * cap cannot be enforced, so the caller must fail the request rather than let
+ * it proceed uncounted (fail closed). The routes answer a throw here — and one
+ * from `checkIntakeRateLimit`, which fails under the same conditions — with a
+ * 503, not a 429: it is an outage, not a limit.
+ */
+export async function recordIntakeAttempt(surface: IntakeSurface, ipHash: string): Promise<void> {
+  await getDb().insert(intakeAttemptsTable).values({ surface, submitterIpHash: ipHash });
+}
+
+/**
+ * Per-IP rate limit for one public write surface, counting PRIOR *attempts* in
+ * the window — not successful inserts.
+ *
+ * Replaces four separate functions (`checkRateLimit`, `checkLeadRateLimit`,
+ * `checkContactRateLimit`, `checkAccessGrantRateLimit`) that each counted their
+ * own OUTCOME table (`submissions` via a jsonb-path lookup, `leads`,
+ * `contact_messages`, `api_access_grants`). Only a successful INSERT can raise
+ * any of those, so every request that terminated without inserting was free:
+ * `POST /api/contribute {"website":"x"}` tripped the honeypot, returned 201,
+ * wrote nothing and cost nothing — a bot that tripped the honeypot was
+ * completely unlimited while one that did not was capped. Same defect
+ * `checkSubscribeRateLimit` fixed for subscribe in PR #288; it was never
+ * carried across. Do not reintroduce a limiter that counts outcome rows.
+ *
+ * Budgets remain per-surface, as they were with four tables: the `surface`
+ * predicate below is what keeps a burst against one surface from silently
+ * starving another, and the composite index leads with it.
+ *
+ * It counts attempts ONLY — never `attempts + outcome rows`. Counting both
+ * would make an inserting request cost 2 units of budget and a non-inserting
+ * one cost 1, which is observable: send one request, then count how many remain
+ * before the 429, and the count reveals whether the insert happened — an
+ * existence oracle (does this facility id exist? does this address already hold
+ * a grant?) straight through the generic success that exists to hide it. Every
+ * request costing exactly 1 has no such asymmetry, and since an insert can only
+ * occur on a request that already wrote its attempt row, the attempt count is a
+ * superset of the insert count: strictly at least as tight, without the oracle.
+ *
+ * Semantics are unchanged (`count < RATE_LIMIT_MAX`); the route gates on the
+ * prior count and then records this request, so 5 requests per hour still
+ * succeed and the 6th is refused.
+ */
+export async function checkIntakeRateLimit(
+  surface: IntakeSurface,
+  ipHash: string
+): Promise<{ ok: boolean }> {
   const windowStart = new Date(Date.now() - RATE_LIMIT_WINDOW_MS);
   const rows = await getDb()
     .select({ c: sql<number>`count(*)::int` })
-    .from(submissionsTable)
+    .from(intakeAttemptsTable)
     .where(
       and(
-        gt(submissionsTable.createdAt, windowStart),
-        sql`${submissionsTable.provenance}->>'submitterIpHash' = ${ipHash}`
+        eq(intakeAttemptsTable.surface, surface),
+        gt(intakeAttemptsTable.createdAt, windowStart),
+        eq(intakeAttemptsTable.submitterIpHash, ipHash)
       )
     );
   return rateLimitDecision(Number(rows[0]?.c ?? 0));
 }
 
+/**
+ * Admin-login budget: 5 FAILED attempts per 15 minutes per IP hash, durable
+ * and shared across serverless instances (the in-memory bucket in
+ * `app/admin/login/login-guards.ts` is only a secondary bound).
+ *
+ * RESERVE-THEN-COUNT, not check-then-record. Each login first INSERTs an
+ * attempt row (committed, autocommit) and then counts the window INCLUDING that
+ * row; it is admitted only if the count is <= max. A request's count covers
+ * every row committed before its count started, which includes its own and all
+ * earlier committers', so its count is at least its commit rank: at most the first
+ * `max` committers can be admitted, however many run concurrently (a simultaneous
+ * burst may refuse all of them, since each sees the others' rows: over-refusal,
+ * never over-admission). The old
+ * check-then-record let N parallel guesses all read the same low count.
+ * The caller deletes the reserved row on SUCCESS (`releaseAdminLoginAttempt`),
+ * so the persisted rows are failed attempts only; a refused request deletes its
+ * own row too, so refusals do not extend the window. If that delete fails the
+ * row stays and counts as a failure (conservative).
+ */
+export const ADMIN_LOGIN_BUDGET = { max: 5, windowMs: 15 * 60 * 1000 } as const;
+
+export async function reserveAdminLoginAttempt(
+  ipHash: string
+): Promise<{ ok: boolean; id: string }> {
+  const db = getDb();
+  const [row] = await db
+    .insert(intakeAttemptsTable)
+    .values({ surface: "admin-login", submitterIpHash: ipHash })
+    .returning({ id: intakeAttemptsTable.id });
+  const windowStart = new Date(Date.now() - ADMIN_LOGIN_BUDGET.windowMs);
+  const rows = await db
+    .select({ c: sql<number>`count(*)::int` })
+    .from(intakeAttemptsTable)
+    .where(
+      and(
+        eq(intakeAttemptsTable.surface, "admin-login"),
+        gt(intakeAttemptsTable.createdAt, windowStart),
+        eq(intakeAttemptsTable.submitterIpHash, ipHash)
+      )
+    );
+  const ok = Number(rows[0]?.c ?? 0) <= ADMIN_LOGIN_BUDGET.max;
+  if (!ok) {
+    await releaseAdminLoginAttempt(row.id);
+  }
+  return { ok, id: row.id };
+}
+
+/** Deletes one reserved admin-login attempt row (successful login, or a refused reservation). */
+export async function releaseAdminLoginAttempt(id: string): Promise<void> {
+  await getDb().delete(intakeAttemptsTable).where(eq(intakeAttemptsTable.id, id));
+}
+
+/**
+ * Records one subscribe request against `subscribe_attempts`.
+ *
+ * MUST be called exactly once per request to `POST /api/subscribe` that gets
+ * past the rate-limit gate, BEFORE any content-dependent branch — so invalid
+ * JSON, Zod failure, honeypot, unknown facility, unknown state, over the
+ * per-address send cap, duplicate and success all cost exactly one row.
+ * `subscribeToTarget` deliberately returns an identical generic `{ok:true}` for
+ * the honeypot / duplicate / over-cap paths (a prior security-review fix), so a
+ * rate-limit side effect that fired on some paths and not others would
+ * reintroduce exactly the branch-distinguishing oracle that symmetry closes.
+ *
+ * The already-refused (429) request deliberately does NOT record — see the
+ * route's comment: that branch is decided purely by the prior count, never by
+ * request content, so it carries no information the status code did not already
+ * give away, and recording it would stop the rolling window ever draining for a
+ * shared egress IP.
+ *
+ * Deliberately does NOT swallow errors: if the attempt cannot be recorded the
+ * cap cannot be enforced, so the caller must fail the request rather than let it
+ * proceed uncounted (fail closed). The route answers a throw here — and one from
+ * `checkSubscribeRateLimit`, which fails under the same conditions — with a 503,
+ * not a 429: it is an outage, not a limit.
+ */
+export async function recordSubscribeAttempt(ipHash: string): Promise<void> {
+  await getDb().insert(subscribeAttemptsTable).values({ submitterIpHash: ipHash });
+}
+
+/**
+ * Per-IP rate limit for `POST /api/subscribe`, counting PRIOR *attempts* in the
+ * window — not successful inserts.
+ *
+ * This previously counted `subscriptions` rows, which only a successful INSERT
+ * can raise: every request that terminated without inserting (invalid JSON, Zod
+ * failure, honeypot, unknown target, over the per-address send cap, duplicate)
+ * was free, so an attacker who never succeeded was never rate-limited.
+ *
+ * It counts attempts ONLY — not `attempts + inserts`. Counting both would make
+ * an inserting request cost 2 units of budget and a non-inserting one cost 1,
+ * which is observable: subscribe once for a victim address, then count the
+ * requests remaining before a 429, and the count reveals whether the insert
+ * happened — an existence oracle over the subscriber list, through the very
+ * generic `{ok:true}` that exists to hide it. Every request costing exactly 1
+ * has no such asymmetry, and since an insert can only occur on a request that
+ * already wrote its attempt row, the attempt count is a superset of the insert
+ * count: strictly at least as tight, without the oracle.
+ *
+ * Semantics are unchanged (`count < RATE_LIMIT_MAX`); the route gates on the
+ * prior count and then records this request, so 5 requests per hour still
+ * succeed and the 6th is refused.
+ */
 export async function checkSubscribeRateLimit(ipHash: string): Promise<{ ok: boolean }> {
   const windowStart = new Date(Date.now() - RATE_LIMIT_WINDOW_MS);
   const rows = await getDb()
     .select({ c: sql<number>`count(*)::int` })
-    .from(subscriptionsTable)
+    .from(subscribeAttemptsTable)
     .where(
       and(
-        gt(subscriptionsTable.createdAt, windowStart),
-        eq(subscriptionsTable.submitterIpHash, ipHash)
+        gt(subscribeAttemptsTable.createdAt, windowStart),
+        eq(subscribeAttemptsTable.submitterIpHash, ipHash)
       )
     );
   return rateLimitDecision(Number(rows[0]?.c ?? 0));
@@ -57,12 +431,24 @@ export async function checkSubscribeRateLimit(ipHash: string): Promise<{ ok: boo
 
 export const EMAIL_SEND_CAP_MAX = 5; // confirm emails per address per window
 
+// Auto-confirm cumulative cap (see canAutoConfirm in lib/subscribe.ts): bounds
+// how many NEW subscriptions a single address can have auto-confirmed (skip
+// the double-opt-in email) within a rolling window, regardless of target.
+// Ed's number (2026-09-27): the biggest genuine power users hold 8 and 7
+// subscriptions respectively, so 50 is ~6x real usage — no legitimate
+// subscriber will ever reach it — while it cuts the abuse ceiling from ~984
+// targets to 50. Going over this cap does NOT reject the subscription; it
+// only denies the auto-confirm shortcut, falling back to the ordinary
+// pending + confirm-email path.
+export const AUTO_CONFIRM_CAP_MAX = 50;
+export const AUTO_CONFIRM_CAP_WINDOW_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+
 /**
  * Per-recipient cap on confirm-email sends, independent of the per-IP rate
  * limit above. The IP limit doesn't stop a distributed attacker from
  * email-bombing one victim by varying targetId (and IP) across requests —
- * this bounds sends to a single address regardless of source (s65 security
- * review, Fix 2). `email` is expected pre-normalized (lowercased/trimmed) by
+ * this bounds sends to a single address regardless of source (a prior
+ * security-review fix). `email` is expected pre-normalized (lowercased/trimmed) by
  * the caller.
  */
 export async function checkEmailSendCap(email: string): Promise<{ ok: boolean }> {
@@ -71,5 +457,110 @@ export async function checkEmailSendCap(email: string): Promise<{ ok: boolean }>
     .select({ c: sql<number>`count(*)::int` })
     .from(subscriptionsTable)
     .where(and(gt(subscriptionsTable.createdAt, windowStart), eq(subscriptionsTable.email, email)));
+  return { ok: Number(rows[0]?.c ?? 0) < EMAIL_SEND_CAP_MAX };
+}
+
+/**
+ * Per-recipient cap on OUTSTANDING "email me when reviewed" requests —
+ * bounds notify-queue depth per address, NOT mail volume. Independent of the
+ * per-IP `checkIntakeRateLimit` ("contribute", 5/hour), which already bounds submission
+ * creation. `email` is expected pre-normalized (lowercased/trimmed) by the
+ * caller.
+ *
+ * CORRECTED LIMITATION (was documented here as "still bounds mail volume" —
+ * that was wrong; see the security-review finding this comment now
+ * reflects): `submission_notify_requests` rows are deleted the moment their
+ * submission is reviewed (see that table's doc comment in lib/db/schema.ts),
+ * approve OR reject either way, so this counts *outstanding* notify requests
+ * per address within the window, not lifetime attempts — unlike
+ * `checkEmailSendCap` above, whose `subscriptions` rows persist. It does
+ * NOT bound mail volume: an attacker can fill this cap, wait for the
+ * maintainer's ordinary review of the queue to delete the rows (which sends
+ * the mail), and refill immediately — volume is unbounded over time with the
+ * maintainer's own spam-cleanup as the delivery mechanism. See
+ * `checkSubmissionNotifySendCap` below for the persistent counter that
+ * actually bounds mail volume; this function is kept only to bound how many
+ * requests can sit outstanding for one address at a time. Submission
+ * creation itself is bounded independently by the per-IP
+ * `checkIntakeRateLimit`("contribute").
+ */
+export async function checkSubmissionNotifyCap(email: string): Promise<{ ok: boolean }> {
+  const windowStart = new Date(Date.now() - RATE_LIMIT_WINDOW_MS);
+  const rows = await getDb()
+    .select({ c: sql<number>`count(*)::int` })
+    .from(submissionNotifyRequestsTable)
+    .where(
+      and(
+        gt(submissionNotifyRequestsTable.createdAt, windowStart),
+        eq(submissionNotifyRequestsTable.email, email)
+      )
+    );
+  return { ok: Number(rows[0]?.c ?? 0) < EMAIL_SEND_CAP_MAX };
+}
+
+export const SUBMISSION_NOTIFY_SEND_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
+export const SUBMISSION_NOTIFY_SEND_CAP_MAX = 5;
+
+/**
+ * Records one notify-email SEND ATTEMPT against `submission_notify_sends`,
+ * hashed via `hashNotifyEmail`.
+ *
+ * MUST be called BEFORE the send is attempted, not after it succeeds — same
+ * "attempts, not outcomes" reasoning as `recordSubscribeAttempt` above (PR
+ * #288): a counter that only increments on success is free to anyone whose
+ * send never succeeds, so a failing send must still spend the target
+ * address's budget or the cap is trivially bypassed by an address that
+ * simply never accepts mail. See `notifySubmitterOfReview` in
+ * lib/submissions.ts for the call site and ordering.
+ */
+export async function recordSubmissionNotifySend(email: string): Promise<void> {
+  await getDb()
+    .insert(submissionNotifySendsTable)
+    .values({ emailHash: hashNotifyEmail(email) });
+}
+
+/**
+ * Per-recipient cap on notify-email SEND ATTEMPTS over a 30-day window — the
+ * cap that actually bounds mail volume (see `checkSubmissionNotifyCap`
+ * above, which does not). Counts `submission_notify_sends` rows, which
+ * persist independently of the `submission_notify_requests` row's deletion
+ * at review time, so the counter survives the exact event that used to reset
+ * it to zero.
+ *
+ * TRADE-OFF, STATED HONESTLY: 5 sends per address per 30 days. A prolific
+ * honest contributor who submits more than five facilities in a month
+ * silently stops receiving the courtesy "reviewed" email once they cross the
+ * cap. This fails safe: the submission itself is still processed completely
+ * normally either way; only the notification email is skipped. `email` is
+ * expected pre-normalized (lowercased/trimmed) by the caller.
+ */
+export async function checkSubmissionNotifySendCap(email: string): Promise<{ ok: boolean }> {
+  const windowStart = new Date(Date.now() - SUBMISSION_NOTIFY_SEND_WINDOW_MS);
+  const emailHash = hashNotifyEmail(email);
+  const rows = await getDb()
+    .select({ c: sql<number>`count(*)::int` })
+    .from(submissionNotifySendsTable)
+    .where(
+      and(
+        gt(submissionNotifySendsTable.createdAt, windowStart),
+        eq(submissionNotifySendsTable.emailHash, emailHash)
+      )
+    );
+  return { ok: Number(rows[0]?.c ?? 0) < SUBMISSION_NOTIFY_SEND_CAP_MAX };
+}
+
+/**
+ * Per-recipient cap on bulk-access-request magic-link emails, independent of
+ * the per-IP rate limit above — mirrors `checkEmailSendCap`'s reasoning
+ * (a prior security-review fix): the IP limit alone doesn't stop a
+ * distributed attacker from email-bombing one victim across IPs. `email` is
+ * expected pre-normalized (lowercased/trimmed) by the caller.
+ */
+export async function checkAccessGrantEmailSendCap(email: string): Promise<{ ok: boolean }> {
+  const windowStart = new Date(Date.now() - RATE_LIMIT_WINDOW_MS);
+  const rows = await getDb()
+    .select({ c: sql<number>`count(*)::int` })
+    .from(apiAccessGrantsTable)
+    .where(and(gt(apiAccessGrantsTable.createdAt, windowStart), eq(apiAccessGrantsTable.email, email)));
   return { ok: Number(rows[0]?.c ?? 0) < EMAIL_SEND_CAP_MAX };
 }

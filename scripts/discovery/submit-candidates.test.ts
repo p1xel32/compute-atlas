@@ -1,7 +1,30 @@
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
-import { runSubmit, normalizeCandidates, parseCandidatesJson, type RunSubmitOptions } from "./submit-candidates";
+import {
+  runSubmit,
+  runSubmitAndLog,
+  normalizeCandidates,
+  parseCandidatesJson,
+  stripCuratedFields,
+  submissionToken,
+  verificationEnabled,
+  exitCodeForSummary,
+  main,
+  VerificationGateUnavailableError,
+  type RunSubmitOptions,
+  type RunSubmitSummary,
+} from "./submit-candidates";
 import type { Facility } from "../../lib/schema";
+import type { VerifyClaim, VerificationResult } from "./verify-source";
+
+// main() reads the live index through the shared loader (Neon); stub it so these
+// tests never touch a database or the real tmp snapshot cache.
+const loadFacilitiesMock = vi.hoisted(() => vi.fn());
+vi.mock("./load-facilities", () => ({ loadFacilities: loadFacilitiesMock }));
 
 const EXISTING_FACILITY: Facility = {
   id: "existing-facility-tx",
@@ -63,6 +86,19 @@ function makeFetch(responses: Array<{ ok: boolean; status?: number; body?: unkno
       json: async () => r.body ?? {},
       text: async () => JSON.stringify(r.body ?? {}),
     } as unknown as Response;
+  });
+}
+
+/**
+ * Builds a stubbed `verifyImpl` for the Task 6 verification-gate seams.
+ * `impl` computes the verdict/reason synchronously per (url, claim) call —
+ * kept as a raw function rather than a fixed map so a single test can branch
+ * on the URL (e.g. "one verified among several").
+ */
+function makeVerifyImpl(impl: (url: string, claim: VerifyClaim) => Partial<VerificationResult> & { verdict: VerificationResult["verdict"] }) {
+  return vi.fn(async (url: string, claim: VerifyClaim): Promise<VerificationResult> => {
+    const result = impl(url, claim);
+    return { reason: `stub reason for ${url}`, sourceUrl: url, ...result };
   });
 }
 
@@ -227,6 +263,484 @@ describe("runSubmit", () => {
     expect(summary.submitted).toBe(1);
     expect(fetchImpl).toHaveBeenCalledTimes(2);
   });
+
+  function connectTimeout() {
+    return Object.assign(new TypeError("fetch failed"), {
+      cause: Object.assign(new Error("Connect Timeout Error"), { code: "UND_ERR_CONNECT_TIMEOUT" }),
+    });
+  }
+
+  it("retries a connect timeout and stages the candidate (no error)", async () => {
+    const ok = { ok: true, status: 201, text: async () => "" } as Response;
+    const fetchImpl = vi.fn().mockRejectedValueOnce(connectTimeout()).mockResolvedValueOnce(ok);
+    const sleepImpl = vi.fn(async () => {});
+    const summary = await runSubmit(
+      [{ facility: makeCandidate({ id: "retry-1" }), provenance: { sources: ["https://x/1"] } }],
+      baseOpts(),
+      { fetchImpl: fetchImpl as unknown as typeof fetch, existingFacilities: [], sleepImpl }
+    );
+    expect(summary.errors).toBe(0);
+    expect(summary.submitted).toBe(1);
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+    expect(sleepImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it("does NOT retry ECONNRESET (server may have processed the POST) and names the candidate", async () => {
+    const reset = Object.assign(new TypeError("fetch failed"), {
+      cause: Object.assign(new Error("read ECONNRESET"), { code: "ECONNRESET" }),
+    });
+    const fetchImpl = vi.fn().mockRejectedValue(reset);
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    const summary = await runSubmit(
+      [{ facility: makeCandidate({ id: "reset-1" }), provenance: { sources: ["https://x/1"] } }],
+      baseOpts(),
+      { fetchImpl: fetchImpl as unknown as typeof fetch, existingFacilities: [], sleepImpl: async () => {} }
+    );
+    const lines = log.mock.calls.map((c) => String(c[0]));
+    log.mockRestore();
+    expect(summary.errors).toBe(1);
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    expect(lines.some((l) => l.includes("reset-1") && l.includes("stage=POST") && l.includes("ECONNRESET"))).toBe(true);
+  });
+
+  it("retries when the connect codes sit on cause.errors[] (AggregateError from multi-address connects)", async () => {
+    const agg = Object.assign(new TypeError("fetch failed"), {
+      cause: Object.assign(new AggregateError([Object.assign(new Error("t"), { code: "UND_ERR_CONNECT_TIMEOUT" })], "x"), {}),
+    });
+    const ok = { ok: true, status: 201, text: async () => "" } as Response;
+    const fetchImpl = vi.fn().mockRejectedValueOnce(agg).mockResolvedValueOnce(ok);
+    const summary = await runSubmit(
+      [{ facility: makeCandidate({ id: "agg-1" }), provenance: { sources: ["https://x/1"] } }],
+      baseOpts(),
+      { fetchImpl: fetchImpl as unknown as typeof fetch, existingFacilities: [], sleepImpl: async () => {} }
+    );
+    expect(summary.errors).toBe(0);
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+  });
+
+  it("does NOT retry a mixed aggregate [ECONNRESET, ECONNREFUSED] (one attempt)", async () => {
+    const mixed = Object.assign(new TypeError("fetch failed"), {
+      cause: new AggregateError(
+        [Object.assign(new Error("r"), { code: "ECONNRESET" }), Object.assign(new Error("c"), { code: "ECONNREFUSED" })],
+        "x"
+      ),
+    });
+    const fetchImpl = vi.fn().mockRejectedValue(mixed);
+    const summary = await runSubmit(
+      [{ facility: makeCandidate({ id: "mixed-1" }), provenance: { sources: ["https://x/1"] } }],
+      baseOpts(),
+      { fetchImpl: fetchImpl as unknown as typeof fetch, existingFacilities: [], sleepImpl: async () => {} }
+    );
+    expect(summary.errors).toBe(1);
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it("after one candidate exhausts the connect budget, skips remaining POSTs (counted as errors, one log line)", async () => {
+    const fetchImpl = vi.fn().mockRejectedValue(connectTimeout());
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    const summary = await runSubmit(
+      [1, 2, 3].map((n) => ({ facility: makeCandidate({ id: `outage-${n}` }), provenance: { sources: [`https://x/${n}`] } })),
+      baseOpts(),
+      { fetchImpl: fetchImpl as unknown as typeof fetch, existingFacilities: [], sleepImpl: async () => {} }
+    );
+    const lines = log.mock.calls.map((c) => String(c[0]));
+    log.mockRestore();
+    expect(fetchImpl).toHaveBeenCalledTimes(3); // only the first candidate's 1 + 2 retries
+    expect(summary.errors).toBe(3);
+    expect(lines.filter((l) => l.includes("retry budget exhausted")).length).toBe(1);
+  });
+
+  it("scrubs URI credentials from a logged server body", async () => {
+    const fetchImpl = makeFetch([{ ok: false, status: 500, body: { error: "see postgres://user:s3cret@host/db" } }]);
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    await runSubmit(
+      [{ facility: makeCandidate({ id: "scrub-1" }), provenance: { sources: ["https://x/1"] } }],
+      baseOpts(),
+      { fetchImpl, existingFacilities: [] }
+    );
+    const text = log.mock.calls.map((c) => String(c[0])).join("\n");
+    log.mockRestore();
+    expect(text).toContain("scrub-1");
+    expect(text).not.toContain("s3cret");
+  });
+
+  it("gives up after the retry budget and counts one error", async () => {
+    const fetchImpl = vi.fn().mockRejectedValue(connectTimeout());
+    const summary = await runSubmit(
+      [{ facility: makeCandidate({ id: "retry-2" }), provenance: { sources: ["https://x/1"] } }],
+      baseOpts(),
+      { fetchImpl: fetchImpl as unknown as typeof fetch, existingFacilities: [], sleepImpl: async () => {} }
+    );
+    expect(summary.errors).toBe(1);
+    expect(fetchImpl).toHaveBeenCalledTimes(3);
+  });
+});
+
+describe("runSubmit — verification gate (facility seam)", () => {
+  it("rejects a candidate when zero sources verify, without consuming --max cap budget for a later candidate", async () => {
+    const fetchImpl = makeFetch([{ ok: true }]);
+    const verifyImpl = makeVerifyImpl((url) => ({
+      verdict: url.includes("fabricated") ? "rejected" : "verified",
+    }));
+    const candidates = [
+      { facility: makeCandidate({ id: "reject-1" }), provenance: { sources: ["https://example.com/fabricated"] } },
+      { facility: makeCandidate({ id: "verified-2" }), provenance: { sources: ["https://example.com/real"] } },
+    ];
+
+    const summary = await runSubmit(candidates, baseOpts({ max: 1 }), {
+      fetchImpl,
+      existingFacilities: [],
+      verifyImpl,
+    });
+
+    expect(summary.skippedUnverified).toBe(1);
+    expect(summary.submitted).toBe(1);
+    expect(summary.submittedIds).toEqual(["verified-2"]);
+    expect(summary.skippedOverCap).toBe(0);
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it("produces a rejectionDetail (and skip-unverified log line) distinguishing an unreadable source from one that was read and rejected, never a generic 'could not be verified' message", async () => {
+    const fetchImpl = makeFetch([]);
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const verifyImpl = makeVerifyImpl((url) =>
+      url.endsWith("/unreadable")
+        ? {
+            verdict: "rejected",
+            reason: "original fetch failed (bad_content_type (http 200)); Wayback snapshot check — not_mentioned",
+            transportFailure: { reason: "bad_content_type", httpStatus: 200 },
+          }
+        : { verdict: "rejected", reason: "quote fragment not found verbatim on the page" }
+    );
+    const candidate = {
+      facility: makeCandidate({ id: "all-rejected-1" }),
+      provenance: { sources: ["https://example.com/unreadable", "https://example.com/read-but-rejected"] },
+    };
+
+    const summary = await runSubmit([candidate], baseOpts(), {
+      fetchImpl,
+      existingFacilities: [],
+      verifyImpl,
+    });
+
+    expect(summary.skippedUnverified).toBe(1);
+    expect(summary.submitted).toBe(0);
+    const skipLine = logSpy.mock.calls.map(([msg]) => msg).find((msg) => typeof msg === "string" && msg.startsWith("skip unverified:"));
+    expect(skipLine).toBeDefined();
+    // The transportFailure-carrying source reads as unreadable...
+    expect(skipLine).toContain("could not be read");
+    expect(skipLine).toContain("bad_content_type");
+    // ...while the genuinely-read-and-rejected source keeps its OWN reason,
+    // not lumped into the same "could not be read" bucket.
+    expect(skipLine).toContain("quote fragment not found verbatim on the page");
+    // The old blanket wording erased this distinction entirely — it must be gone.
+    expect(skipLine).not.toContain("no cited source could be mechanically verified");
+    logSpy.mockRestore();
+  });
+
+  it("submits when at least one of several sources verifies, even if others reject", async () => {
+    const fetchImpl = makeFetch([{ ok: true }]);
+    const verifyImpl = makeVerifyImpl((url) => ({
+      verdict: url.endsWith("/good") ? "verified" : "rejected",
+    }));
+    const candidate = {
+      facility: makeCandidate({ id: "multi-source-1" }),
+      provenance: { sources: ["https://example.com/bad", "https://example.com/good"] },
+    };
+
+    const summary = await runSubmit([candidate], baseOpts(), {
+      fetchImpl,
+      existingFacilities: [],
+      verifyImpl,
+    });
+
+    expect(summary.submitted).toBe(1);
+    expect(summary.skippedUnverified).toBe(0);
+    expect(verifyImpl).toHaveBeenCalledTimes(2);
+  });
+
+  it("submits a candidate whose sources are unverified-but-escalated, surfacing the escalation in the provenance note", async () => {
+    const fetchImpl = makeFetch([{ ok: true }]);
+    const verifyImpl = makeVerifyImpl(() => ({ verdict: "escalate", reason: "too_large" }));
+    const candidate = {
+      facility: makeCandidate({ id: "escalate-1" }),
+      provenance: { sources: ["https://example.com/escalate"] },
+    };
+
+    const summary = await runSubmit([candidate], baseOpts(), {
+      fetchImpl,
+      existingFacilities: [],
+      verifyImpl,
+    });
+
+    expect(summary.submitted).toBe(1);
+    expect(summary.skippedUnverified).toBe(0);
+    const [, init] = fetchImpl.mock.calls[0];
+    const body = JSON.parse(init!.body as string);
+    expect(body.provenance.note).toMatch(/escalat/i);
+    expect(body.provenance.note).toContain("https://example.com/escalate");
+  });
+
+  // verify-source.ts's escalate/unavailable verdicts are expected to fire far
+  // more often once page-truncation (escalate) and Ollama/Wayback timeouts
+  // (unavailable) land there (Ed, approved) — this gate's handling of both
+  // is verdict-driven, never keyed on the specific `reason` string, so it
+  // does not need to change when that lands. These two tests pin that with a
+  // DIFFERENT reason string / a MIXED result set than the tests above, to
+  // demonstrate the behavior generalizes rather than just happening to match
+  // one hardcoded example.
+  it("survives on escalate even when mixed with rejected sources, and the note reports only the escalated ones", async () => {
+    const fetchImpl = makeFetch([{ ok: true }]);
+    const verifyImpl = makeVerifyImpl((url) => ({
+      verdict: url.endsWith("/rejected") ? "rejected" : "escalate",
+      reason: url.endsWith("/rejected") ? "quote not found on page" : "page truncated by context window; model said not_mentioned",
+    }));
+    const candidate = {
+      facility: makeCandidate({ id: "mixed-escalate-1" }),
+      provenance: { sources: ["https://example.com/rejected", "https://example.com/truncated"] },
+    };
+
+    const summary = await runSubmit([candidate], baseOpts(), {
+      fetchImpl,
+      existingFacilities: [],
+      verifyImpl,
+    });
+
+    expect(summary.submitted).toBe(1);
+    expect(summary.skippedUnverified).toBe(0);
+    expect(verifyImpl).toHaveBeenCalledTimes(2);
+    const [, init] = fetchImpl.mock.calls[0];
+    const body = JSON.parse(init!.body as string);
+    expect(body.provenance.note).toContain("https://example.com/truncated");
+    expect(body.provenance.note).not.toContain("https://example.com/rejected");
+  });
+
+  it("skips the verification gate entirely in dry-run mode", async () => {
+    const fetchImpl = makeFetch([]);
+    const verifyImpl = makeVerifyImpl(() => ({ verdict: "rejected", reason: "should never be called" }));
+    const candidate = { facility: makeCandidate(), provenance: { sources: ["https://example.com/new"] } };
+
+    const summary = await runSubmit([candidate], baseOpts({ dryRun: true }), {
+      fetchImpl,
+      existingFacilities: [],
+      verifyImpl,
+    });
+
+    expect(summary.submitted).toBe(1);
+    expect(verifyImpl).not.toHaveBeenCalled();
+  });
+
+  it("proceeds unchanged and logs a warning when verifyImpl is absent (backward compatible)", async () => {
+    const fetchImpl = makeFetch([{ ok: true }]);
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const candidate = { facility: makeCandidate(), provenance: { sources: ["https://example.com/new"] } };
+
+    const summary = await runSubmit([candidate], baseOpts(), {
+      fetchImpl,
+      existingFacilities: [],
+    });
+
+    expect(summary.submitted).toBe(1);
+    const warnedAboutVerification = warnSpy.mock.calls.some(
+      ([msg]) => typeof msg === "string" && /verif/i.test(msg)
+    );
+    expect(warnedAboutVerification).toBe(true);
+    warnSpy.mockRestore();
+  });
+
+  it("aborts the entire run loudly (rejects, never resolves) the moment a source verdict is unavailable", async () => {
+    const fetchImpl = makeFetch([]);
+    const verifyImpl = makeVerifyImpl(() => ({ verdict: "unavailable", reason: "http_error_404" }));
+    const candidates = [
+      { facility: makeCandidate({ id: "unavailable-1" }), provenance: { sources: ["https://example.com/new"] } },
+      { facility: makeCandidate({ id: "unavailable-2" }), provenance: { sources: ["https://example.com/other"] } },
+    ];
+
+    await expect(
+      runSubmit(candidates, baseOpts(), { fetchImpl, existingFacilities: [], verifyImpl })
+    ).rejects.toThrow(/http_error_404/);
+
+    // Must abort on the FIRST unavailable verdict — never mark it
+    // skippedUnverified and move on to the second candidate.
+    expect(verifyImpl).toHaveBeenCalledTimes(1);
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it("aborts loudly on an unavailable verdict regardless of the specific reason string (not special-cased to http_error_404)", async () => {
+    const fetchImpl = makeFetch([]);
+    // A timeout (not yet implemented upstream, but approved/incoming for the
+    // Ollama call and the Wayback lookup) will surface through callOllama as
+    // a NEW reason string this gate has never seen before — the abort path
+    // must fire on the verdict alone, never on matching a known reason.
+    const verifyImpl = makeVerifyImpl(() => ({ verdict: "unavailable", reason: "timeout_after_10000ms" }));
+    const candidate = { facility: makeCandidate({ id: "timeout-1" }), provenance: { sources: ["https://example.com/slow"] } };
+
+    await expect(
+      runSubmit([candidate], baseOpts(), { fetchImpl, existingFacilities: [], verifyImpl })
+    ).rejects.toThrow(/timeout_after_10000ms/);
+
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+});
+
+describe("runSubmit — verification gate: per-call model timeout", () => {
+  const SLOW_URL = "https://example.com/slow";
+
+  function timeoutImpl() {
+    return makeVerifyImpl((url) =>
+      url === SLOW_URL
+        ? { verdict: "unavailable", reason: "model call failed: timeout", modelTimedOut: true }
+        : { verdict: "verified" }
+    );
+  }
+
+  function slowThenGood() {
+    return [
+      { facility: makeCandidate({ id: "slow-1" }), provenance: { sources: [SLOW_URL] } },
+      { facility: makeCandidate({ id: "good-2" }), provenance: { sources: ["https://example.com/good"] } },
+    ];
+  }
+
+  it("skips a timed-out candidate when the probe is healthy, and still stages the next one", async () => {
+    const fetchImpl = makeFetch([{ ok: true, body: { id: "sub-1" } }]);
+    const probeOllama = vi.fn(async () => ({ ok: true as const }));
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    const summary = await runSubmit(slowThenGood(), baseOpts(), {
+      fetchImpl,
+      existingFacilities: [],
+      verifyImpl: timeoutImpl(),
+      probeOllama,
+    });
+
+    const lines = logSpy.mock.calls.map((c) => String(c[0]));
+    logSpy.mockRestore();
+    expect(probeOllama).toHaveBeenCalledTimes(1);
+    expect(summary.skippedUnverified).toBe(1);
+    expect(summary.submittedIds).toEqual(["good-2"]);
+    const skipLine = lines.find((l) => l.startsWith("skip unverified: slow-1"));
+    expect(skipLine).toMatch(/timed out while Ollama was healthy/);
+    expect(skipLine).toContain(SLOW_URL);
+  });
+
+  it("throws VerificationGateUnavailableError when the probe is unhealthy, processing no later candidate", async () => {
+    const fetchImpl = makeFetch([{ ok: true }]);
+    const verifyImpl = timeoutImpl();
+    const probeOllama = vi.fn(async () => ({ ok: false as const, reason: "network_error" }));
+
+    await expect(
+      runSubmit(slowThenGood(), baseOpts(), { fetchImpl, existingFacilities: [], verifyImpl, probeOllama })
+    ).rejects.toThrow(VerificationGateUnavailableError);
+
+    expect(verifyImpl).toHaveBeenCalledTimes(1);
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it("throws when a timeout is flagged but no probe is wired (never skips without a health check)", async () => {
+    const fetchImpl = makeFetch([{ ok: true }]);
+    await expect(
+      runSubmit(slowThenGood(), baseOpts(), { fetchImpl, existingFacilities: [], verifyImpl: timeoutImpl() })
+    ).rejects.toThrow(VerificationGateUnavailableError);
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it("throws immediately for a non-timeout unavailable verdict, without calling the probe", async () => {
+    const fetchImpl = makeFetch([{ ok: true }]);
+    const probeOllama = vi.fn(async () => ({ ok: true as const }));
+    const verifyImpl = makeVerifyImpl(() => ({ verdict: "unavailable", reason: "model call failed: network_error" }));
+
+    await expect(
+      runSubmit(slowThenGood(), baseOpts(), { fetchImpl, existingFacilities: [], verifyImpl, probeOllama })
+    ).rejects.toThrow(/network_error/);
+
+    expect(probeOllama).not.toHaveBeenCalled();
+    expect(verifyImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it("throws on the 4th healthy-probe timeout (default budget 3)", async () => {
+    const fetchImpl = makeFetch([{ ok: true, body: { id: "sub-1" } }]);
+    const probeOllama = vi.fn(async () => ({ ok: true as const }));
+    const verifyImpl = makeVerifyImpl(() => ({
+      verdict: "unavailable",
+      reason: "model call failed: timeout",
+      modelTimedOut: true,
+    }));
+    const four = [1, 2, 3, 4].map((n) => ({
+      facility: makeCandidate({ id: `slow-${n}` }),
+      provenance: { sources: [`https://example.com/slow-${n}`] },
+    }));
+    const partial: RunSubmitSummary[] = [];
+
+    await expect(
+      runSubmit(four, baseOpts(), {
+        fetchImpl,
+        existingFacilities: [],
+        verifyImpl,
+        probeOllama,
+        onSummaryInit: (s) => partial.push(s),
+      })
+    ).rejects.toThrow(/timeout budget/);
+
+    expect(verifyImpl).toHaveBeenCalledTimes(4);
+    expect(partial[0].skippedUnverified).toBe(3);
+  });
+
+  it("honours an explicit timeoutBudget", async () => {
+    const fetchImpl = makeFetch([{ ok: true }]);
+    const probeOllama = vi.fn(async () => ({ ok: true as const }));
+    await expect(
+      runSubmit(slowThenGood(), baseOpts(), {
+        fetchImpl,
+        existingFacilities: [],
+        verifyImpl: timeoutImpl(),
+        probeOllama,
+        timeoutBudget: 0,
+      })
+    ).rejects.toThrow(/timeout budget/);
+  });
+
+  it("stages with a note naming the timed-out URL when a sibling source escalates", async () => {
+    const fetchImpl = makeFetch([{ ok: true, body: { id: "sub-1" } }]);
+    const probeOllama = vi.fn(async () => ({ ok: true as const }));
+    const verifyImpl = makeVerifyImpl((url) =>
+      url === SLOW_URL
+        ? { verdict: "unavailable", reason: "model call failed: timeout", modelTimedOut: true }
+        : { verdict: "escalate", reason: "page too large" }
+    );
+    const summary = await runSubmit(
+      [{ facility: makeCandidate({ id: "esc-1" }), provenance: { sources: [SLOW_URL, "https://example.com/big"] } }],
+      baseOpts(),
+      { fetchImpl, existingFacilities: [], verifyImpl, probeOllama }
+    );
+    expect(summary.submittedIds).toEqual(["esc-1"]);
+    const body = JSON.parse(String((fetchImpl.mock.calls[0][1] as RequestInit).body));
+    const text = JSON.stringify(body);
+    expect(text).toContain("https://example.com/big");
+    expect(text).toMatch(/timed out while Ollama was healthy for: https:\/\/example\.com\/slow/);
+  });
+
+  it("treats a probe that throws as unhealthy and aborts", async () => {
+    const fetchImpl = makeFetch([{ ok: true }]);
+    const probeOllama = vi.fn(async () => {
+      throw new Error("boom");
+    });
+    await expect(
+      runSubmit(slowThenGood(), baseOpts(), { fetchImpl, existingFacilities: [], verifyImpl: timeoutImpl(), probeOllama })
+    ).rejects.toThrow(VerificationGateUnavailableError);
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it("still verifies via another source when one source of the same candidate timed out", async () => {
+    const fetchImpl = makeFetch([{ ok: true, body: { id: "sub-1" } }]);
+    const probeOllama = vi.fn(async () => ({ ok: true as const }));
+    const summary = await runSubmit(
+      [{ facility: makeCandidate({ id: "mixed-1" }), provenance: { sources: [SLOW_URL, "https://example.com/good"] } }],
+      baseOpts(),
+      { fetchImpl, existingFacilities: [], verifyImpl: timeoutImpl(), probeOllama }
+    );
+    expect(summary.submittedIds).toEqual(["mixed-1"]);
+    expect(summary.skippedUnverified).toBe(0);
+  });
 });
 
 describe("runSubmit — status_update intents", () => {
@@ -374,6 +888,232 @@ describe("runSubmit — status_update intents", () => {
     expect(summary.submittedIds).toEqual(["existing-facility-tx"]);
     expect(fetchImpl).not.toHaveBeenCalled();
   });
+
+  it("gates the status_update seam — all-rejected sources skip it as unverified, resolving entityName from the existing facility", async () => {
+    const fetchImpl = makeFetch([]);
+    const verifyImpl = makeVerifyImpl(() => ({ verdict: "rejected" }));
+    const candidate = { statusUpdate: makeStatusUpdate(), provenance: { sources: ["https://example.com/x"] } };
+
+    const summary = await runSubmit([candidate], baseOpts(), {
+      fetchImpl,
+      existingFacilities: [EXISTING_FACILITY],
+      verifyImpl,
+    });
+
+    expect(summary.skippedUnverified).toBe(1);
+    expect(summary.submitted).toBe(0);
+    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(verifyImpl).toHaveBeenCalledWith(
+      "https://example.com/x",
+      expect.objectContaining({ entityName: "Existing Facility" })
+    );
+  });
+
+  it("gates the status_update seam — an EMPTY provenance.sources produces a non-empty skip-unverified reason, never a dangling '— '", async () => {
+    const fetchImpl = makeFetch([]);
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    // provenance.sources is empty — the intent's own `sources` field (inside
+    // makeStatusUpdate()) is unrelated and stays non-empty so this candidate
+    // reaches the verification gate instead of failing schema validation.
+    const verifyImpl = makeVerifyImpl(() => ({ verdict: "rejected" }));
+    const candidate = { statusUpdate: makeStatusUpdate(), provenance: { sources: [] } };
+
+    const summary = await runSubmit([candidate], baseOpts(), {
+      fetchImpl,
+      existingFacilities: [EXISTING_FACILITY],
+      verifyImpl,
+    });
+
+    expect(summary.skippedUnverified).toBe(1);
+    expect(summary.submitted).toBe(0);
+    expect(fetchImpl).not.toHaveBeenCalled();
+    // Nothing to iterate over, so the injected verifyImpl is never reached.
+    expect(verifyImpl).not.toHaveBeenCalled();
+
+    const skipLine = logSpy.mock.calls
+      .map(([msg]) => msg)
+      .find((msg) => typeof msg === "string" && msg.startsWith("skip unverified:"));
+    expect(skipLine).toBeDefined();
+    const afterDash = (skipLine as string).split("—")[1]?.trim() ?? "";
+    expect(afterDash.length).toBeGreaterThan(0);
+    expect(afterDash.toLowerCase()).toContain("no sources");
+    logSpy.mockRestore();
+  });
+});
+
+describe("runSubmit — enrichment_update intents", () => {
+  function makeEnrichmentUpdate(overrides: Record<string, unknown> = {}) {
+    return {
+      targetFacilityId: "existing-facility-tx",
+      date: "2026-07-20",
+      sources: [
+        { url: "https://example.com/enrichment", label: "10-Q filing", retrievedAt: "2026-07-20", kind: "filing" },
+      ],
+      fields: { investmentUsd: 500000000 },
+      ...overrides,
+    };
+  }
+
+  it("submits a valid enrichment_update as kind=enrichment_update with targetFacilityId stripped from payload", async () => {
+    const fetchImpl = makeFetch([{ ok: true, status: 200 }]);
+    const candidate = {
+      enrichmentUpdate: makeEnrichmentUpdate(),
+      provenance: { sources: ["https://example.com/enrichment"], discoveredBy: "test" },
+    };
+
+    const summary = await runSubmit([candidate], baseOpts(), {
+      fetchImpl,
+      existingFacilities: [EXISTING_FACILITY],
+    });
+
+    expect(summary.submitted).toBe(1);
+    expect(summary.submittedIds).toEqual(["existing-facility-tx"]);
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    const [, init] = fetchImpl.mock.calls[0];
+    const body = JSON.parse(init!.body as string);
+    expect(body.kind).toBe("enrichment_update");
+    expect(body.targetFacilityId).toBe("existing-facility-tx");
+    // payload is the parsed EnrichmentUpdateIntent (enrichmentUpdateIntentSchema,
+    // which is .strict() and does not declare targetFacilityId) — it must not
+    // include targetFacilityId, which lives at the envelope level.
+    const { targetFacilityId: omittedTargetId, ...expectedIntent } = makeEnrichmentUpdate();
+    expect(omittedTargetId).toBe("existing-facility-tx");
+    expect(body.payload).toEqual(expectedIntent);
+    expect(body.provenance.sources).toEqual(["https://example.com/enrichment"]);
+    expect(body.provenance.discoveredBy).toBe("test");
+  });
+
+  it("skips an enrichment_update whose targetFacilityId is missing", async () => {
+    const fetchImpl = makeFetch([]);
+    const rest = Object.fromEntries(
+      Object.entries(makeEnrichmentUpdate()).filter(([key]) => key !== "targetFacilityId")
+    );
+    const candidate = {
+      enrichmentUpdate: rest,
+      provenance: { sources: ["https://example.com/x"] },
+    };
+
+    const summary = await runSubmit([candidate], baseOpts(), {
+      fetchImpl,
+      existingFacilities: [EXISTING_FACILITY],
+    });
+
+    expect(summary.skippedInvalid).toBe(1);
+    expect(summary.submitted).toBe(0);
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it("skips an enrichment_update whose targetFacilityId is not an existing facility", async () => {
+    const fetchImpl = makeFetch([]);
+    const candidate = {
+      enrichmentUpdate: makeEnrichmentUpdate({ targetFacilityId: "no-such-facility" }),
+      provenance: { sources: ["https://example.com/x"] },
+    };
+
+    const summary = await runSubmit([candidate], baseOpts(), {
+      fetchImpl,
+      existingFacilities: [EXISTING_FACILITY],
+    });
+
+    expect(summary.skippedInvalid).toBe(1);
+    expect(summary.submitted).toBe(0);
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it("skips an enrichment_update with an unknown field key as malformed (strict schema)", async () => {
+    const fetchImpl = makeFetch([]);
+    const candidate = {
+      enrichmentUpdate: makeEnrichmentUpdate({ fields: { notARealField: true } }),
+      provenance: { sources: ["https://example.com/x"] },
+    };
+
+    const summary = await runSubmit([candidate], baseOpts(), {
+      fetchImpl,
+      existingFacilities: [EXISTING_FACILITY],
+    });
+
+    expect(summary.skippedInvalid).toBe(1);
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it("skips an enrichment_update with an out-of-range sourceRel as malformed", async () => {
+    const fetchImpl = makeFetch([]);
+    const candidate = {
+      enrichmentUpdate: makeEnrichmentUpdate({
+        fields: { community: { status: "supportive", sourceRel: 5 } },
+      }),
+      provenance: { sources: ["https://example.com/x"] },
+    };
+
+    const summary = await runSubmit([candidate], baseOpts(), {
+      fetchImpl,
+      existingFacilities: [EXISTING_FACILITY],
+    });
+
+    expect(summary.skippedInvalid).toBe(1);
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it("dry-run logs the enrichment_update line and does not POST", async () => {
+    const fetchImpl = makeFetch([]);
+    const candidate = {
+      enrichmentUpdate: makeEnrichmentUpdate(),
+      provenance: { sources: ["https://example.com/x"] },
+    };
+
+    const summary = await runSubmit([candidate], baseOpts({ dryRun: true }), {
+      fetchImpl,
+      existingFacilities: [EXISTING_FACILITY],
+    });
+
+    expect(summary.submitted).toBe(1);
+    expect(summary.submittedIds).toEqual(["existing-facility-tx"]);
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it("processes discovery (net-new + status_update) ahead of enrichment_update under a tight shared --max cap", async () => {
+    const fetchImpl = makeFetch([{ ok: true }]);
+    // enrichment_update appears FIRST in the array, the net-new create SECOND —
+    // discovery-first ordering means the create still wins the single cap slot.
+    const candidates = [
+      { enrichmentUpdate: makeEnrichmentUpdate(), provenance: { sources: ["https://x/enrich"] } },
+      { facility: makeCandidate({ id: "discovery-priority-tx" }), provenance: { sources: ["https://x/new"] } },
+    ];
+
+    const summary = await runSubmit(candidates, baseOpts({ max: 1 }), {
+      fetchImpl,
+      existingFacilities: [EXISTING_FACILITY],
+    });
+
+    expect(summary.submitted).toBe(1);
+    expect(summary.submittedIds).toEqual(["discovery-priority-tx"]);
+    expect(summary.skippedOverCap).toBe(1);
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    const [, init] = fetchImpl.mock.calls[0];
+    expect(JSON.parse(init!.body as string).kind).toBe("create");
+  });
+
+  it("gates the enrichment_update seam — one verified source lets it through, resolving entityName from the existing facility", async () => {
+    const fetchImpl = makeFetch([{ ok: true }]);
+    const verifyImpl = makeVerifyImpl(() => ({ verdict: "verified" }));
+    const candidate = {
+      enrichmentUpdate: makeEnrichmentUpdate(),
+      provenance: { sources: ["https://example.com/enrichment"] },
+    };
+
+    const summary = await runSubmit([candidate], baseOpts(), {
+      fetchImpl,
+      existingFacilities: [EXISTING_FACILITY],
+      verifyImpl,
+    });
+
+    expect(summary.submitted).toBe(1);
+    expect(summary.skippedUnverified).toBe(0);
+    expect(verifyImpl).toHaveBeenCalledWith(
+      "https://example.com/enrichment",
+      expect.objectContaining({ entityName: "Existing Facility" })
+    );
+  });
 });
 
 describe("normalizeCandidates — status_update classification", () => {
@@ -388,6 +1128,29 @@ describe("normalizeCandidates — status_update classification", () => {
 
     expect(a.type).toBe("status_update");
     if (a.type === "status_update") {
+      expect(a.targetFacilityId).toBe("existing-facility-tx");
+    }
+    expect(b.type).toBe("facility");
+  });
+});
+
+describe("normalizeCandidates — enrichment_update classification", () => {
+  it("classifies an { enrichmentUpdate, provenance } entry distinctly from facility and status_update entries", () => {
+    const enrichmentUpdateEntry = {
+      enrichmentUpdate: {
+        targetFacilityId: "existing-facility-tx",
+        date: "2026-07-20",
+        sources: [],
+        fields: {},
+      },
+      provenance: { sources: ["https://x"] },
+    };
+    const bareFacility = makeCandidate();
+
+    const [a, b] = normalizeCandidates([enrichmentUpdateEntry, bareFacility]);
+
+    expect(a.type).toBe("enrichment_update");
+    if (a.type === "enrichment_update") {
       expect(a.targetFacilityId).toBe("existing-facility-tx");
     }
     expect(b.type).toBe("facility");
@@ -420,5 +1183,892 @@ describe("parseCandidatesJson", () => {
 
   it("throws on unparseable garbage", () => {
     expect(() => parseCandidatesJson("not json at all")).toThrow();
+  });
+});
+
+describe("runSubmit — restricted-source guard", () => {
+  const RESTRICTED_URL = "https://interconnection.fyi/queue/999";
+  const RESTRICTED_SUBDOMAIN_URL = "https://www.interconnection.fyi/queue/998";
+  const VERIFIED_URL = "https://example.com/verified";
+
+  it("create/update: strips a restricted source from doc.sources AND provenance.sources while the candidate still stages", async () => {
+    const fetchImpl = makeFetch([{ ok: true, status: 201 }]);
+    const candidate = {
+      facility: makeCandidate({
+        id: "restricted-strip-tx",
+        sources: [
+          { url: VERIFIED_URL, label: "Verified source", retrievedAt: "2026-09-20", kind: "press" },
+          { url: RESTRICTED_URL, label: "Queue listing", retrievedAt: "2026-09-20", kind: "iso_queue" },
+        ],
+      }),
+      provenance: { sources: [VERIFIED_URL, RESTRICTED_URL] },
+    };
+
+    const summary = await runSubmit([candidate], baseOpts(), { fetchImpl, existingFacilities: [] });
+
+    expect(summary.submitted).toBe(1);
+    expect(summary.skippedRestrictedSource).toBe(0);
+    const [, init] = fetchImpl.mock.calls[0];
+    const body = JSON.parse(init!.body as string);
+    expect(body.payload.sources).toEqual([
+      { url: VERIFIED_URL, label: "Verified source", retrievedAt: "2026-09-20", kind: "press" },
+    ]);
+    expect(body.provenance.sources).toEqual([VERIFIED_URL]);
+  });
+
+  it("create/update ADVERSARIAL ordering: a restricted source at index 0 with a LATER sourceIndex ref still resolves to the same URL after the strip", async () => {
+    const fetchImpl = makeFetch([{ ok: true, status: 201 }]);
+    const candidate = {
+      facility: makeCandidate({
+        id: "adversarial-order-tx",
+        sources: [
+          { url: RESTRICTED_URL, label: "Queue listing", retrievedAt: "2026-09-20", kind: "iso_queue" },
+          { url: VERIFIED_URL, label: "Groundbreaking", retrievedAt: "2026-09-20", kind: "press" },
+        ],
+        // References index 1 — the source AFTER the restricted one — on
+        // purpose: the real 2026-09-21 offenders all happened to have refs
+        // only BELOW the restricted index, so a fixture mirroring prod would
+        // pass vacuously even with a naive index-shift (rather than
+        // URL-identity) remap. This ref is deliberately on the other side.
+        statusHistory: [{ status: "under_construction", date: "2026-09-20", sourceIndex: 1 }],
+      }),
+      provenance: { sources: [RESTRICTED_URL, VERIFIED_URL] },
+    };
+
+    const summary = await runSubmit([candidate], baseOpts(), { fetchImpl, existingFacilities: [] });
+
+    expect(summary.submitted).toBe(1);
+    const [, init] = fetchImpl.mock.calls[0];
+    const body = JSON.parse(init!.body as string);
+    expect(body.payload.sources).toHaveLength(1);
+    // The URL-IDENTITY invariant, asserted directly: whatever index the ref
+    // now carries, it must resolve to the SAME url it resolved to before
+    // the strip (VERIFIED_URL) — never an arithmetic guess that happens to
+    // land in-range.
+    expect(body.payload.sources[body.payload.statusHistory[0].sourceIndex].url).toBe(VERIFIED_URL);
+    expect(body.payload.statusHistory[0].sourceIndex).toBe(0);
+  });
+
+  it("create/update: skips a candidate whose sources are ALL restricted, without POSTing", async () => {
+    const fetchImpl = makeFetch([]);
+    const candidate = {
+      facility: makeCandidate({
+        id: "all-restricted-tx",
+        sources: [{ url: RESTRICTED_URL, label: "Queue listing", retrievedAt: "2026-09-20", kind: "iso_queue" }],
+      }),
+      // provenance.sources is deliberately a DIFFERENT, non-restricted URL —
+      // isolates this test to doc.sources's own emptiness guard, rather than
+      // also (coincidentally) tripping the separate provenance.sources guard.
+      provenance: { sources: [VERIFIED_URL] },
+    };
+
+    const summary = await runSubmit([candidate], baseOpts(), { fetchImpl, existingFacilities: [] });
+
+    expect(summary.skippedRestrictedSource).toBe(1);
+    expect(summary.submitted).toBe(0);
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it("create/update: a strip that would empty sources is skipped rather than staged with an empty sources array", async () => {
+    const fetchImpl = makeFetch([]);
+    const candidate = {
+      facility: makeCandidate({
+        id: "all-restricted-multi-tx",
+        sources: [
+          { url: RESTRICTED_URL, label: "Queue listing A", retrievedAt: "2026-09-20", kind: "iso_queue" },
+          { url: RESTRICTED_SUBDOMAIN_URL, label: "Queue listing B (subdomain)", retrievedAt: "2026-09-20", kind: "iso_queue" },
+        ],
+      }),
+      // Isolated from the provenance.sources guard, same reasoning as above.
+      provenance: { sources: [VERIFIED_URL] },
+    };
+
+    const summary = await runSubmit([candidate], baseOpts(), { fetchImpl, existingFacilities: [] });
+
+    expect(summary.skippedRestrictedSource).toBe(1);
+    expect(summary.submitted).toBe(0);
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it("logs a 'stripped restricted source(s)' line naming the facility id and URL when a strip succeeds — NOT counted as a skip", async () => {
+    const fetchImpl = makeFetch([{ ok: true }]);
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const candidate = {
+      facility: makeCandidate({
+        id: "logged-strip-tx",
+        sources: [
+          { url: VERIFIED_URL, label: "Verified", retrievedAt: "2026-09-20", kind: "press" },
+          { url: RESTRICTED_URL, label: "Queue listing", retrievedAt: "2026-09-20", kind: "iso_queue" },
+        ],
+      }),
+      provenance: { sources: [VERIFIED_URL, RESTRICTED_URL] },
+    };
+
+    const summary = await runSubmit([candidate], baseOpts(), { fetchImpl, existingFacilities: [] });
+
+    expect(summary.submitted).toBe(1);
+    expect(summary.skippedRestrictedSource).toBe(0);
+    const strippedLine = logSpy.mock.calls
+      .map(([msg]) => msg)
+      .find((msg) => typeof msg === "string" && msg.startsWith("stripped restricted source(s)"));
+    expect(strippedLine).toBeDefined();
+    expect(strippedLine).toContain("logged-strip-tx");
+    expect(strippedLine).toContain(RESTRICTED_URL);
+    logSpy.mockRestore();
+  });
+
+  it("status_update: strips a restricted source from the intent's own sources and still stages it", async () => {
+    const fetchImpl = makeFetch([{ ok: true }]);
+    const candidate = {
+      statusUpdate: {
+        targetFacilityId: "existing-facility-tx",
+        status: "under_construction",
+        date: "2026-09-20",
+        sources: [
+          { url: RESTRICTED_URL, label: "Queue listing", retrievedAt: "2026-09-20", kind: "iso_queue" },
+          { url: VERIFIED_URL, label: "Groundbreaking report", retrievedAt: "2026-09-20", kind: "press" },
+        ],
+      },
+      provenance: { sources: [RESTRICTED_URL, VERIFIED_URL] },
+    };
+
+    const summary = await runSubmit([candidate], baseOpts(), {
+      fetchImpl,
+      existingFacilities: [EXISTING_FACILITY],
+    });
+
+    expect(summary.submitted).toBe(1);
+    const [, init] = fetchImpl.mock.calls[0];
+    const body = JSON.parse(init!.body as string);
+    expect(body.payload.sources).toEqual([
+      { url: VERIFIED_URL, label: "Groundbreaking report", retrievedAt: "2026-09-20", kind: "press" },
+    ]);
+    expect(body.provenance.sources).toEqual([VERIFIED_URL]);
+  });
+
+  it("enrichment_update ADVERSARIAL ordering: strips a restricted source and remaps a LATER sourceRel by URL identity", async () => {
+    const fetchImpl = makeFetch([{ ok: true }]);
+    const candidate = {
+      enrichmentUpdate: {
+        targetFacilityId: "existing-facility-tx",
+        date: "2026-09-20",
+        sources: [
+          { url: RESTRICTED_URL, label: "Queue listing", retrievedAt: "2026-09-20", kind: "iso_queue" },
+          { url: VERIFIED_URL, label: "Subsidy filing", retrievedAt: "2026-09-20", kind: "filing" },
+        ],
+        fields: {
+          subsidies: [{ program: "Tax abatement", sourceRel: 1 }],
+        },
+      },
+      provenance: { sources: [RESTRICTED_URL, VERIFIED_URL] },
+    };
+
+    const summary = await runSubmit([candidate], baseOpts(), {
+      fetchImpl,
+      existingFacilities: [EXISTING_FACILITY],
+    });
+
+    expect(summary.submitted).toBe(1);
+    const [, init] = fetchImpl.mock.calls[0];
+    const body = JSON.parse(init!.body as string);
+    expect(body.payload.sources).toHaveLength(1);
+    expect(body.payload.sources[0].url).toBe(VERIFIED_URL);
+    const remappedRel = body.payload.fields.subsidies[0].sourceRel;
+    expect(remappedRel).toBe(0);
+    expect(body.payload.sources[remappedRel].url).toBe(VERIFIED_URL);
+  });
+
+  it("enrichment_update: a reSourced sourceRel pointing DIRECTLY at the restricted source is skipped as unmappable, even though a different source survives the strip", async () => {
+    // Distinct from the "would empty" tests above: here the strip leaves
+    // `sources` non-empty (VERIFIED_URL survives) — the failure must come
+    // from the remap loop finding no honest new home for the reference,
+    // not from the emptiness guard.
+    const fetchImpl = makeFetch([]);
+    const candidate = {
+      enrichmentUpdate: {
+        targetFacilityId: "existing-facility-tx",
+        date: "2026-09-20",
+        sources: [
+          { url: RESTRICTED_URL, label: "Queue listing", retrievedAt: "2026-09-20", kind: "iso_queue" },
+          { url: VERIFIED_URL, label: "Unrelated filing", retrievedAt: "2026-09-20", kind: "filing" },
+        ],
+        fields: {},
+        reSourced: [{ replacesUrl: "https://example.com/old", sourceRel: 0 }],
+      },
+      // Isolated from the provenance.sources guard, same reasoning as above.
+      provenance: { sources: [VERIFIED_URL] },
+    };
+
+    const summary = await runSubmit([candidate], baseOpts(), {
+      fetchImpl,
+      existingFacilities: [EXISTING_FACILITY],
+    });
+
+    expect(summary.skippedRestrictedSource).toBe(1);
+    expect(summary.submitted).toBe(0);
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it("ADVERSARIAL duplicate URL: a ref pointing at the SECOND of two same-URL sources keeps that source's OWN metadata after the strip, not the first occurrence's", async () => {
+    const fetchImpl = makeFetch([{ ok: true, status: 201 }]);
+    const DUP_URL = "https://example.com/duplicate-url";
+    const candidate = {
+      facility: makeCandidate({
+        id: "duplicate-url-tx",
+        sources: [
+          { url: DUP_URL, label: "Report A", retrievedAt: "2026-09-20", kind: "press" },
+          { url: RESTRICTED_URL, label: "Queue listing", retrievedAt: "2026-09-20", kind: "iso_queue" },
+          { url: DUP_URL, label: "Report B", retrievedAt: "2026-09-20", kind: "subsidy" },
+        ],
+        // References index 2 — the SECOND occurrence of DUP_URL, on the
+        // other side of the restricted entry — on purpose: a URL-search
+        // remap (`kept.findIndex((s) => s.url === url)`) returns the FIRST
+        // match and would silently swap this ref onto "Report A"/press even
+        // though the URL itself is preserved. This shape is real in prod
+        // data: google-skyway-pine-island-mn cites one URL twice with
+        // different kind/label.
+        statusHistory: [{ status: "under_construction", date: "2026-09-20", sourceIndex: 2 }],
+      }),
+      provenance: { sources: [DUP_URL] },
+    };
+
+    const summary = await runSubmit([candidate], baseOpts(), { fetchImpl, existingFacilities: [] });
+
+    expect(summary.submitted).toBe(1);
+    const [, init] = fetchImpl.mock.calls[0];
+    const body = JSON.parse(init!.body as string);
+    expect(body.payload.sources).toHaveLength(2);
+    const remappedIndex = body.payload.statusHistory[0].sourceIndex;
+    // Asserting only the URL would pass under the OLD (findIndex) code too,
+    // since both entries share DUP_URL — the metadata is the only thing
+    // that distinguishes correct behavior from the swapped-citation bug.
+    expect(body.payload.sources[remappedIndex].url).toBe(DUP_URL);
+    expect(body.payload.sources[remappedIndex].label).toBe("Report B");
+    expect(body.payload.sources[remappedIndex].kind).toBe("subsidy");
+  });
+
+  it("verification gate ACTIVE + restricted source coexist: the gate approves via the non-restricted source, and the strip still removes the restricted one from doc.sources", async () => {
+    const fetchImpl = makeFetch([{ ok: true, status: 201 }]);
+    const verifyImpl = makeVerifyImpl((url) => ({
+      verdict: url === VERIFIED_URL ? "verified" : "rejected",
+    }));
+    const candidate = {
+      facility: makeCandidate({
+        id: "gate-and-restricted-tx",
+        sources: [
+          { url: VERIFIED_URL, label: "Verified source", retrievedAt: "2026-09-20", kind: "press" },
+          { url: RESTRICTED_URL, label: "Queue listing", retrievedAt: "2026-09-20", kind: "iso_queue" },
+        ],
+      }),
+      provenance: { sources: [VERIFIED_URL] },
+    };
+
+    const summary = await runSubmit([candidate], baseOpts(), {
+      fetchImpl,
+      existingFacilities: [],
+      verifyImpl,
+    });
+
+    expect(verifyImpl).toHaveBeenCalled();
+    expect(summary.submitted).toBe(1);
+    expect(summary.skippedUnverified).toBe(0);
+    expect(summary.skippedRestrictedSource).toBe(0);
+    const [, init] = fetchImpl.mock.calls[0];
+    const body = JSON.parse(init!.body as string);
+    // The strip ran despite (not because of) the active gate — it must
+    // remove the restricted entry regardless of whether verification is on,
+    // since the strip lives outside the `!opts.dryRun && deps.verifyImpl`
+    // block entirely.
+    expect(body.payload.sources).toEqual([
+      { url: VERIFIED_URL, label: "Verified source", retrievedAt: "2026-09-20", kind: "press" },
+    ]);
+  });
+});
+
+// --- Finding 2: VERIFY_SOURCES_ENABLED's fail-closed parse -------------------
+// This polarity used to live inline in `main()`, where no unit test could reach
+// it. A refactor to `!== "true"` or a truthiness check would have disabled
+// mechanical source verification on every run with the whole suite still green
+// — the gate's absence produces no error, only unverified candidates reaching
+// `pending`. Each typo case below is a value someone could plausibly TYPE
+// meaning "off"; every one of them must still leave the gate ON.
+describe("verificationEnabled", () => {
+  it("disables the gate on the exact string \"false\"", () => {
+    expect(verificationEnabled({ VERIFY_SOURCES_ENABLED: "false" })).toBe(false);
+  });
+
+  it.each([
+    ["FALSE", "wrong case"],
+    ["False", "wrong case"],
+    ["flase", "typo"],
+    ["fals", "truncated"],
+    [" false", "leading space"],
+    ["false ", "trailing space"],
+    ["0", "numeric off"],
+    ["no", "prose off"],
+    ["off", "prose off"],
+    ["", "empty string"],
+    ["true", "explicitly on"],
+  ])("leaves the gate ENABLED for %j (%s)", (value) => {
+    expect(verificationEnabled({ VERIFY_SOURCES_ENABLED: value })).toBe(true);
+  });
+
+  it("leaves the gate ENABLED when the variable is unset", () => {
+    expect(verificationEnabled({})).toBe(true);
+  });
+
+  it("reads process.env by default", () => {
+    const original = process.env.VERIFY_SOURCES_ENABLED;
+    try {
+      process.env.VERIFY_SOURCES_ENABLED = "false";
+      expect(verificationEnabled()).toBe(false);
+      process.env.VERIFY_SOURCES_ENABLED = "nonsense";
+      expect(verificationEnabled()).toBe(true);
+      delete process.env.VERIFY_SOURCES_ENABLED;
+      expect(verificationEnabled()).toBe(true);
+    } finally {
+      if (original === undefined) delete process.env.VERIFY_SOURCES_ENABLED;
+      else process.env.VERIFY_SOURCES_ENABLED = original;
+    }
+  });
+});
+
+// --- Finding 1: least-privilege intake token ---------------------------------
+describe("submissionToken", () => {
+  it("prefers API_INTAKE_TOKEN", () => {
+    expect(submissionToken({ API_INTAKE_TOKEN: "intake", API_ADMIN_TOKEN: "admin" })).toBe("intake");
+  });
+
+  // Default (manual runs): the admin fallback stays; the scheduled run opts out below.
+  it("falls back to API_ADMIN_TOKEN when API_INTAKE_TOKEN is unset", () => {
+    expect(submissionToken({ API_ADMIN_TOKEN: "admin" })).toBe("admin");
+  });
+
+  it("falls back when API_INTAKE_TOKEN is an empty string", () => {
+    expect(submissionToken({ API_INTAKE_TOKEN: "", API_ADMIN_TOKEN: "admin" })).toBe("admin");
+  });
+
+  it("strict mode uses the intake token and ignores the admin token", () => {
+    expect(
+      submissionToken({ DISCOVERY_REQUIRE_INTAKE_TOKEN: "1", API_INTAKE_TOKEN: "intake", API_ADMIN_TOKEN: "admin" })
+    ).toBe("intake");
+  });
+
+  it("strict mode never falls back to API_ADMIN_TOKEN", () => {
+    expect(submissionToken({ DISCOVERY_REQUIRE_INTAKE_TOKEN: "1", API_ADMIN_TOKEN: "admin" })).toBeUndefined();
+    expect(
+      submissionToken({ DISCOVERY_REQUIRE_INTAKE_TOKEN: "1", API_INTAKE_TOKEN: "", API_ADMIN_TOKEN: "admin" })
+    ).toBeUndefined();
+  });
+
+  it("only the exact value 1 enables strict mode", () => {
+    expect(submissionToken({ DISCOVERY_REQUIRE_INTAKE_TOKEN: "true", API_ADMIN_TOKEN: "admin" })).toBe("admin");
+  });
+
+  it("returns undefined — never the string \"undefined\" — when neither is set", () => {
+    expect(submissionToken({})).toBeUndefined();
+  });
+
+  it("sends the intake token on the wire when it is set", async () => {
+    const original = process.env.API_INTAKE_TOKEN;
+    try {
+      process.env.API_INTAKE_TOKEN = "intake-on-the-wire";
+      const fetchImpl = makeFetch([{ ok: true, body: { id: "sub-1" } }]);
+      await runSubmit([{ facility: makeCandidate(), provenance: { sources: ["https://example.com/new"] } }], baseOpts(), {
+        fetchImpl,
+        existingFacilities: [],
+      });
+      const [, init] = fetchImpl.mock.calls[0];
+      expect((init!.headers as Record<string, string>).Authorization).toBe("Bearer intake-on-the-wire");
+    } finally {
+      if (original === undefined) delete process.env.API_INTAKE_TOKEN;
+      else process.env.API_INTAKE_TOKEN = original;
+    }
+  });
+
+  it("sends API_ADMIN_TOKEN on the wire when API_INTAKE_TOKEN is unset", async () => {
+    const original = process.env.API_INTAKE_TOKEN;
+    try {
+      delete process.env.API_INTAKE_TOKEN;
+      const fetchImpl = makeFetch([{ ok: true, body: { id: "sub-1" } }]);
+      await runSubmit([{ facility: makeCandidate(), provenance: { sources: ["https://example.com/new"] } }], baseOpts(), {
+        fetchImpl,
+        existingFacilities: [],
+      });
+      const [, init] = fetchImpl.mock.calls[0];
+      // `beforeEach` sets API_ADMIN_TOKEN = "test-token".
+      expect((init!.headers as Record<string, string>).Authorization).toBe("Bearer test-token");
+    } finally {
+      if (original === undefined) delete process.env.API_INTAKE_TOKEN;
+      else process.env.API_INTAKE_TOKEN = original;
+    }
+  });
+});
+
+// --- Finding 3: a gate abort must still write its run log --------------------
+describe("runSubmitAndLog", () => {
+  const UNAVAILABLE_URL = "https://example.com/unavailable";
+
+  it("writes the log on the success path", async () => {
+    const fetchImpl = makeFetch([{ ok: true, body: { id: "sub-1" } }]);
+    const logged: RunSubmitSummary[] = [];
+
+    const summary = await runSubmitAndLog(
+      [{ facility: makeCandidate(), provenance: { sources: ["https://example.com/new"] } }],
+      baseOpts(),
+      { fetchImpl, existingFacilities: [] },
+      (s) => logged.push(s)
+    );
+
+    expect(logged).toHaveLength(1);
+    expect(logged[0]).toBe(summary);
+    expect(logged[0].submitted).toBe(1);
+  });
+
+  // The defect: `writeLog` sat AFTER `runSubmit` returned, so an abort wrote
+  // no run-<runId>.json at all — and an absent log is indistinguishable from a
+  // state that never ran. The partial counts are the whole point: they say how
+  // many candidates had already reached `pending` before Ollama went away.
+  it("writes a PARTIAL log when the verification gate aborts the run", async () => {
+    const fetchImpl = makeFetch([{ ok: true, body: { id: "sub-1" } }]);
+    const logged: RunSubmitSummary[] = [];
+    const verifyImpl = makeVerifyImpl((url) => ({
+      verdict: url === UNAVAILABLE_URL ? "unavailable" : "verified",
+      reason: url === UNAVAILABLE_URL ? "http_error_404" : "ok",
+    }));
+
+    const candidates = [
+      { facility: makeCandidate({ id: "staged-first-tx" }), provenance: { sources: ["https://example.com/new"] } },
+      { facility: makeCandidate({ id: "aborts-the-run-tx" }), provenance: { sources: [UNAVAILABLE_URL] } },
+    ];
+
+    await expect(
+      runSubmitAndLog(candidates, baseOpts({ runId: "aborted-run" }), { fetchImpl, existingFacilities: [] , verifyImpl }, (s) =>
+        logged.push(s)
+      )
+    ).rejects.toThrow(VerificationGateUnavailableError);
+
+    expect(logged).toHaveLength(1);
+    expect(logged[0].runId).toBe("aborted-run");
+    expect(logged[0].discovered).toBe(2);
+    expect(logged[0].submitted).toBe(1);
+    expect(logged[0].submittedIds).toEqual(["staged-first-tx"]);
+  });
+
+  it("rethrows the original abort error unchanged (exit semantics unaffected)", async () => {
+    const verifyImpl = makeVerifyImpl(() => ({ verdict: "unavailable", reason: "http_error_404" }));
+    const err = await runSubmitAndLog(
+      [{ facility: makeCandidate(), provenance: { sources: [UNAVAILABLE_URL] } }],
+      baseOpts(),
+      { fetchImpl: makeFetch([{ ok: true }]), existingFacilities: [], verifyImpl },
+      () => {}
+    ).catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(VerificationGateUnavailableError);
+    expect((err as Error).message).toContain("http_error_404");
+  });
+
+  // A log-write failure must not REPLACE the aborting error on its way out of
+  // the `finally` — that would turn a diagnosable "Ollama is unreachable" into
+  // an unrelated filesystem error.
+  it("does not let a log-write failure mask the abort error", async () => {
+    const verifyImpl = makeVerifyImpl(() => ({ verdict: "unavailable", reason: "http_error_404" }));
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      await expect(
+        runSubmitAndLog(
+          [{ facility: makeCandidate(), provenance: { sources: [UNAVAILABLE_URL] } }],
+          baseOpts(),
+          { fetchImpl: makeFetch([{ ok: true }]), existingFacilities: [], verifyImpl },
+          () => {
+            throw new Error("EACCES: discovery-logs");
+          }
+        )
+      ).rejects.toThrow(VerificationGateUnavailableError);
+      expect(errSpy.mock.calls.some(([msg]) => typeof msg === "string" && msg.includes("could not write run log"))).toBe(true);
+    } finally {
+      errSpy.mockRestore();
+    }
+  });
+});
+
+// --- Finding 4: stakeholders never pass through the submission lane ---------
+// `stakeholders` names real private individuals. No discovery prompt asks for
+// it, so these tests pin a CLOSED path rather than a broken one: CLAUDE.md
+// says the field is excluded from discovery, and this is what makes the code
+// agree instead of relying on no prompt ever asking.
+describe("stripCuratedFields", () => {
+  const STAKEHOLDER = {
+    name: "A Private Person",
+    role: "landowner",
+    sourceIndex: 0,
+    asOf: "2026-09-01",
+  };
+
+  it("removes the field from a raw doc", () => {
+    const stripped = stripCuratedFields({ id: "x", stakeholders: [STAKEHOLDER] }) as Record<string, unknown>;
+    expect("stakeholders" in stripped).toBe(false);
+    expect(stripped.id).toBe("x");
+  });
+
+  it("leaves a doc without the field untouched (same reference)", () => {
+    const doc = { id: "x" };
+    expect(stripCuratedFields(doc)).toBe(doc);
+  });
+
+  it("does not mutate its input", () => {
+    const doc = { id: "x", stakeholders: [STAKEHOLDER] };
+    stripCuratedFields(doc);
+    expect(doc.stakeholders).toEqual([STAKEHOLDER]);
+  });
+
+  it.each([[null], [undefined], ["a string"], [42], [[1, 2]]])("passes through non-objects: %j", (value) => {
+    expect(stripCuratedFields(value)).toEqual(value);
+  });
+});
+
+describe("the submission lane strips stakeholders", () => {
+  const STAKEHOLDER = {
+    name: "A Private Person",
+    role: "landowner",
+    sourceIndex: 0,
+    asOf: "2026-09-01",
+  };
+
+  it("drops it from a bare candidate doc at normalization", () => {
+    const [normalized] = normalizeCandidates([makeCandidate({ stakeholders: [STAKEHOLDER] })]);
+    expect(normalized.type).toBe("facility");
+    if (normalized.type === "facility") {
+      expect("stakeholders" in (normalized.doc as Record<string, unknown>)).toBe(false);
+    }
+  });
+
+  it("drops it from a wrapped { facility, provenance } candidate", () => {
+    const [normalized] = normalizeCandidates([
+      { facility: makeCandidate({ stakeholders: [STAKEHOLDER] }), provenance: { sources: ["https://x"] } },
+    ]);
+    if (normalized.type === "facility") {
+      expect("stakeholders" in (normalized.doc as Record<string, unknown>)).toBe(false);
+    }
+  });
+
+  // End to end: what reaches POST /api/submissions is what a human reviewer
+  // sees in the admin detail view, so this is the assertion that matters.
+  it("never reaches the POST body, and the candidate still stages", async () => {
+    const fetchImpl = makeFetch([{ ok: true, body: { id: "sub-1" } }]);
+    const summary = await runSubmit(
+      [
+        {
+          facility: makeCandidate({ stakeholders: [STAKEHOLDER] }),
+          provenance: { sources: ["https://example.com/new"] },
+        },
+      ],
+      baseOpts(),
+      { fetchImpl, existingFacilities: [] }
+    );
+
+    expect(summary.submitted).toBe(1);
+    const [, init] = fetchImpl.mock.calls[0];
+    const body = JSON.parse(init!.body as string);
+    expect(body.payload.stakeholders).toBeUndefined();
+    expect("stakeholders" in body.payload).toBe(false);
+    // Stripped, not rejected — the rest of the candidate survives intact.
+    expect(body.payload.id).toBe("new-facility-tx");
+  });
+});
+
+// --- D-4: a run that lost work must not exit 0 -------------------------------
+
+function makeSummary(overrides: Partial<RunSubmitSummary> = {}): RunSubmitSummary {
+  return {
+    runId: "test-run",
+    state: "TX",
+    discovered: 10,
+    submitted: 10,
+    skippedDuplicate: 0,
+    skippedInvalid: 0,
+    skippedOverCap: 0,
+    skippedUnverified: 0,
+    skippedRestrictedSource: 0,
+    errors: 0,
+    submittedIds: [],
+    ...overrides,
+  };
+}
+
+describe("exitCodeForSummary", () => {
+  it("exits 0 on a clean run", () => {
+    expect(exitCodeForSummary(makeSummary())).toBe(0);
+  });
+
+  it.each([
+    [1, "a single lost candidate"],
+    [42, "every candidate lost"],
+  ])("exits nonzero when errors = %i (%s)", (errors) => {
+    expect(exitCodeForSummary(makeSummary({ errors, submitted: 0 }))).not.toBe(0);
+  });
+
+  // The anti-regression. Each skip counter is the corresponding gate WORKING:
+  // a source-verification skip is the gate correctly refusing to stage
+  // something unverified, not a failure. Widening the predicate to any of
+  // these would page a human for healthy operation — tested one at a time so
+  // widening to exactly one still goes red.
+  it.each([
+    ["skippedDuplicate", "already tracked"],
+    ["skippedInvalid", "failed facilitySchema"],
+    ["skippedOverCap", "hit --max"],
+    ["skippedUnverified", "the verification gate refused it"],
+    ["skippedRestrictedSource", "licence-restricted citation"],
+  ])("exits 0 with %s > 0 and no errors (%s)", (counter) => {
+    const summary = makeSummary({ [counter]: 7, submitted: 3 } as Partial<RunSubmitSummary>);
+    expect(summary[counter as keyof RunSubmitSummary]).toBe(7);
+    expect(exitCodeForSummary(summary)).toBe(0);
+  });
+
+  it("exits 0 with every skip counter populated and nothing submitted", () => {
+    expect(
+      exitCodeForSummary(
+        makeSummary({
+          submitted: 0,
+          skippedDuplicate: 4,
+          skippedInvalid: 3,
+          skippedOverCap: 2,
+          skippedUnverified: 9,
+          skippedRestrictedSource: 1,
+        })
+      )
+    ).toBe(0);
+  });
+
+  // The deliberate design decision, pinned: ONE nonzero code, not a graded
+  // scale. The only consumer is run.sh's `if !`, which sees zero/nonzero; the
+  // "how much" lives in the summary JSON, not in the exit status.
+  it("uses the SAME code for partial loss and total loss", () => {
+    const partial = exitCodeForSummary(makeSummary({ submitted: 9, errors: 1 }));
+    const total = exitCodeForSummary(makeSummary({ submitted: 0, errors: 10 }));
+    expect(partial).toBe(total);
+    expect(partial).toBe(1);
+  });
+});
+
+// Wiring, not arithmetic: every test above would pass unchanged against the
+// hardcoded `process.exit(0)` this replaced. These drive the real `main()`.
+describe("main — token preflight", () => {
+  async function preflight(env: Record<string, string>): Promise<{ code: number | undefined; stderr: string }> {
+    for (const [k, v] of Object.entries(env)) vi.stubEnv(k, v);
+    let code: number | undefined;
+    const errors: string[] = [];
+    const errSpy = vi.spyOn(console, "error").mockImplementation((...a: unknown[]) => {
+      errors.push(a.map(String).join(" "));
+    });
+    const exitSpy = vi.spyOn(process, "exit").mockImplementation(((c?: number) => {
+      code = c;
+      throw new Error(`process.exit(${c})`);
+    }) as never);
+    try {
+      await expect(main()).rejects.toThrow(/^process\.exit\(1\)$/);
+      return { code, stderr: errors.join("\n") };
+    } finally {
+      exitSpy.mockRestore();
+      errSpy.mockRestore();
+      vi.unstubAllEnvs();
+    }
+  }
+
+  it("strict mode with only the admin token exits 1 naming the strict flag", async () => {
+    const r = await preflight({ DISCOVERY_REQUIRE_INTAKE_TOKEN: "1", API_INTAKE_TOKEN: "", API_ADMIN_TOKEN: "admin" });
+    expect(r.code).toBe(1);
+    expect(r.stderr).toContain("API_INTAKE_TOKEN is required when DISCOVERY_REQUIRE_INTAKE_TOKEN=1");
+    expect(r.stderr).not.toContain("Neither");
+  });
+
+  it("default mode with neither token keeps the original message", async () => {
+    const r = await preflight({ DISCOVERY_REQUIRE_INTAKE_TOKEN: "", API_INTAKE_TOKEN: "", API_ADMIN_TOKEN: "" });
+    expect(r.code).toBe(1);
+    expect(r.stderr).toContain("Neither API_INTAKE_TOKEN nor API_ADMIN_TOKEN is set");
+  });
+});
+
+describe("main — exit code wiring", () => {
+  async function runMain(submitStatus: number): Promise<{
+    exitCode: number | undefined;
+    logs: string[];
+  }> {
+    const logDir = mkdtempSync(path.join(tmpdir(), "submit-candidates-exit-"));
+    const inputPath = path.join(logDir, "candidates.json");
+    writeFileSync(
+      inputPath,
+      JSON.stringify([
+        { facility: makeCandidate(), provenance: { sources: ["https://example.com/new"] } },
+      ])
+    );
+
+    const originalArgv = process.argv;
+    const originalLogDir = process.env.DISCOVERY_LOG_DIR;
+    const originalVerify = process.env.VERIFY_SOURCES_ENABLED;
+    const originalFetch = globalThis.fetch;
+
+    // Off so `main()` never builds the real Ollama-backed gate — this test is
+    // about the exit path, and the gate has its own coverage above.
+    process.env.VERIFY_SOURCES_ENABLED = "false";
+    process.env.DISCOVERY_LOG_DIR = logDir;
+    process.argv = ["node", "submit-candidates.ts", inputPath, "--run-id=exit-wiring", "--base-url=http://api.test"];
+
+    loadFacilitiesMock.mockResolvedValue({ facilities: [], source: "db", cached: false });
+    globalThis.fetch = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/api/submissions")) {
+        return new Response(submitStatus === 200 ? JSON.stringify({ id: "sub-1" }) : "upstream boom", {
+          status: submitStatus,
+        });
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    }) as unknown as typeof fetch;
+
+    const logs: string[] = [];
+    const logSpy = vi.spyOn(console, "log").mockImplementation((...args: unknown[]) => {
+      logs.push(args.map(String).join(" "));
+    });
+    let exitCode: number | undefined;
+    const exitSpy = vi.spyOn(process, "exit").mockImplementation(((code?: number) => {
+      exitCode = code;
+      throw new Error(`process.exit(${code})`);
+    }) as never);
+
+    try {
+      await expect(main()).rejects.toThrow(/^process\.exit\(/);
+      return { exitCode, logs };
+    } finally {
+      exitSpy.mockRestore();
+      logSpy.mockRestore();
+      globalThis.fetch = originalFetch;
+      process.argv = originalArgv;
+      if (originalLogDir === undefined) delete process.env.DISCOVERY_LOG_DIR;
+      else process.env.DISCOVERY_LOG_DIR = originalLogDir;
+      if (originalVerify === undefined) delete process.env.VERIFY_SOURCES_ENABLED;
+      else process.env.VERIFY_SOURCES_ENABLED = originalVerify;
+      rmSync(logDir, { recursive: true, force: true });
+    }
+  }
+
+  function printedSummary(logs: string[]): RunSubmitSummary {
+    const line = logs.find((l) => l.trimStart().startsWith("{"));
+    if (!line) throw new Error(`no summary JSON printed; logs were: ${JSON.stringify(logs)}`);
+    return JSON.parse(line) as RunSubmitSummary;
+  }
+
+  // The D-4 defect itself: every candidate failed to POST, the summary said
+  // so, and the process exited 0 anyway — so run.sh's `if !` never fired, the
+  // heartbeat never went `degraded`, and no human ever heard about it.
+  it("exits nonzero when every candidate failed to submit", async () => {
+    const { exitCode, logs } = await runMain(500);
+    expect(printedSummary(logs).errors).toBe(1);
+    expect(exitCode).not.toBe(0);
+  });
+
+  // The summary JSON is the diagnosis, so it has to survive the failure it
+  // describes: printed BEFORE the exit, not swallowed by it.
+  it("still prints the summary JSON on the failing path", async () => {
+    const { logs } = await runMain(500);
+    const summary = printedSummary(logs);
+    expect(summary.runId).toBe("exit-wiring");
+    expect(summary.submitted).toBe(0);
+    expect(summary.errors).toBe(1);
+  });
+
+  it("exits 0 and prints the summary on a clean run", async () => {
+    const { exitCode, logs } = await runMain(200);
+    const summary = printedSummary(logs);
+    expect(summary.submitted).toBe(1);
+    expect(summary.errors).toBe(0);
+    expect(exitCode).toBe(0);
+  });
+});
+
+// The defect this task fixes: loadFacilities' file fallback used to be
+// invisible to every caller. For submit-candidates specifically, a stale
+// index corrupts target resolution and this script POSTs to the very API
+// that just failed to answer — so it must abort before staging anything,
+// not just warn like the four read-only lanes.
+describe("main — aborts on a stale facility index", () => {
+  it("exits nonzero and never calls /api/submissions when the Neon read falls back to the file", async () => {
+    const logDir = mkdtempSync(path.join(tmpdir(), "submit-candidates-stale-index-"));
+    const inputPath = path.join(logDir, "candidates.json");
+    writeFileSync(
+      inputPath,
+      JSON.stringify([
+        { facility: makeCandidate(), provenance: { sources: ["https://example.com/new"] } },
+      ])
+    );
+
+    const originalArgv = process.argv;
+    const originalLogDir = process.env.DISCOVERY_LOG_DIR;
+    const originalVerify = process.env.VERIFY_SOURCES_ENABLED;
+    const originalFetch = globalThis.fetch;
+
+    process.env.VERIFY_SOURCES_ENABLED = "false";
+    process.env.DISCOVERY_LOG_DIR = logDir;
+    process.argv = [
+      "node",
+      "submit-candidates.ts",
+      inputPath,
+      "--run-id=stale-index",
+      "--base-url=http://api.test",
+    ];
+
+    const submissionsCalls: string[] = [];
+    loadFacilitiesMock.mockResolvedValue({
+      facilities: [],
+      source: "file",
+      dbError: "3 attempts; last: 57P01",
+    });
+    globalThis.fetch = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/api/submissions")) {
+        submissionsCalls.push(url);
+        return new Response(JSON.stringify({ id: "sub-1" }), { status: 200 });
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    }) as unknown as typeof fetch;
+
+    const errors: string[] = [];
+    const errorSpy = vi.spyOn(console, "error").mockImplementation((...args: unknown[]) => {
+      errors.push(args.map(String).join(" "));
+    });
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    let exitCode: number | undefined;
+    const exitSpy = vi.spyOn(process, "exit").mockImplementation(((code?: number) => {
+      exitCode = code;
+      throw new Error(`process.exit(${code})`);
+    }) as never);
+
+    try {
+      await expect(main()).rejects.toThrow(/^process\.exit\(/);
+      expect(exitCode).toBe(1);
+      expect(submissionsCalls).toHaveLength(0);
+      expect(errors.some((line) => line.includes("57P01") && line.includes("stale"))).toBe(true);
+    } finally {
+      exitSpy.mockRestore();
+      logSpy.mockRestore();
+      errorSpy.mockRestore();
+      globalThis.fetch = originalFetch;
+      process.argv = originalArgv;
+      if (originalLogDir === undefined) delete process.env.DISCOVERY_LOG_DIR;
+      else process.env.DISCOVERY_LOG_DIR = originalLogDir;
+      if (originalVerify === undefined) delete process.env.VERIFY_SOURCES_ENABLED;
+      else process.env.VERIFY_SOURCES_ENABLED = originalVerify;
+      rmSync(logDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("stripCuratedFields also strips notRecorded", () => {
+  it("removes a model-supplied notRecorded from a raw candidate doc", () => {
+    const stripped = stripCuratedFields({
+      id: "x",
+      notRecorded: { "capacityMw.operational": "Model-supplied reason text." },
+    }) as Record<string, unknown>;
+    expect("notRecorded" in stripped).toBe(false);
+    expect(stripped.id).toBe("x");
   });
 });

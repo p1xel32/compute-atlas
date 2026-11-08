@@ -5,6 +5,384 @@ All notable changes to Compute Atlas are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.35.1](https://github.com/ek33450505/compute-atlas/compare/v1.35.0...v1.35.1) (2026-11-02)
+
+
+### Bug Fixes
+
+* **a11y:** label-in-name for axe 4.14 + floor-capped deps (replaces [#509](https://github.com/ek33450505/compute-atlas/issues/509), [#510](https://github.com/ek33450505/compute-atlas/issues/510)) ([#513](https://github.com/ek33450505/compute-atlas/issues/513)) ([e8c3129](https://github.com/ek33450505/compute-atlas/commit/e8c3129df75c30fe59b52963cf82c46309d7805c))
+
+## [1.35.0](https://github.com/ek33450505/compute-atlas/compare/v1.34.1...v1.35.0) (2026-11-02)
+
+
+### Features
+
+* offtaker label guard, bash 3.2-safe BATS asserts, crypto draw rule and capacity bench ([#503](https://github.com/ek33450505/compute-atlas/issues/503)) ([e9f3495](https://github.com/ek33450505/compute-atlas/commit/e9f3495a6bdeaee067e385c7678a3873d9b2ad4a))
+
+
+### Bug Fixes
+
+* methodology precision/statusHistory wording; drop baxtel FP ([#507](https://github.com/ek33450505/compute-atlas/issues/507)) ([e5238f4](https://github.com/ek33450505/compute-atlas/commit/e5238f4de2c16615f1aa9b73891705c4856c3ded))
+
+## [1.34.1](https://github.com/ek33450505/compute-atlas/compare/v1.34.0...v1.34.1) (2026-10-04)
+
+
+### Bug Fixes
+
+* **ci:** require the Vercel ignore-gate's diff base to be an ancestor of HEAD ([#358](https://github.com/ek33450505/compute-atlas/issues/358)) ([c6809cb](https://github.com/ek33450505/compute-atlas/commit/c6809cb3da93c24ac46ed736328db26ffae086fa))
+* **discovery:** exit nonzero when a submit run loses candidates ([#362](https://github.com/ek33450505/compute-atlas/issues/362)) ([b1be354](https://github.com/ek33450505/compute-atlas/commit/b1be354de3a876d4bbf2fdad4bdb6fc886244052))
+* **discovery:** strip licence-restricted sources instead of letting them ride along ([#339](https://github.com/ek33450505/compute-atlas/issues/339)) ([53a251a](https://github.com/ek33450505/compute-atlas/commit/53a251a7e3db34b106759f9f45d3f97e00edc837))
+* **scripts:** pre-flight NHD query layers before build:mapdata ([#344](https://github.com/ek33450505/compute-atlas/issues/344)) ([a81d3fd](https://github.com/ek33450505/compute-atlas/commit/a81d3fd5dd7f4ccfdc8b88cfc7686c57e719e0ca))
+
+## [1.34.0](https://github.com/ek33450505/compute-atlas/compare/v1.33.0...v1.34.0) (2026-09-21)
+
+
+### Features
+
+* **map:** add server-rendered content section to /map ([#334](https://github.com/ek33450505/compute-atlas/issues/334)) ([4f4840d](https://github.com/ek33450505/compute-atlas/commit/4f4840d97e8670a0901c85a9a8bb0e978d7b9703))
+
+
+### Bug Fixes
+
+* **chart:** centre composition chart footer and increase caption spacing ([#327](https://github.com/ek33450505/compute-atlas/issues/327)) ([223e955](https://github.com/ek33450505/compute-atlas/commit/223e9552b9fb36710423ee4a7df302c44e9e2b28))
+* **chart:** hide composition chart caption in sr-only table ([#328](https://github.com/ek33450505/compute-atlas/issues/328)) ([597943e](https://github.com/ek33450505/compute-atlas/commit/597943e66f2ee2e980386fa84c675e4e6e5171aa))
+* **chart:** increase caption margin to improve spacing ([#326](https://github.com/ek33450505/compute-atlas/issues/326)) ([755bb8a](https://github.com/ek33450505/compute-atlas/commit/755bb8a89e2f63bc39de7aca0b41f02e031be2fa))
+* **discovery:** verify a failed HEAD with GET before calling a source dead ([#314](https://github.com/ek33450505/compute-atlas/issues/314)) ([1e9549d](https://github.com/ek33450505/compute-atlas/commit/1e9549db590c249f2f9bef2b212dc00aa04cb5aa))
+* **enrichment:** stop re-cited sources from accumulating as duplicates ([#316](https://github.com/ek33450505/compute-atlas/issues/316)) ([2b80fb7](https://github.com/ek33450505/compute-atlas/commit/2b80fb7d656ffff6fbbe8bbc835bd3f2cc6b87c1))
+* **seo:** split meta description from JSON-LD description ([#333](https://github.com/ek33450505/compute-atlas/issues/333)) ([66bdd3a](https://github.com/ek33450505/compute-atlas/commit/66bdd3a903e26a2daec7fa24d113fb9bbb091332))
+
+## [1.33.0](https://github.com/ek33450505/compute-atlas/compare/v1.32.0...v1.33.0) (2026-09-14)
+
+
+### Features
+
+* **bench:** measure aiClassification — not shippable, and the rule made it worse ([#294](https://github.com/ek33450505/compute-atlas/issues/294)) ([785d1f5](https://github.com/ek33450505/compute-atlas/commit/785d1f5a99ac1c8309b6968cc48377806f379a70))
+* **content:** name the environmental and community cost of the buildout ([#305](https://github.com/ek33450505/compute-atlas/issues/305)) ([e1fcbaf](https://github.com/ek33450505/compute-atlas/commit/e1fcbaf1b975005c94121e9ae304b749d513b9d2))
+* **contribute:** ask at the gap — contextual correction prompts and easier coordinate entry ([#274](https://github.com/ek33450505/compute-atlas/issues/274)) ([11328a3](https://github.com/ek33450505/compute-atlas/commit/11328a3aad1336f2cdd05316f9e1b6870c574322))
+* **counties:** a by-county lens, and the county-string hygiene it exposed ([#287](https://github.com/ek33450505/compute-atlas/issues/287)) ([1261e77](https://github.com/ek33450505/compute-atlas/commit/1261e774d05e71baff39713a334bbb455dd588ec))
+* **data:** publish round three — 8 new records, and close 24 siting gaps ([e5354ab](https://github.com/ek33450505/compute-atlas/commit/e5354ab4ae279118ce8cb7eb8bc016833c1f36ba))
+* **data:** publish round three batch two — 9 new records, and stop counting bond ceilings as subsidies ([473e587](https://github.com/ek33450505/compute-atlas/commit/473e5879e9424a3756cf0a6100a20213d2dcf739))
+* **data:** publish round two — 26 new, 51 updated records ([e565e37](https://github.com/ek33450505/compute-atlas/commit/e565e37f9416caceeaa33b70c3df649d0090dee3))
+* **data:** publish the 16-never-reached-states wave (1659 -&gt; 1709) ([deb6d01](https://github.com/ek33450505/compute-atlas/commit/deb6d01e364ed3ece03bc455b93901b6920c737c))
+* **data:** publish the 65-record non-rotation-state wave (1594 -&gt; 1659) ([3b06fa3](https://github.com/ek33450505/compute-atlas/commit/3b06fa3706dcb5f563f5ccbf7e88177d286838da))
+* **data:** publish the first US territory records (1709 -&gt; 1718) ([bd8463d](https://github.com/ek33450505/compute-atlas/commit/bd8463dcb8930f2a5b0f2b737cb4f40d4c42d121))
+* **discovery:** cover all 50 states + DC, and raise the cap 20% ([#302](https://github.com/ek33450505/compute-atlas/issues/302)) ([73fe4ad](https://github.com/ek33450505/compute-atlas/commit/73fe4ad3b56e34b18ff48cec47d6b4135cce0c4b))
+* **notify:** wire the monthly state digest, disabled ([#289](https://github.com/ek33450505/compute-atlas/issues/289)) ([0dee98e](https://github.com/ek33450505/compute-atlas/commit/0dee98eaa5076740a20aa86768bf14eb230a20a2))
+* print brief, /gaps, and two a11y fixes ([#275](https://github.com/ek33450505/compute-atlas/issues/275)) ([0bf4de4](https://github.com/ek33450505/compute-atlas/commit/0bf4de4e7f3318edad242f5f0baeb434cb766744))
+* **states:** support US territories as first-class jurisdictions ([12fd041](https://github.com/ek33450505/compute-atlas/commit/12fd041827a826a1d1988f1fdeb75da471477c58))
+* **wave:** track the coordinate gate instead of deleting it each wave ([#293](https://github.com/ek33450505/compute-atlas/issues/293)) ([17bf073](https://github.com/ek33450505/compute-atlas/commit/17bf0730eee40a53202d15c7a4e4dafc58057b6e))
+
+
+### Bug Fixes
+
+* **ci:** tell a converging sync from a broken one in drift-alert ([#298](https://github.com/ek33450505/compute-atlas/issues/298)) ([76f7c22](https://github.com/ek33450505/compute-atlas/commit/76f7c22d296fb2387bceef4d50f6a46fe9c9eea3))
+* close the five surfaced-and-open items ([#303](https://github.com/ek33450505/compute-atlas/issues/303)) ([04d6b79](https://github.com/ek33450505/compute-atlas/commit/04d6b79d8a360ff189dd3ce91c1a0fa69acb1f4d))
+* **data:** correct the Colossus 2 pin and the Brightseat moratorium ([d658fa5](https://github.com/ek33450505/compute-atlas/commit/d658fa5c9644349ab4ea2e71a47bf91be70ca912))
+* **discovery:** name the real cause when a run produces no candidates ([#284](https://github.com/ek33450505/compute-atlas/issues/284)) ([2558e65](https://github.com/ek33450505/compute-atlas/commit/2558e65e7ccfc5c992cd7a273c43f57d4bec3b5a))
+* **notify:** batch subscriber emails per recipient, wire into db:sync, widen correctable fields ([#273](https://github.com/ek33450505/compute-atlas/issues/273)) ([4af54ab](https://github.com/ek33450505/compute-atlas/commit/4af54ab79bcbcad3058b6f5c6ef96601672751a1))
+* **print:** get the common record onto a single page ([#285](https://github.com/ek33450505/compute-atlas/issues/285)) ([b0abada](https://github.com/ek33450505/compute-atlas/commit/b0abada9b592fa8ca25d84920fc47ac78cc9bab2))
+* **print:** scope the print-only blocks to the facility brief ([#286](https://github.com/ek33450505/compute-atlas/issues/286)) ([51dca1c](https://github.com/ek33450505/compute-atlas/commit/51dca1cf7b9279220ef3c13e19a62eed8a30e39b))
+* **subscribe:** count rate-limit attempts, not successful subscriptions ([#288](https://github.com/ek33450505/compute-atlas/issues/288)) ([45db76c](https://github.com/ek33450505/compute-atlas/commit/45db76c8bbe3c0a9dc9f68f7f919f3052137b528))
+* **ui:** condense the states stat tile to one word and footnote the rest ([#308](https://github.com/ek33450505/compute-atlas/issues/308)) ([352013e](https://github.com/ek33450505/compute-atlas/commit/352013e96358e9287c6f5384d36b919cc84a64f2))
+* **ui:** stop calling the District of Columbia a state ([#299](https://github.com/ek33450505/compute-atlas/issues/299)) ([34dc4ff](https://github.com/ek33450505/compute-atlas/commit/34dc4ff3d71ca8dc3d201216d69d08285f2ff25e))
+* **ui:** the states tile said 51, which is a state too many ([#304](https://github.com/ek33450505/compute-atlas/issues/304)) ([a729c8c](https://github.com/ek33450505/compute-atlas/commit/a729c8c71f2218c268d6fee6de219811887a470d))
+* **ui:** three DC count tiles the first sweep missed ([#301](https://github.com/ek33450505/compute-atlas/issues/301)) ([2546300](https://github.com/ek33450505/compute-atlas/commit/2546300a0a261079b6ec2ccf054e8d144eddd16c))
+
+## [1.32.0](https://github.com/ek33450505/compute-atlas/compare/v1.31.0...v1.32.0) (2026-09-07)
+
+
+### Features
+
+* **admin-session:** add expiring HMAC-signed admin session cookie ([#245](https://github.com/ek33450505/compute-atlas/issues/245)) ([e9f0702](https://github.com/ek33450505/compute-atlas/commit/e9f07021238c1ee8efbd2e11d1e96783a54d42a8)), closes [#237](https://github.com/ek33450505/compute-atlas/issues/237)
+* **data:** add public dataset download page ([85a3a2e](https://github.com/ek33450505/compute-atlas/commit/85a3a2eac5dbd42dcd9220c65f8d20c6b28fa3f4))
+* **explore:** add Download lens linking to /data page ([256f298](https://github.com/ek33450505/compute-atlas/commit/256f298af3c0843bb9e2a7c48f808d2920952e9d))
+* **export:** add source_count and primary_source_url to CSV export ([1c50465](https://github.com/ek33450505/compute-atlas/commit/1c504652a8b25140c55cf1587b18495c7a6e20cd))
+* **nav:** link /data page from header, footer, homepage, and contact flow ([54fc718](https://github.com/ek33450505/compute-atlas/commit/54fc718cd47a822d896ae56034a69280d5e4e956))
+
+
+### Bug Fixes
+
+* **api:** add Zenodo DOI to persistent identifier citation ([024b3e5](https://github.com/ek33450505/compute-atlas/commit/024b3e558759969e1a779b0a2bc16828b2066e9c))
+* **ci:** hold the sync PR open when build:mapdata fails ([#227](https://github.com/ek33450505/compute-atlas/issues/227)) ([e7cc5b5](https://github.com/ek33450505/compute-atlas/commit/e7cc5b58033bbbc635bbdbf75007854ab2a2a8d2))
+* **neon-sync:** add PAT preflight verification and correct token comments ([#240](https://github.com/ek33450505/compute-atlas/issues/240)) ([415193e](https://github.com/ek33450505/compute-atlas/commit/415193e6c5b542edb14f129989861d595e85cffd))
+
+## [1.31.0](https://github.com/ek33450505/compute-atlas/compare/v1.30.0...v1.31.0) (2026-09-03)
+
+
+### Features
+
+* **discovery:** schedule the field-extraction lane in the nightly run ([#201](https://github.com/ek33450505/compute-atlas/issues/201)) ([c5443c2](https://github.com/ek33450505/compute-atlas/commit/c5443c2622cdbefa4c0b6d0921e5ec9484668b44))
+
+
+### Performance Improvements
+
+* **db:** cut Neon egress from preview branches and SELECT * ([#196](https://github.com/ek33450505/compute-atlas/issues/196)) ([8d89ac3](https://github.com/ek33450505/compute-atlas/commit/8d89ac374fadcff89e01cdb0d8e736c1e186560f))
+
+## [1.30.0](https://github.com/ek33450505/compute-atlas/compare/v1.29.0...v1.30.0) (2026-08-31)
+
+
+### Features
+
+* **data:** publish the 2026-08-26 discovery wave and split Amazon's northwest Louisiana aggregate ([#186](https://github.com/ek33450505/compute-atlas/issues/186)) ([77c677a](https://github.com/ek33450505/compute-atlas/commit/77c677ad0c2ed4fea28be71a4ac493cc5a7dd2e3))
+* **data:** publish the VA and OH discovery wave ([#188](https://github.com/ek33450505/compute-atlas/issues/188)) ([e59ea53](https://github.com/ek33450505/compute-atlas/commit/e59ea535854192541e335e5b4996f0180e0651fc))
+* **funding:** add Ko-fi as a second support path and a dedicated /support page ([#183](https://github.com/ek33450505/compute-atlas/issues/183)) ([1899938](https://github.com/ek33450505/compute-atlas/commit/189993844ed154c2b489d8ff51fd4ada0d74b43b))
+* **learn:** add cited prose explainers for four remaining /learn topics ([#175](https://github.com/ek33450505/compute-atlas/issues/175)) ([fbb1ebd](https://github.com/ek33450505/compute-atlas/commit/fbb1ebdb13c008cc18facd37a52491d73a7573c7))
+* **learn:** answer the topic questions with cited explanations, not just stats ([#172](https://github.com/ek33450505/compute-atlas/issues/172)) ([a8b4705](https://github.com/ek33450505/compute-atlas/commit/a8b4705eb38febd07f6e8f588508cd486d3892ac))
+* **stakeholders:** tag named people with a documented stake in specific facilities ([#185](https://github.com/ek33450505/compute-atlas/issues/185)) ([8cfe44c](https://github.com/ek33450505/compute-atlas/commit/8cfe44ccd30af37063d9389bc4203bba2bf406e9))
+
+
+### Bug Fixes
+
+* **alerts:** scope email alerts to one facility, and add real traffic measurement ([#176](https://github.com/ek33450505/compute-atlas/issues/176)) ([8860ca6](https://github.com/ek33450505/compute-atlas/commit/8860ca63227c34972a5412084eddde7a5e04085e))
+* close the audit backlog and wire Playwright into CI ([#181](https://github.com/ek33450505/compute-atlas/issues/181)) ([dd18b53](https://github.com/ek33450505/compute-atlas/commit/dd18b539dc588740079db8b79347f359f03145c0))
+* **data:** correct eight mis-tagged community.status records ([#173](https://github.com/ek33450505/compute-atlas/issues/173)) ([40a63ed](https://github.com/ek33450505/compute-atlas/commit/40a63ed8f21d161515e22d68c26cf72ea2f9c429))
+* **docs,web:** correct docs drift and false claims across site and repo ([#170](https://github.com/ek33450505/compute-atlas/issues/170)) ([bbef899](https://github.com/ek33450505/compute-atlas/commit/bbef899fa4d3b49853a7a5f567f4fc040ec5534d))
+* **map:** make dragging always pan instead of tilting into 3D ([#182](https://github.com/ek33450505/compute-atlas/issues/182)) ([a2a3081](https://github.com/ek33450505/compute-atlas/commit/a2a3081440ec34fe1e597bb82d9d4a9c1c71fa90))
+* redirect the retired Amazon aggregate slug, and unblock the /table a11y gate ([#187](https://github.com/ek33450505/compute-atlas/issues/187)) ([b51b0e1](https://github.com/ek33450505/compute-atlas/commit/b51b0e100a5fc773b0783376ca519854e4578102))
+* **seo:** de-duplicate facility titles and stop hourly sitemap lastmod churn ([#177](https://github.com/ek33450505/compute-atlas/issues/177)) ([4812508](https://github.com/ek33450505/compute-atlas/commit/48125080fd8e75109bbfca4fc8ee10b719c7cab3))
+* **seo:** stop churning learn-routes lastModified on each build ([#179](https://github.com/ek33450505/compute-atlas/issues/179)) ([65a08b7](https://github.com/ek33450505/compute-atlas/commit/65a08b7197ce81d1d3d904c1982591a1d6e9e535))
+* **web:** remove loading.tsx from dynamic routes to fix soft-404 responses ([#180](https://github.com/ek33450505/compute-atlas/issues/180)) ([07571ba](https://github.com/ek33450505/compute-atlas/commit/07571ba42c639851d3408e08add839bc44111e0f))
+
+## [1.29.0](https://github.com/ek33450505/compute-atlas/compare/v1.28.0...v1.29.0) (2026-08-22)
+
+
+### Features
+
+* **contribute:** lead-first intake — share a link, we take it from there ([#164](https://github.com/ek33450505/compute-atlas/issues/164)) ([e7bf768](https://github.com/ek33450505/compute-atlas/commit/e7bf76877ed10f22b7c8e0592b752c354c831f69))
+
+
+### Performance Improvements
+
+* **web:** cut hosting cost — fix four cache defects (1,495→468 routes busted per publish) ([#167](https://github.com/ek33450505/compute-atlas/issues/167)) ([a646d59](https://github.com/ek33450505/compute-atlas/commit/a646d59ca06ab22f42d70f43bbdee01bf475b7d0))
+* **web:** cut the search index and hero points out of the RSC payload ([#161](https://github.com/ek33450505/compute-atlas/issues/161)) ([1e458fb](https://github.com/ek33450505/compute-atlas/commit/1e458fbe4343db0474fdbdc9e039e169428436fc))
+* **web:** stop shipping the full dataset to every client + rebuild the homepage hero ([#160](https://github.com/ek33450505/compute-atlas/issues/160)) ([b0363c7](https://github.com/ek33450505/compute-atlas/commit/b0363c7607f3592c34d3f9eeed57b5090aadad23))
+
+## [1.28.0](https://github.com/ek33450505/compute-atlas/compare/v1.27.0...v1.28.0) (2026-08-17)
+
+
+### Features
+
+* **discovery:** mechanically verify candidate source URLs before staging ([#150](https://github.com/ek33450505/compute-atlas/issues/150)) ([a5b44e0](https://github.com/ek33450505/compute-atlas/commit/a5b44e0e2669478ee989ffac0eca110fd9faa822))
+* **discovery:** pipeline alerting, cap enforcement, rotation rebalance + 93-facility wave (941→1034) ([#156](https://github.com/ek33450505/compute-atlas/issues/156)) ([bc02aff](https://github.com/ek33450505/compute-atlas/commit/bc02aff3d8e8ce0bd8b9bebdebbee79f15803105))
+* **discovery:** source-verification census over the live dataset ([#152](https://github.com/ek33450505/compute-atlas/issues/152)) ([c572ca8](https://github.com/ek33450505/compute-atlas/commit/c572ca8acdea954e87d983c85e74a6fac19b4761))
+* **discovery:** Track 5 hardening — extraction guards, Unicode dashes, fetch instrumentation + 64-value capacity wave ([#158](https://github.com/ek33450505/compute-atlas/issues/158)) ([76f9ffe](https://github.com/ek33450505/compute-atlas/commit/76f9ffea882ce1bf0adde9d1d69beb352c4daab4))
+
+
+### Bug Fixes
+
+* **ci:** close the siting-context automation gap + resync 941-facility artifacts ([#155](https://github.com/ek33450505/compute-atlas/issues/155)) ([801ab25](https://github.com/ek33450505/compute-atlas/commit/801ab256017f5f486f68919c3470f57dffa6fdb6))
+* **data:** repair 320-char truncated energy and community notes ([c0ef32d](https://github.com/ek33450505/compute-atlas/commit/c0ef32d2d1261681ef68b07267de0df61e6cdec5))
+* **discovery:** match entity names by distinctive tokens, not exact canonical string ([#151](https://github.com/ek33450505/compute-atlas/issues/151)) ([acc500a](https://github.com/ek33450505/compute-atlas/commit/acc500a4e7d2375cc9746a6ba08466d34aac7d3a))
+* **discovery:** resolve launchd timeout and WebFetch permission blocking ([#154](https://github.com/ek33450505/compute-atlas/issues/154)) ([2d37dba](https://github.com/ek33450505/compute-atlas/commit/2d37dbac0a4838883ebdc1b34ec1af6fa98ac48f))
+
+## [1.27.0](https://github.com/ek33450505/compute-atlas/compare/v1.26.1...v1.27.0) (2026-08-10)
+
+
+### Features
+
+* **data:** db:sync maintainer write path + heartland wave (890→934) ([#146](https://github.com/ek33450505/compute-atlas/issues/146)) ([aaee0ec](https://github.com/ek33450505/compute-atlas/commit/aaee0ecf3c46bb8ada68d0d61d31726650ba152a))
+
+
+### Bug Fixes
+
+* **data:** county rendering bug, operator canonicalization, and 10-record enrichment ([#147](https://github.com/ek33450505/compute-atlas/issues/147)) ([d306a55](https://github.com/ek33450505/compute-atlas/commit/d306a557692e1d709ade333d063c86240e9ba95e))
+
+## [1.26.1](https://github.com/ek33450505/compute-atlas/compare/v1.26.0...v1.26.1) (2026-08-08)
+
+
+### Bug Fixes
+
+* **vercel:** make the ignore gate work in Vercel's shallow clone ([#142](https://github.com/ek33450505/compute-atlas/issues/142)) ([8babbd5](https://github.com/ek33450505/compute-atlas/commit/8babbd5022c83eb201d951d0aa7b708eddd819a0))
+
+## [1.26.0](https://github.com/ek33450505/compute-atlas/compare/v1.25.0...v1.26.0) (2026-08-06)
+
+
+### Features
+
+* **data:** Ohio deep-coverage pass + LN Compute Georgia crypto (+21 facilities) ([#136](https://github.com/ek33450505/compute-atlas/issues/136)) ([813d198](https://github.com/ek33450505/compute-atlas/commit/813d198554fa1a68a098b37d23a6715741534d54))
+
+## [1.25.0](https://github.com/ek33450505/compute-atlas/compare/v1.24.0...v1.25.0) (2026-08-05)
+
+
+### Features
+
+* **map:** water & geology overlays, siting-context datums, and map-UX polish ([#133](https://github.com/ek33450505/compute-atlas/issues/133)) ([ca3fecf](https://github.com/ek33450505/compute-atlas/commit/ca3fecff54c3e3c75344043de2f6c323f8d012cd))
+
+
+### Bug Fixes
+
+* **a11y:** label table scroll region + add motion-reduce guards ([#135](https://github.com/ek33450505/compute-atlas/issues/135)) ([f14c405](https://github.com/ek33450505/compute-atlas/commit/f14c405b8e1adbc65074af71afd20921bfa20bcb))
+
+## [1.24.0](https://github.com/ek33450505/compute-atlas/compare/v1.23.1...v1.24.0) (2026-08-05)
+
+
+### Features
+
+* **data:** Georgia crypto-mining backfill — 5 CleanSpark + Cango facilities ([#128](https://github.com/ek33450505/compute-atlas/issues/128)) ([1b8125b](https://github.com/ek33450505/compute-atlas/commit/1b8125b38b485ecbf1e7fbbb08f65a9ce1515476))
+
+## [1.23.1](https://github.com/ek33450505/compute-atlas/compare/v1.23.0...v1.23.1) (2026-08-05)
+
+
+### Bug Fixes
+
+* **data:** add fallback resilience for build-time Neon reads ([#126](https://github.com/ek33450505/compute-atlas/issues/126)) ([33a70ef](https://github.com/ek33450505/compute-atlas/commit/33a70efd02b6521f7b11ff67ce6ce9cc0f22f67f))
+
+## [1.23.0](https://github.com/ek33450505/compute-atlas/compare/v1.22.0...v1.23.0) (2026-08-05)
+
+
+### Features
+
+* **opposition:** add defeated projects dimension with local-opposition cancellations ([#124](https://github.com/ek33450505/compute-atlas/issues/124)) ([0239a14](https://github.com/ek33450505/compute-atlas/commit/0239a14d80dd4a1a9ef0c2c26536229ba7fcdaa4))
+
+## [1.22.0](https://github.com/ek33450505/compute-atlas/compare/v1.21.0...v1.22.0) (2026-08-05)
+
+
+### Features
+
+* **data:** crypto-mining geographic expansion — 35 new facilities ([#122](https://github.com/ek33450505/compute-atlas/issues/122)) ([b54a1a0](https://github.com/ek33450505/compute-atlas/commit/b54a1a0e452ca3da2e17743ce3dc1c71b237e75e))
+
+## [1.21.0](https://github.com/ek33450505/compute-atlas/compare/v1.20.0...v1.21.0) (2026-08-05)
+
+
+### Features
+
+* **data:** crypto-mining wave — 22 second-tier facilities + American Bitcoin attribution ([#120](https://github.com/ek33450505/compute-atlas/issues/120)) ([e86b1b5](https://github.com/ek33450505/compute-atlas/commit/e86b1b506b1ca423dceffbb1020e85e3695af312))
+
+## [1.20.0](https://github.com/ek33450505/compute-atlas/compare/v1.19.0...v1.20.0) (2026-08-05)
+
+
+### Features
+
+* **schema:** add `fusion` power-generation technology ([#118](https://github.com/ek33450505/compute-atlas/issues/118)) ([1d59ad2](https://github.com/ek33450505/compute-atlas/commit/1d59ad25f4f69b8ff51b54d50425753d3b680c4c))
+
+## [1.19.0](https://github.com/ek33450505/compute-atlas/compare/v1.18.0...v1.19.0) (2026-08-05)
+
+
+### Features
+
+* **data:** power-generation wave — 11 compute-power facilities + operator cleanup ([#116](https://github.com/ek33450505/compute-atlas/issues/116)) ([8698d66](https://github.com/ek33450505/compute-atlas/commit/8698d66281869e689d62e2cbc3e0b412bc0c7092))
+
+## [1.18.0](https://github.com/ek33450505/compute-atlas/compare/v1.17.0...v1.18.0) (2026-08-04)
+
+
+### Features
+
+* homepage watch-CTA and Speed Insights monitoring ([#113](https://github.com/ek33450505/compute-atlas/issues/113)) ([df3f183](https://github.com/ek33450505/compute-atlas/commit/df3f1838d5aab998fd8ca1c059c506ab7fc9c09d))
+
+## [1.17.0](https://github.com/ek33450505/compute-atlas/compare/v1.16.0...v1.17.0) (2026-08-03)
+
+
+### Features
+
+* **data:** SEC-filer mining wave batch 2 — 15 crypto/AI-HPC facilities ([#110](https://github.com/ek33450505/compute-atlas/issues/110)) ([7cf6cf3](https://github.com/ek33450505/compute-atlas/commit/7cf6cf37721a038b3a4359a22def8eb09710e4ae))
+
+## [1.16.0](https://github.com/ek33450505/compute-atlas/compare/v1.15.0...v1.16.0) (2026-08-03)
+
+
+### Features
+
+* **data:** SEC-filer mining wave batch 1 — 11 crypto/AI-HPC facilities ([#108](https://github.com/ek33450505/compute-atlas/issues/108)) ([24d1226](https://github.com/ek33450505/compute-atlas/commit/24d1226785019bf0eaf83c071413d0608a9be501))
+
+## [1.15.0](https://github.com/ek33450505/compute-atlas/compare/v1.14.0...v1.15.0) (2026-08-03)
+
+
+### Features
+
+* **data:** Ohio data wave — 4 facilities (Akron, Hamilton, Springfield) ([#106](https://github.com/ek33450505/compute-atlas/issues/106)) ([af3b616](https://github.com/ek33450505/compute-atlas/commit/af3b616cb236dd3542d137f11168ad3de1e1896f))
+
+## [1.14.0](https://github.com/ek33450505/compute-atlas/compare/v1.13.0...v1.14.0) (2026-08-02)
+
+
+### Features
+
+* **data:** Florida data wave — 8 facilities (Miami, Jacksonville, Orlando, Polk) ([#103](https://github.com/ek33450505/compute-atlas/issues/103)) ([7b50d43](https://github.com/ek33450505/compute-atlas/commit/7b50d433c53539b03588f130a00f5476f32cabc2))
+
+
+### Bug Fixes
+
+* **activity:** surface bulk-seeded facilities in /activity feed ([#105](https://github.com/ek33450505/compute-atlas/issues/105)) ([41bdf13](https://github.com/ek33450505/compute-atlas/commit/41bdf13b79c57122c94d66a90b410132ba035b3d))
+
+## [1.13.0](https://github.com/ek33450505/compute-atlas/compare/v1.12.0...v1.13.0) (2026-08-02)
+
+
+### Features
+
+* **data:** deeper California wave — 4 East Bay facilities ([#100](https://github.com/ek33450505/compute-atlas/issues/100)) ([d8893da](https://github.com/ek33450505/compute-atlas/commit/d8893da267e8da5f392b08d00b56b6ccf21f5642))
+
+## [1.12.0](https://github.com/ek33450505/compute-atlas/compare/v1.11.0...v1.12.0) (2026-08-02)
+
+
+### Features
+
+* **data:** California data wave - 4 facilities + data-wave workflow fixes ([#97](https://github.com/ek33450505/compute-atlas/issues/97)) ([eb77326](https://github.com/ek33450505/compute-atlas/commit/eb773268613a5e3236a11e3ebab263d626791aab))
+
+
+### Bug Fixes
+
+* **data:** harden bulk go-live — insert-new-safe db:seed + POST /api/revalidate ([#99](https://github.com/ek33450505/compute-atlas/issues/99)) ([bf928c9](https://github.com/ek33450505/compute-atlas/commit/bf928c9940bb326853706dd485b72eab3791978f))
+
+## [1.11.0](https://github.com/ek33450505/compute-atlas/compare/v1.10.2...v1.11.0) (2026-08-01)
+
+
+### Features
+
+* **map:** siting context, overlays, radius tool, mobile-first + declutter ([#95](https://github.com/ek33450505/compute-atlas/issues/95)) ([a71c9de](https://github.com/ek33450505/compute-atlas/commit/a71c9de1addac38904b11713d226baa0507583fb))
+
+## [1.10.2](https://github.com/ek33450505/compute-atlas/compare/v1.10.1...v1.10.2) (2026-07-31)
+
+
+### Bug Fixes
+
+* clear all open Dependabot + CodeQL security alerts ([#93](https://github.com/ek33450505/compute-atlas/issues/93)) ([79e6837](https://github.com/ek33450505/compute-atlas/commit/79e6837357d626f9b5a0486dd42290eff3319eed))
+
+## [1.10.1](https://github.com/ek33450505/compute-atlas/compare/v1.10.0...v1.10.1) (2026-07-31)
+
+
+### Bug Fixes
+
+* **discovery:** fail-open on wrong-shape source-health reports ([#91](https://github.com/ek33450505/compute-atlas/issues/91)) ([67b0f2b](https://github.com/ek33450505/compute-atlas/commit/67b0f2b4380cabf63bc540289c4653196eff9eb5))
+
+## [1.10.0](https://github.com/ek33450505/compute-atlas/compare/v1.9.0...v1.10.0) (2026-07-30)
+
+
+### Features
+
+* **discovery:** fold light enrichment into each daily run ([#87](https://github.com/ek33450505/compute-atlas/issues/87)) ([3095758](https://github.com/ek33450505/compute-atlas/commit/30957582e2bc815abe77cc9c31558e21d43a3bde))
+
+
+### Bug Fixes
+
+* **discovery:** accurate source-liveness classification (UA + retry) ([#85](https://github.com/ek33450505/compute-atlas/issues/85)) ([419e1ed](https://github.com/ek33450505/compute-atlas/commit/419e1ed340cddc06bdc6c60dbc4e745d1f3d98b0))
+
+## [1.9.0](https://github.com/ek33450505/compute-atlas/compare/v1.8.0...v1.9.0) (2026-07-30)
+
+
+### Features
+
+* **discovery:** harden the daily pipeline — session-limit resilience, heartbeat, self-reverting cap ([#83](https://github.com/ek33450505/compute-atlas/issues/83)) ([7985cd4](https://github.com/ek33450505/compute-atlas/commit/7985cd4567e0cdbcdcdbb2f26181351c87031442))
+
+## [1.8.0](https://github.com/ek33450505/compute-atlas/compare/v1.7.0...v1.8.0) (2026-07-30)
+
+
+### Features
+
+* **brand:** replace the graticule mark with the plate-stack mark ([#81](https://github.com/ek33450505/compute-atlas/issues/81)) ([154036b](https://github.com/ek33450505/compute-atlas/commit/154036b9a23becdc322aa31f862a536462e4dd90))
+* **chrome:** redesign header nav and footer as an atlas sitemap ([#79](https://github.com/ek33450505/compute-atlas/issues/79)) ([5509959](https://github.com/ek33450505/compute-atlas/commit/55099597a55d78417e20ec9a58500d17dbf67cbd))
+
+## [1.7.0](https://github.com/ek33450505/compute-atlas/compare/v1.6.0...v1.7.0) (2026-07-30)
+
+
+### Features
+
+* **home:** modernize the below-hero into a data-showcase gateway ([#77](https://github.com/ek33450505/compute-atlas/issues/77)) ([b542cfd](https://github.com/ek33450505/compute-atlas/commit/b542cfdcad81e0f002d705f9662c2a1adefc9c30))
+
+## [1.6.0](https://github.com/ek33450505/compute-atlas/compare/v1.5.3...v1.6.0) (2026-07-30)
+
+
+### Features
+
+* **home:** lead with a living parchment-globe hero ([#75](https://github.com/ek33450505/compute-atlas/issues/75)) ([a961da9](https://github.com/ek33450505/compute-atlas/commit/a961da94ff0d36338e42191685ced858cbca83fe))
+
 ## [1.5.3](https://github.com/ek33450505/compute-atlas/compare/v1.5.2...v1.5.3) (2026-07-30)
 
 

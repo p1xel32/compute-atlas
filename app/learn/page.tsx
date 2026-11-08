@@ -3,10 +3,11 @@ import type { Metadata } from "next";
 
 import { GLOSSARY_TOPICS } from "@/lib/glossary";
 import { Breadcrumb } from "@/components/breadcrumb";
+import { PageMasthead } from "@/components/page-masthead";
 import { breadcrumbJsonLdString, itemListJsonLdString } from "@/lib/seo";
 import { siteConfig } from "@/lib/site";
 
-export const revalidate = 3600;
+export const revalidate = 86400;
 
 const CRUMBS = [{ label: "Explore", href: "/explore" }, { label: "Learn" }];
 
@@ -54,29 +55,16 @@ export default function LearnIndexPage() {
 
       <Breadcrumb items={CRUMBS} />
 
-      {/* ------------------------------------------------------------------ */}
-      {/* Masthead                                                            */}
-      {/* ------------------------------------------------------------------ */}
-      <header className="space-y-4 pb-2">
-        <p className="font-mono text-xs uppercase tracking-widest text-primary">
-          Learn
-        </p>
-        <h1 className="font-display text-4xl leading-[1.05] text-foreground sm:text-5xl">
-          Data center glossary
-        </h1>
-        <p className="max-w-2xl text-base text-muted-foreground">
-          Plain-language answers to the questions that come up most, each
-          grounded in the facilities Compute Atlas tracks.
-        </p>
+      <PageMasthead
+        eyebrow="Learn"
+        title="Data center glossary"
+        dek="Plain-language answers to the questions that come up most, each grounded in the facilities Compute Atlas tracks."
+      >
         <p className="text-base text-muted-foreground">
           {GLOSSARY_TOPICS.length} topics
         </p>
-        <div className="border-t border-border" />
-      </header>
+      </PageMasthead>
 
-      {/* ------------------------------------------------------------------ */}
-      {/* Topic list                                                          */}
-      {/* ------------------------------------------------------------------ */}
       <section aria-labelledby="topics-list-heading" className="space-y-4">
         <h2 id="topics-list-heading" className="sr-only">
           All glossary topics
@@ -86,7 +74,7 @@ export default function LearnIndexPage() {
             <li key={slug}>
               <Link
                 href={`/learn/${slug}`}
-                className="flex min-h-11 flex-col gap-1 rounded-sm border border-border px-4 py-3 transition-colors hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+                className="flex min-h-11 flex-col gap-1 rounded-sm border border-border px-4 py-3 transition-colors hover:bg-muted/50 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"
               >
                 <span className="text-sm text-foreground">{title}</span>
                 <span className="text-xs text-muted-foreground">{dek}</span>

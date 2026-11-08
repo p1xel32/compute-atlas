@@ -2,15 +2,15 @@ import { Suspense } from "react";
 import type { Metadata } from "next";
 
 import { getAllFacilities } from "@/lib/data";
+import { loadExplorerParams } from "@/lib/explorer-params";
+import { queryTable } from "@/lib/table-query";
 import { Explorer } from "@/components/explorer/explorer";
 import { GraticuleSurvey } from "@/components/home/graticule-survey";
 
-export const revalidate = 3600;
-
 export const metadata: Metadata = {
-  title: "Data table",
+  title: "Searchable table of every tracked facility",
   description:
-    "Filterable, sortable table of all tracked data centers in the United States — shares filter state with the map.",
+    "Filterable, sortable, paginated table of the facilities tracked by Compute Atlas — data centers, crypto-mining operations, and dedicated power generation. Shares filter state with the map.",
   alternates: { canonical: "/table" },
 };
 
@@ -20,8 +20,13 @@ export const metadata: Metadata = {
  * state; the header stays server-rendered, the Explorer subtree hydrates
  * client-side (Suspense boundary required for useSearchParams / nuqs).
  */
-export default async function TablePage() {
-  const facilities = await getAllFacilities();
+export default async function TablePage({
+  searchParams,
+}: {
+  searchParams: Promise<Record<string, string | string[] | undefined>>;
+}) {
+  const params = await loadExplorerParams(searchParams);
+  const result = queryTable(await getAllFacilities(), params);
 
   return (
     <div className="mx-auto max-w-7xl px-4 py-8 sm:px-6 sm:py-12">
@@ -29,25 +34,29 @@ export default async function TablePage() {
         <GraticuleSurvey className="pointer-events-none absolute inset-0 [mask-image:linear-gradient(to_bottom,transparent,black_20%,black_80%,transparent)]" />
         <div className="relative space-y-3">
           <p className="font-mono text-xs uppercase tracking-widest text-primary">
-            United States · Edition 2026 · Gazetteer
+            United States · Gazetteer
           </p>
           <h1 className="font-display text-4xl leading-[1.05] text-foreground sm:text-5xl">
             Data center data table
           </h1>
           <p className="max-w-2xl text-base leading-relaxed text-muted-foreground">
-            Compute Atlas tracks data centers across the United States —
-            traditional and hyperscale compute, AI-specific facilities, and
-            crypto-mining operations — with a public source behind every
-            record. Every tracked facility is listed below, filterable and
-            sortable. Filters are shared with the map — the URL carries them
-            between the two views. Each row links to its detail plate.
+            Facilities are listed 50 to a page, up to 500 per search, filterable and
+            sortable. Filters
+            are shared with the map — the URL carries them between the two
+            views. Each row links to its detail plate.
           </p>
         </div>
         <div className="border-t border-border" />
       </header>
 
       <Suspense>
-        <Explorer facilities={facilities} mode="table" />
+        <Explorer
+          mode="table"
+          {...result}
+          sort={params.sort}
+          dir={params.dir}
+          q={params.q}
+        />
       </Suspense>
     </div>
   );

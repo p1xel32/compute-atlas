@@ -1,0 +1,835 @@
+/**
+ * Publishes `data/facilities.json` to Neon — the maintainer's single write
+ * path for reviewed data.
+ *
+ * ## Why this exists
+ *
+ * Neon is the source of truth; the site reads it live. But data waves edited
+ * the FILE, so data reached prod as *git → build → deploy* and every
+ * correction cost a Vercel build. Worse, the only bulk file→DB tool was
+ * `db:seed`, which inserts new ids happily but needs `--force` to touch an
+ * existing row — and `--force` writes NO `facility_history` (so `/activity`
+ * goes blind) and busts NO cache tags (so scoped pages stay stale until
+ * someone hand-runs a revalidate curl). A plain `db:seed` against a wave with
+ * 44 adds and 51 corrections publishes the 44 and silently drops all 51.
+ *
+ * This script closes that gap: it applies adds AND updates, writes history
+ * for every single change, busts exactly the tags it touched, and notifies
+ * every confirmed subscriber watching an affected facility (batched one
+ * email per recipient, not one per facility — see lib/notify.ts). Data then
+ * reaches prod without a build at all.
+ *
+ * `db:seed` is NOT retired — it remains the bootstrap tool for an empty
+ * database. `db:sync` is the tool for a live one.
+ *
+ * ## The human gate
+ *
+ * The `pending`-submission queue still governs UNREVIEWED intake — the
+ * discovery pipeline and the anonymous `POST /api/contribute`. It is not
+ * relaxed. This CLI is the other path: a maintainer publishing data they have
+ * already reviewed (in the admin portal or in-session) is themselves the human
+ * gate, which is why `--apply` is explicit and `--dry-run` is the default.
+ *
+ * ## Safety properties
+ *
+ * 1. **Dry run by default.** Nothing is written without `--apply`.
+ * 2. **Never deletes.** Ids in Neon but absent from the JSON are reported as
+ *    orphans and left completely alone.
+ * 3. **Fail-closed drift guard.** `data/facilities.meta.json`'s `asOf` is the
+ *    JSON snapshot's basis — the moment it was last generated from Neon by
+ *    `db:export`. Any Neon row whose `updatedAt` is newer than that basis has
+ *    moved ahead of the JSON (someone approved on the admin portal), so
+ *    overwriting it would clobber a prod approval. Those rows are refused
+ *    unless `--force-over-drift`. If the basis can't be established at all,
+ *    EVERY update is refused rather than assumed safe. The guard is also
+ *    re-applied atomically in the UPDATE's own WHERE clause, so a row that
+ *    changes between planning and writing is skipped rather than clobbered.
+ * 4. **Revalidation is pre-flighted.** If tag-busting is configured wrong,
+ *    the script refuses BEFORE writing — the one failure mode worse than not
+ *    publishing is publishing to a DB whose pages never refresh.
+ *
+ * Run via: npm run db:sync                     (dry run — prints the plan)
+ *          npm run db:sync -- --apply          (writes + busts tags)
+ *          npm run db:sync -- --apply --force-over-drift
+ *          npm run db:sync -- --apply --skip-revalidate
+ *
+ * Requires DATABASE_URL, plus API_ADMIN_TOKEN and API_BASE_URL when applying
+ * (unless `--skip-revalidate`). Afterwards run `npm run db:export` so the local JSON
+ * snapshot is regenerated FROM Neon.
+ *
+ * Uses relative imports throughout, matching the other scripts in this folder.
+ */
+import { readFileSync } from "node:fs";
+import path from "node:path";
+
+import { and, eq, lte } from "drizzle-orm";
+
+import { facilitiesSchema, type Facility } from "../lib/schema";
+import { facilitiesTable } from "../lib/db/schema";
+import { getDb } from "../lib/db/client";
+import { docToRow } from "../lib/db/serialize";
+import { computeDocDiff, type DiffEntry } from "../lib/doc-diff";
+import { insertFacilityHistoryRow } from "../lib/facility-history";
+import { isEditorialOnlyChange } from "../lib/editorial-change";
+import { canonicalize, canonicalStringify, changedTopLevelKeys } from "../lib/canonical-json";
+import { tagsForFacility, MAX_TAGS_PER_REQUEST } from "../lib/cache-tags";
+import {
+  assertValidTags,
+  bustErrorSummary,
+  bustTags,
+  errorMessage,
+  resolveRevalidate,
+  type RevalidateConfig,
+} from "./bust-tags";
+import { notifySubscribersOfChanges } from "../lib/notify";
+import { redactedErrorCode } from "../lib/db-error";
+import { isEntrypoint } from "./is-entrypoint";
+import { MIN_FACILITIES } from "./export";
+import { formatFatalError } from "../lib/db-error";
+
+/**
+ * `facility_history.source` for rows this tool writes — a new value alongside
+ * `"admin-direct"` (app writes), `"db-seed"` (bootstrap inserts) and a raw
+ * submission id (promoted submissions). Distinct so the audit trail says
+ * which door a change came through.
+ */
+export const SYNC_HISTORY_SOURCE = "maintainer-sync";
+
+// ---------------------------------------------------------------------------
+// Plan
+// ---------------------------------------------------------------------------
+
+/** The subset of a facilities row the planner needs. */
+export interface NeonSnapshotRow {
+  id: string;
+  doc: Facility;
+  updatedAt: Date;
+}
+
+export interface PlannedChange {
+  id: string;
+  action: "create" | "update";
+  /** Top-level Facility keys that differ. Empty for a create. */
+  changedKeys: string[];
+  doc: Facility;
+  /** The Neon doc being replaced. Absent for a create. */
+  prevDoc?: Facility;
+}
+
+export interface BlockedChange {
+  id: string;
+  changedKeys: string[];
+  neonUpdatedAt: Date;
+  /**
+   * `neon-newer` — the row was written after the JSON's basis.
+   * `unknown-basis` — no basis could be established, so no row can be proven safe.
+   */
+  reason: "neon-newer" | "unknown-basis";
+}
+
+export interface SyncPlan {
+  /** The JSON snapshot's basis timestamp, or null when it couldn't be established. */
+  basis: Date | null;
+  /** False when `--force-over-drift` disabled the guard. */
+  guardEnforced: boolean;
+  creates: PlannedChange[];
+  updates: PlannedChange[];
+  blocked: BlockedChange[];
+  unchangedCount: number;
+  /** Ids in Neon but absent from the JSON. Reported only — never written, never deleted. */
+  orphans: string[];
+  /** De-duplicated cache tags covering every planned change. */
+  tags: string[];
+}
+
+/**
+ * Pure diff of the JSON snapshot against a Neon snapshot. No I/O, so the
+ * decision logic is testable without a database.
+ *
+ * `jsonFacilities` must already be parsed through `facilitySchema` so schema
+ * defaults are materialized — otherwise a record that Neon stored WITH
+ * defaults would look "changed" against a JSON record without them. This is
+ * the same normalization `scripts/export.ts` round-trips, deliberately:
+ * the two tools must agree on what "changed" means or rows this tool
+ * considers identical would look changed, forever.
+ */
+export function planSync(
+  jsonFacilities: Facility[],
+  neonRows: NeonSnapshotRow[],
+  options: { basis: Date | null; forceOverDrift?: boolean }
+): SyncPlan {
+  const guardEnforced = !options.forceOverDrift;
+  const neonById = new Map(neonRows.map((row) => [row.id, row]));
+
+  const creates: PlannedChange[] = [];
+  const updates: PlannedChange[] = [];
+  const blocked: BlockedChange[] = [];
+  let unchangedCount = 0;
+
+  const seen = new Set<string>();
+  for (const doc of jsonFacilities) {
+    if (seen.has(doc.id)) {
+      // A splice-appended duplicate would otherwise let the last copy win
+      // silently. The JSON is the artifact under review; refuse to publish it.
+      throw new Error(`Duplicate facility id in the JSON snapshot: ${doc.id}`);
+    }
+    seen.add(doc.id);
+
+    const row = neonById.get(doc.id);
+    if (!row) {
+      creates.push({ id: doc.id, action: "create", changedKeys: [], doc });
+      continue;
+    }
+
+    if (canonicalStringify(row.doc) === canonicalStringify(doc)) {
+      unchangedCount++;
+      continue;
+    }
+
+    const changedKeys = changedTopLevelKeys(
+      row.doc as unknown as Record<string, unknown>,
+      doc as unknown as Record<string, unknown>
+    );
+
+    // Fail closed: with no basis, no row can be PROVEN not to have moved
+    // ahead of the snapshot, so none is safe to overwrite.
+    const reason: BlockedChange["reason"] | null =
+      options.basis === null
+        ? "unknown-basis"
+        : row.updatedAt.getTime() > options.basis.getTime()
+          ? "neon-newer"
+          : null;
+
+    if (reason && guardEnforced) {
+      blocked.push({ id: doc.id, changedKeys, neonUpdatedAt: row.updatedAt, reason });
+      continue;
+    }
+
+    updates.push({ id: doc.id, action: "update", changedKeys, doc, prevDoc: row.doc });
+  }
+
+  const orphans = neonRows
+    .filter((row) => !seen.has(row.id))
+    .map((row) => row.id)
+    .sort();
+
+  return {
+    basis: options.basis,
+    guardEnforced,
+    creates,
+    updates,
+    blocked,
+    unchangedCount,
+    orphans,
+    tags: tagsForChanges([...creates, ...updates]),
+  };
+}
+
+/**
+ * The de-duplicated tag set for a batch of changes, plus the global
+ * `"facilities"` tag when the batch is non-empty.
+ *
+ * `tagsForFacility` deliberately omits `"facilities"`: a single write must
+ * not nuke the ~1,547-route aggregate surface, which is refreshed by
+ * the "facilities" tag bust at the end of a review batch, or its 24h ISR timer. A bulk sync inverts that argument — one extra tag, once, is
+ * far cheaper than the individual writes it stands in for, and without it
+ * the homepage would keep quoting yesterday's facility count for up to an
+ * hour after a publish. That justification still holds and this line should
+ * stay as-is — but it was only ever safe to add unconditionally once
+ * `loadNavFacets` (see the comment on it in `lib/data.ts`) stopped
+ * carrying the `"facilities"` tag. While it still did, this one `tags.add`
+ * fanned out through the root layout's search read and hard-expired ~1,495
+ * of ~1,500 routes on every `--apply` — not just the aggregate pages this
+ * comment names. Measured 2026-08-21; see the ground-truth table on that
+ * fix for the corrected per-route numbers.
+ */
+export function tagsForChanges(changes: PlannedChange[]): string[] {
+  const tags = new Set<string>();
+  for (const change of changes) {
+    for (const tag of tagsForFacility(change.doc, change.prevDoc)) tags.add(tag);
+  }
+  if (tags.size > 0) tags.add("facilities");
+  return [...tags];
+}
+
+// ---------------------------------------------------------------------------
+// Apply
+// ---------------------------------------------------------------------------
+
+export interface ApplyResult {
+  created: PlannedChange[];
+  updated: PlannedChange[];
+  /** Rows whose atomic drift predicate no longer matched at write time. */
+  blockedAtApply: string[];
+  failed: { id: string; error: string }[];
+  /** Ids whose facility write succeeded but whose audit row did not. */
+  historyFailures: string[];
+}
+
+/**
+ * Executes a plan against Neon. Sequential by design: a burst of concurrent
+ * writes over Neon's serverless HTTP driver is the same failure mode that
+ * broke production builds on 2026-08-05, and ~100 records is a few tens of
+ * seconds. Per-record failures are collected and reported rather than
+ * aborting — a partial apply is re-runnable, since the next plan simply won't
+ * include what already landed.
+ *
+ * Calls `getDb()` internally, matching `lib/facility-write.ts` and
+ * `scripts/seed.ts`, so tests mock `../lib/db/client` rather than injecting.
+ */
+export async function applySync(
+  plan: SyncPlan,
+  options: { source?: string; skipNotify?: boolean } = {}
+): Promise<ApplyResult> {
+  const db = getDb();
+  const source = options.source ?? SYNC_HISTORY_SOURCE;
+
+  const result: ApplyResult = {
+    created: [],
+    updated: [],
+    blockedAtApply: [],
+    failed: [],
+    historyFailures: [],
+  };
+
+  for (const change of plan.creates) {
+    try {
+      // onConflictDoNothing + returning distinguishes a real insert from a row
+      // that appeared between planning and writing; a phantom conflict is
+      // reported, never silently counted as published.
+      const inserted = await db
+        .insert(facilitiesTable)
+        .values(docToRow(change.doc))
+        .onConflictDoNothing()
+        .returning({ id: facilitiesTable.id });
+
+      if (inserted.length === 0) {
+        result.failed.push({
+          id: change.id,
+          error: "already present in Neon at write time (appeared after the plan was computed)",
+        });
+        continue;
+      }
+
+      result.created.push(change);
+      if (!(await recordHistory(change.id, "create", canonicalDocDiff(null, change.doc), source))) {
+        result.historyFailures.push(change.id);
+      }
+    } catch (err) {
+      result.failed.push({ id: change.id, error: errorMessage(err) });
+    }
+  }
+
+  for (const change of plan.updates) {
+    try {
+      // The drift guard again, this time evaluated by Postgres as part of the
+      // write, so a row approved on the admin portal in the seconds between
+      // planning and applying is skipped rather than clobbered.
+      const guard =
+        plan.guardEnforced && plan.basis
+          ? and(eq(facilitiesTable.id, change.id), lte(facilitiesTable.updatedAt, plan.basis))
+          : eq(facilitiesTable.id, change.id);
+
+      const updated = await db
+        .update(facilitiesTable)
+        .set({ ...docToRow(change.doc), updatedAt: new Date() })
+        .where(guard)
+        .returning({ id: facilitiesTable.id });
+
+      if (updated.length === 0) {
+        result.blockedAtApply.push(change.id);
+        continue;
+      }
+
+      result.updated.push(change);
+      const diff = canonicalDocDiff(change.prevDoc ?? null, change.doc);
+      // A notes-only update (internal narration rewritten, no fact changed) is
+      // recorded as `editorial`: kept in facility_history but excluded by every
+      // public reader (/activity, feed, credits, quarterly summary, state
+      // digest), which filter on create|update. Applied ONLY on this maintainer
+      // bulk path, not lib/facility-write.ts: a community submission that fixes
+      // notes is a contribution and must keep counting. Notification is NOT
+      // inferred from this: watchers are still mailed unless `--skip-notify`.
+      const changeType =
+        change.prevDoc && isEditorialOnlyChange(change.prevDoc, change.doc)
+          ? "editorial"
+          : "update";
+      if (!(await recordHistory(change.id, changeType, diff, source))) {
+        result.historyFailures.push(change.id);
+      }
+    } catch (err) {
+      result.failed.push({ id: change.id, error: errorMessage(err) });
+    }
+  }
+
+  // Best-effort — mirrors lib/submissions.ts:150's approve-path call. A
+  // notification failure must never turn a successful publish into an error;
+  // notifySubscribersOfChanges never throws internally, but the try/catch
+  // here is belt-and-suspenders around building its input. One batched call
+  // covering every created + updated facility in this run (not one call per
+  // facility) is what lets a recipient watching several of them get ONE
+  // email instead of one per facility — see lib/notify.ts's
+  // notifySubscribersOfChanges doc comment.
+  //
+  // `--skip-notify` exists for METADATA-ONLY publishes. The source-URL dedupe
+  // (scripts/dedupe-source-urls.ts) touches 226 records without changing a
+  // single asserted fact — no status, capacity, operator or coordinate moves,
+  // only a redundant citation disappearing. Mailing a watcher "record updated"
+  // for that is how a change feed teaches people to ignore it, and the blast
+  // radius was real: 1 confirmed facility subscriber plus 2 confirmed state
+  // subscribers, measured before the publish.
+  //
+  // Deliberately opt-in and deliberately NOT inferred from the diff: "did this
+  // change matter to a human" is a judgement the person publishing makes, and
+  // a heuristic that guesses wrong fails silently in the direction of not
+  // telling someone about a fact they asked to be told about.
+  if (options.skipNotify) {
+    console.log(
+      `↷ skipping subscriber notification for ${result.created.length + result.updated.length} change(s) (--skip-notify)`
+    );
+  } else {
+    try {
+      const changes = [
+        ...result.created.map((change) => ({
+          facility: change.doc,
+          changeLabel: "added to the atlas",
+        })),
+        ...result.updated.map((change) => ({
+          facility: change.doc,
+          changeLabel: "record updated",
+        })),
+      ];
+      await notifySubscribersOfChanges(changes);
+    } catch (err) {
+      // SQLSTATE only, never `err`: the notify path's queries bind subscriber
+      // email addresses, which a DrizzleQueryError embeds in its `.message`
+      // (see lib/db-error.ts). A failed notification stays non-fatal.
+      console.error(`subscriber notification failed (sqlstate: ${redactedErrorCode(err)})`);
+    }
+  }
+
+  return result;
+}
+
+/**
+ * Thin wrapper over the shared `insertFacilityHistoryRow` leaf
+ * (`../lib/facility-history.ts`) — the same insert `lib/facility-write.ts`'s
+ * `recordFacilityHistory` now delegates to, rather than each keeping its own
+ * copy. What's still genuinely different is caller-side: this CLI collects
+ * every failing id into `result.historyFailures` and exits non-zero, because
+ * a silently missing history row is precisely the `db:seed --force` bug this
+ * script exists to fix, whereas the app's HTTP write path only carries the
+ * same boolean on `WriteResult.historyRecorded` for the response body to
+ * report.
+ */
+async function recordHistory(
+  facilityId: string,
+  changeType: "create" | "update" | "editorial",
+  diff: DiffEntry[],
+  source: string
+): Promise<boolean> {
+  return insertFacilityHistoryRow(facilityId, changeType, diff, source);
+}
+
+/**
+ * `computeDocDiff` compares with a raw `JSON.stringify`, which is correct for
+ * the app's own writes — there both sides originate from the same jsonb
+ * ordering, so only real edits differ. It is wrong for this tool: `prevDoc`
+ * comes back from Postgres in jsonb key order while `doc` carries the order it
+ * was authored in, so untouched objects like `location` register as changed
+ * and the audit row lists keys nobody edited (and stores two values that look
+ * identical, since jsonb re-normalizes them on the way in).
+ *
+ * Canonicalizing both sides first makes the recorded diff list exactly the
+ * keys the dry-run plan listed — what the maintainer reviewed is what the
+ * audit trail says.
+ */
+function canonicalDocDiff(before: Facility | null, after: Facility): DiffEntry[] {
+  return computeDocDiff(
+    before ? (canonicalize(before) as Record<string, unknown>) : null,
+    canonicalize(after) as Record<string, unknown>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Basis
+// ---------------------------------------------------------------------------
+
+export interface BasisResult {
+  /** The guard basis: `asOf` minus the clock-skew margin. Null when it couldn't be established. */
+  basis: Date | null;
+  /** Human-readable provenance, printed in the report either way. */
+  description: string;
+}
+
+/**
+ * Safety margin subtracted from `asOf` before it is used as the drift-guard
+ * basis.
+ *
+ * The two timestamps being compared come from different clocks:
+ * `facilities.updatedAt` is stamped by Postgres (`defaultNow()`), while
+ * `asOf` is stamped by whichever machine ran `db:export` — Ed's Mac or a
+ * GitHub Actions runner. A few seconds of skew in the wrong direction would
+ * let a genuine prod approval slip under the guard and be silently
+ * overwritten. Backing the basis off makes the guard err toward blocking,
+ * which is the failure it should prefer: a false block prints an explanation
+ * and costs a `db:export`, a false pass discards someone's approval.
+ */
+export const BASIS_CLOCK_SKEW_MARGIN_MS = 5_000;
+
+/**
+ * Reads the JSON snapshot's basis from `data/facilities.meta.json` — the
+ * `asOf` that `db:export` stamps when it generates the JSON FROM Neon. That
+ * is precisely "the last moment JSON and Neon were known to agree", which is
+ * what the drift guard needs to compare each row's `updatedAt` against.
+ *
+ * Returns `basis: null` (not a throw) on any problem, so the caller can fail
+ * closed with an explanation rather than a stack trace.
+ */
+export function readBasis(metaPath: string): BasisResult {
+  let raw: string;
+  try {
+    raw = readFileSync(metaPath, "utf-8");
+  } catch (err) {
+    return { basis: null, description: `unreadable (${errorMessage(err)})` };
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    return { basis: null, description: `not valid JSON (${errorMessage(err)})` };
+  }
+
+  const asOf = (parsed as { asOf?: unknown } | null)?.asOf;
+  if (typeof asOf !== "string") {
+    return { basis: null, description: "no string `asOf` field" };
+  }
+
+  const date = new Date(asOf);
+  if (Number.isNaN(date.getTime())) {
+    return { basis: null, description: `\`asOf\` is not a valid date: ${asOf}` };
+  }
+
+  const basis = new Date(date.getTime() - BASIS_CLOCK_SKEW_MARGIN_MS);
+  return {
+    basis,
+    description: `asOf ${date.toISOString()} → guard basis ${basis.toISOString()} (${BASIS_CLOCK_SKEW_MARGIN_MS / 1000}s clock-skew margin)`,
+  };
+}
+
+/**
+ * Refuses a snapshot that is not the real exported dataset. After the data files
+ * were untracked, a pull deletes them and a local prebuild fills the ~68-record
+ * test fixture; publishing (or even planning) against that would diff the whole
+ * of Neon as removals/updates. Same floor `db:export` enforces. `metaCount` is
+ * `facilities.meta.json`'s `recordCount` (undefined when absent or not a number).
+ * Returns the refusal message, or null when the snapshot is acceptable.
+ */
+export function snapshotSizeRefusal(
+  count: number,
+  metaCount: unknown,
+  floor: number = MIN_FACILITIES,
+): string | null {
+  if (count < floor) {
+    return `db:sync refuses a snapshot of ${count} records (floor ${floor}): this looks like the test fixture; run \`npm run db:export\` first`;
+  }
+  if (typeof metaCount !== "number") {
+    return "db:sync refuses a snapshot with no numeric recordCount in data/facilities.meta.json (missing or malformed); run `npm run db:export` first";
+  }
+  if (metaCount !== count) {
+    return `db:sync refuses a snapshot whose facilities.meta.json recordCount (${String(metaCount)}) does not match data/facilities.json (${count} records); run \`npm run db:export\` first`;
+  }
+  return null;
+}
+
+export type SnapshotLoad =
+  | { ok: true; facilities: unknown[]; metaCount: unknown }
+  | { ok: false; message: string };
+
+/**
+ * Reads the JSON snapshot and its meta for the size guard, reducing every
+ * failure to a fixed message (no stack, no parser text). `read` is injected so
+ * tests need no files. A missing meta is not a load failure: it yields
+ * `metaCount: undefined` and `snapshotSizeRefusal` names the meta file.
+ */
+export function loadSnapshotForSync(
+  read: (p: string) => string,
+  jsonPath: string,
+  metaPath: string,
+): SnapshotLoad {
+  let raw: string;
+  try {
+    raw = read(jsonPath);
+  } catch {
+    return { ok: false, message: "db:sync: data/facilities.json not found: run `npm run db:export` first" };
+  }
+  let facilities: unknown;
+  try {
+    facilities = JSON.parse(raw);
+  } catch {
+    return { ok: false, message: "data/facilities.json: not valid JSON: run `npm run db:export`" };
+  }
+  if (!Array.isArray(facilities)) {
+    return { ok: false, message: "data/facilities.json is not an array" };
+  }
+  let metaRaw: string | null = null;
+  try {
+    metaRaw = read(metaPath);
+  } catch {
+    metaRaw = null;
+  }
+  let metaCount: unknown;
+  if (metaRaw !== null) {
+    try {
+      metaCount = (JSON.parse(metaRaw) as { recordCount?: unknown } | null)?.recordCount;
+    } catch {
+      return { ok: false, message: "data/facilities.meta.json: not valid JSON: run `npm run db:export`" };
+    }
+  }
+  return { ok: true, facilities, metaCount };
+}
+
+// ---------------------------------------------------------------------------
+// CLI
+// ---------------------------------------------------------------------------
+
+/**
+ * `forceOverDrift` is broader than its name suggests, deliberately noted here
+ * because it is the destructive one: it disables the guard for BOTH blocked
+ * reasons — `"neon-newer"` (we detected a row that moved ahead) and
+ * `"unknown-basis"` (we could not establish a basis at all, so nothing can be
+ * proven safe). Reaching for it because you have reviewed a specific drift
+ * also opts you into overwriting blind if `facilities.meta.json` is missing or
+ * malformed. `printPlan` states the guard is DISABLED before any write, and
+ * dry run is still the default, so this cannot fire unnoticed.
+ */
+export interface CliOptions {
+  apply: boolean;
+  forceOverDrift: boolean;
+  skipRevalidate: boolean;
+  /** Suppress subscriber email. For metadata-only publishes — see applySync. */
+  skipNotify: boolean;
+}
+
+const KNOWN_FLAGS = new Set([
+  "--apply",
+  "--dry-run",
+  "--force-over-drift",
+  "--skip-revalidate",
+  "--skip-notify",
+]);
+
+export function parseCliArgs(argv: string[]): CliOptions {
+  const unknown = argv.filter((arg) => !KNOWN_FLAGS.has(arg));
+  if (unknown.length > 0) {
+    throw new Error(
+      `Unknown argument(s): ${unknown.join(", ")}. Known flags: ${[...KNOWN_FLAGS].join(", ")}`
+    );
+  }
+  // `--dry-run` is accepted but redundant; it makes the default explicit at a
+  // call site, and `--apply` always wins if someone passes both.
+  return {
+    apply: argv.includes("--apply"),
+    forceOverDrift: argv.includes("--force-over-drift"),
+    skipRevalidate: argv.includes("--skip-revalidate"),
+    skipNotify: argv.includes("--skip-notify"),
+  };
+}
+
+function describeChange(change: PlannedChange): string {
+  const doc = change.doc;
+  if (change.action === "create") {
+    return `  + ${doc.id}  [${doc.facilityType}/${doc.location.state}/${doc.status}]`;
+  }
+  return `  ~ ${doc.id}  →  ${change.changedKeys.join(", ")}`;
+}
+
+export function printPlan(plan: SyncPlan, jsonCount: number, neonCount: number, basisDesc: string): void {
+  console.log(`JSON: ${jsonCount} facilities · Neon: ${neonCount} facilities`);
+  console.log(`Basis (data/facilities.meta.json): ${basisDesc}`);
+  console.log(
+    `Drift guard: ${plan.guardEnforced ? "ENFORCED" : "DISABLED (--force-over-drift)"}\n`
+  );
+
+  console.log(`CREATE ${plan.creates.length}`);
+  for (const change of plan.creates) console.log(describeChange(change));
+
+  const editorialCount = plan.updates.filter(
+    (c) => c.prevDoc && isEditorialOnlyChange(c.prevDoc, c.doc)
+  ).length;
+  console.log(`\nUPDATE ${plan.updates.length} (${editorialCount} editorial)`);
+  for (const change of plan.updates) console.log(describeChange(change));
+
+  console.log(`\nUNCHANGED ${plan.unchangedCount}`);
+
+  if (plan.blocked.length > 0) {
+    console.log(`\n⚠ BLOCKED by the drift guard: ${plan.blocked.length}`);
+    console.log("  These Neon rows moved ahead of the JSON snapshot. Overwriting them would");
+    console.log("  discard a prod approval. Run `npm run db:export` to pull them into the JSON,");
+    console.log("  reconcile by hand, then re-run — or pass --force-over-drift to overwrite.");
+    for (const b of plan.blocked) {
+      console.log(
+        `  ! ${b.id}  (neon updatedAt ${b.neonUpdatedAt.toISOString()}, ${b.reason})  →  ${b.changedKeys.join(", ")}`
+      );
+    }
+  }
+
+  if (plan.orphans.length > 0) {
+    console.log(`\nORPHANS in Neon, absent from the JSON: ${plan.orphans.length} (never touched)`);
+    console.log("  Run `npm run db:export` to pull them into the JSON snapshot.");
+    for (const id of plan.orphans) console.log(`  ? ${id}`);
+  }
+
+  const batches = Math.ceil(plan.tags.length / MAX_TAGS_PER_REQUEST);
+  console.log(`\nCache tags to bust: ${plan.tags.length} (${batches} request(s))`);
+}
+
+async function main(): Promise<void> {
+  const options = parseCliArgs(process.argv.slice(2));
+
+  // Pre-flight BEFORE any write. Publishing rows whose pages can never be
+  // busted is worse than not publishing: scoped pages (facility detail, state
+  // landing) are tag-only with no ISR timer of their own. That no longer
+  // means indefinitely stale, though — the facility, state and embed-state
+  // pages declare `revalidate = 86400` themselves (nothing else supplies a
+  // floor; see `lib/data.ts`), so an un-busted scoped page self-heals within
+  // ~24h worst case rather than staying stale forever. Still worth refusing: ~24h of a published change not showing up
+  // is exactly the kind of silent gap this guard exists to prevent.
+  let revalidateConfig: RevalidateConfig | null;
+  try {
+    revalidateConfig = resolveRevalidate({
+      apply: options.apply,
+      skipRevalidate: options.skipRevalidate,
+      env: process.env,
+    });
+  } catch (err) {
+    // lint-no-raw-error-logs: allow -- RefusalError from resolveRevalidate names only env presence and the URL scheme/host, never a token or a DB error
+    console.error(err instanceof Error ? err.message : String(err));
+    process.exit(1);
+  }
+
+  // Config/argument errors above; then the snapshot size guard, before DATABASE_URL and any DB read.
+  const jsonPath = path.join(process.cwd(), "data", "facilities.json");
+  const metaPath = path.join(path.dirname(jsonPath), "facilities.meta.json");
+
+  // Size guard: before DATABASE_URL, any DB read, and in dry run too.
+  const snapshot = loadSnapshotForSync((p) => readFileSync(p, "utf-8"), jsonPath, metaPath);
+  if (!snapshot.ok) {
+    console.error(snapshot.message);
+    process.exit(1);
+  }
+  const rawFacilities = snapshot.facilities;
+  const sizeRefusal = snapshotSizeRefusal(rawFacilities.length, snapshot.metaCount);
+  if (sizeRefusal !== null) {
+    console.error(sizeRefusal);
+    process.exit(1);
+  }
+
+  if (!process.env.DATABASE_URL) {
+    console.error(
+      "DATABASE_URL is not set. Configure it in .env.local (see .env.example) before syncing."
+    );
+    process.exit(1);
+  }
+
+  const facilities = facilitiesSchema.parse(rawFacilities);
+  const { basis, description: basisDesc } = readBasis(metaPath);
+
+  const db = getDb();
+  const neonRows = await db
+    .select({
+      id: facilitiesTable.id,
+      doc: facilitiesTable.doc,
+      updatedAt: facilitiesTable.updatedAt,
+    })
+    .from(facilitiesTable);
+
+  const plan = planSync(facilities, neonRows, {
+    basis,
+    forceOverDrift: options.forceOverDrift,
+  });
+
+  // A tag the revalidate route would reject aborts its whole batch — catch
+  // that here, before anything is written, rather than after.
+  try {
+    assertValidTags(plan.tags);
+  } catch (err) {
+    // lint-no-raw-error-logs: allow -- RefusalError from assertValidTags lists tag strings only
+    console.error(err instanceof Error ? err.message : String(err));
+    process.exit(1);
+  }
+
+  printPlan(plan, facilities.length, neonRows.length, basisDesc);
+
+  if (!options.apply) {
+    console.log("\nDRY RUN — nothing written. Re-run with --apply to publish.");
+    process.exit(0);
+  }
+
+  if (plan.creates.length === 0 && plan.updates.length === 0) {
+    console.log("\nNothing to apply.");
+    process.exit(plan.blocked.length > 0 ? 1 : 0);
+  }
+
+  console.log(
+    `\nAPPLYING to Neon${revalidateConfig ? ` and busting tags at ${revalidateConfig.baseUrl}` : " (--skip-revalidate: NOT busting tags)"}…`
+  );
+  const result = await applySync(plan, { skipNotify: options.skipNotify });
+  console.log(`Created ${result.created.length}, updated ${result.updated.length}.`);
+
+  let failed = plan.blocked.length > 0;
+
+  if (result.blockedAtApply.length > 0) {
+    failed = true;
+    console.error(
+      `\n⚠ ${result.blockedAtApply.length} row(s) changed in Neon between planning and writing, ` +
+        `and were skipped by the atomic drift guard:\n  ${result.blockedAtApply.join("\n  ")}`
+    );
+  }
+  if (result.failed.length > 0) {
+    failed = true;
+    console.error(`\n⚠ ${result.failed.length} record(s) failed:`);
+    for (const f of result.failed) console.error(`  ! ${f.id}: ${f.error}`);
+  }
+  if (result.historyFailures.length > 0) {
+    failed = true;
+    console.error(
+      `\n⚠ ${result.historyFailures.length} facility write(s) landed without an audit row ` +
+        `(they will be missing from /activity):\n  ${result.historyFailures.join("\n  ")}`
+    );
+  }
+
+  const appliedTags = tagsForChanges([...result.created, ...result.updated]);
+  if (revalidateConfig && appliedTags.length > 0) {
+    const bust = await bustTags(appliedTags, revalidateConfig);
+    console.log(`\nBusted ${bust.bustedTags.length} tag(s) in ${bust.batches} request(s).`);
+    if (bust.failedTags.length > 0) {
+      failed = true;
+      console.error(`⚠ ${bust.failedTags.length} tag(s) failed to bust: ${bustErrorSummary(bust.errors)}`);
+      console.error(
+        "Retry them with:\n  curl -X POST \"$API_BASE_URL/api/revalidate\" " +
+          '-H "Authorization: Bearer $API_ADMIN_TOKEN" -H "Content-Type: application/json" \\\n' +
+          `    -d '${JSON.stringify({ tags: bust.failedTags.slice(0, MAX_TAGS_PER_REQUEST) })}'`
+      );
+    }
+  } else if (!revalidateConfig) {
+    console.log(
+      `\nSkipped busting ${appliedTags.length} tag(s). Scoped pages (facility detail, state ` +
+        "landing) have no ISR timer and will stay stale until something busts them."
+    );
+  }
+
+  console.log("\nNext: `npm run db:export` to regenerate the JSON from Neon, then commit it.");
+  process.exit(failed ? 1 : 0);
+}
+
+// Only run the CLI when this file is executed directly, not when its exports
+// are imported by the test suite — matches scripts/seed.ts's isMain guard.
+const isMain = isEntrypoint(import.meta.url);
+if (isMain) {
+  main().catch((err) => {
+    console.error(formatFatalError(err));
+    process.exit(1);
+  });
+}

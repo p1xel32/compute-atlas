@@ -164,7 +164,7 @@ describe("DropdownMenu", () => {
 
   // jsdom can't evaluate the prefers-reduced-motion media query, so this asserts
   // the class contract: the enter/exit animation must be paired with the
-  // motion-reduce: variant that disables it (s59 reduced-motion gating). The `!`
+  // motion-reduce: variant that disables it (reduced-motion gating). The `!`
   // important modifier is required because `data-open:animate-in`/
   // `data-closed:animate-out` out-specify a plain utility (attribute selector);
   // verified in-browser that only the important form wins the cascade and gates
@@ -178,5 +178,21 @@ describe("DropdownMenu", () => {
       '[data-slot="dropdown-menu-content"]'
     );
     expect(content).toHaveClass("motion-reduce:animate-none!");
+  });
+
+  // The popup is a programmatic focus target (tabindex -1) that keeps outline-none
+  // and had no focus cue at all. `outline-solid` is load-bearing: outline-none sets
+  // --tw-outline-style: none, which outline-2 would otherwise read. See button.tsx.
+  it("draws a real focus-visible outline on the popup alongside outline-none", async () => {
+    render(<BasicMenu defaultOpen />);
+    await screen.findByRole("menu");
+    expect(
+      document.querySelector('[data-slot="dropdown-menu-content"]')
+    ).toHaveClass(
+      "outline-none",
+      "focus-visible:outline-2",
+      "focus-visible:outline-solid",
+      "focus-visible:outline-ring"
+    );
   });
 });

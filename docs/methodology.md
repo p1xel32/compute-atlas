@@ -82,6 +82,20 @@ enter the dataset without one.
 - **Corroboration for consequential claims.** Extraordinary figures — a
   multi-gigawatt campus, a multi-billion-dollar investment, a contested status —
   are checked against a second source before they are recorded.
+- **Colocation marketplaces are leads, not citations.** Listing directories and
+  colo marketplaces aggregate specifications without publishing where they came
+  from, and they go stale silently — a facility sold to another operator years
+  ago can still carry its former owner's name. They are useful for finding
+  candidates and worthless for establishing facts. A figure that appears only in
+  such a directory is omitted rather than recorded.
+- **A citation names who published it.** The `publisher` on a source is the
+  organization that actually put the page up. An aggregator's page about an
+  operator is credited to the aggregator, never to the operator — otherwise a
+  record looks corroborated by a company that never said the thing.
+- **Capacity is omitted when it cannot be sourced.** Roughly half of the records
+  carry no `capacityMw`, because most operators simply do not publish per-site
+  megawatts. That gap is deliberate. An absent figure is a fact about the public
+  record; an invented one would be a fact about nothing.
 - **A source is not an endorsement.** Citing a source means the claim traces to
   the public record, not that the underlying fact has been independently audited.
   Readers can, and should, follow the source.
@@ -97,10 +111,13 @@ refute a candidate, and it survives only if it holds up. It routinely catches
 errors — a miscopied capacity figure, a status that a later vote overtook, a
 name that turns out to be a duplicate — before they reach the dataset.
 
-Locations follow a geocoding discipline. When a primary source gives a parcel or
-street address, the coordinate is exact. When it names only a town, the record
-carries the town centroid and is marked `approximate` in the `precision` field —
-never presented as a parcel-level point it is not.
+Locations follow a geocoding discipline. A coordinate is marked `exact` in the
+`precision` field only when the record ties it to the facility itself: an
+OpenStreetMap outline of the facility, an EIA or permit plant location, a
+parcel the facility occupies in full, or a single-site facility geocoded from
+its own street address. A town or county centroid, a point on a single
+contiguous campus, or a road-level placement is marked `approximate`, and is
+never presented as a footprint it is not.
 
 ## Deduplication
 
@@ -123,9 +140,40 @@ Nothing becomes a live facility automatically. Every candidate — from the
 research waves, the automated pipeline, or a public contributor — lands as a
 `pending` submission and is promoted only by an explicit human approval. Public
 intake is anonymous and moderated and can only ever stage a pending record;
-privileged writes require an admin credential. This "open output, curated intake"
-model is what keeps the dataset trustworthy: the data and code are fully open,
-but volume never bypasses review.
+privileged writes require an admin credential. This curated-intake model
+is what keeps the dataset trustworthy: every record is public and cited, but
+volume never bypasses review.
+
+## Map data pipeline
+
+The optional map overlays and per-facility siting-context metrics are built from
+public, static sources via `scripts/build-map-data.mjs` (invoked as
+`npm run build:mapdata`). The script fetches several public datasets; the
+overlays below are simplified to GeoJSON and committed as static assets in
+`public/data/` (each lazily loaded only when its layer is toggled on):
+
+- **Waterways** — Natural Earth generalized rivers/lakes geometry (public domain).
+- **Transmission lines** — HIFLD "Electric Power Transmission Lines" (public
+  domain, U.S. Government Works).
+- **Drought** — U.S. Drought Monitor (NDMC / USDA / NOAA) point-in-time snapshot,
+  with an "as of" date recorded in `public/data/map-layers.json`.
+- **Baseline water stress** and **groundwater decline** — WRI Aqueduct 4.0,
+  hydrological-basin polygons (licensed CC BY 4.0). Rendered with single-hue
+  light→dark ramps so severity reads by luminance, not hue.
+- **Principal aquifers** — USGS Principal Aquifers of the United States
+  (public domain), mapped at 1:2,500,000 — regional context, not site
+  hydrogeology.
+
+The script also pre-computes `data/siting-context.json`, which holds each
+facility's nearest named surface water (via USGS National Hydrography Dataset),
+nearest ≥230 kV transmission line (via HIFLD), the water stress / groundwater
+trend of its surrounding basin (WRI Aqueduct 4.0), and the underlying principal
+aquifer (USGS) — the latter three by point-in-polygon lookup. This siting
+context is shown on the facility page and in the map popup. Distances denote
+**proximity only** — not stated water withdrawals or grid interconnections; the
+basin and aquifer values are **regional context**, not the facility's measured
+water use. All data is source-cited; no per-request geospatial API is used
+(cost: $0).
 
 ## Zero fabrication
 
@@ -143,8 +191,7 @@ The dataset has a deliberate bias against inventing detail.
 
 ## How to read a record's sources
 
-Every facility carries a `sources` array; the [live API](../README.md#api) and
-the [JSON export](../data/facilities.json) expose it in full. Reading a record
+Every facility carries a `sources` array; each facility page (`/facilities/{id}`) lists it in full. Reading a record
 means reading its provenance:
 
 - **`sources[]`** — one entry per citation, each with a `url`, a human `label`, an
@@ -161,22 +208,382 @@ means reading its provenance:
   The `kind` mix is the fastest read on how a record is grounded: a `permit`- or
   `filing`-anchored record rests on a primary document; a `press`-only record
   rests on reporting and is usually held at `reported` confidence.
+
+  **The source-kind convention:** `kind` describes what the document *is*, not
+  what it is *about* — a news article reporting on a permit is `press`, not
+  `permit`. The one exception is when the publisher IS the granting party, so
+  the page is first-party evidence of the grant rather than reportage: a state
+  economic-development agency announcing its own incentive is `subsidy`. The
+  enum values are `press`, `permit`, `osm`, `iso_queue`, `subsidy`, `filing`,
+  and `other`. The `other` value is the schema default, so it cannot be
+  distinguished from a deliberate choice. This convention was established after
+  discovering that nine records cited the same URL twice with different kinds,
+  tagged by different enrichment passes.
 - **`confidence`** — `confirmed`, `reported`, or `rumored`, describing how firmly
   the record's core facts are established.
-- **`statusHistory[]`** — an append-only audit trail of status changes, each dated
-  and tied by `sourceIndex` to the source that corroborates it. It is never
-  reordered or rewritten; new events and sources are appended, so the trail stays
-  intact.
-- **`location.precision`** — `exact` when the coordinate is a real footprint,
-  `approximate` when it is a geocoded town/parcel centroid.
+- **`statusHistory[]`** — an audit trail of status changes, each dated
+  and tied by `sourceIndex` to the source that corroborates it. It is not
+  reordered; new events and sources are appended, so the trail stays intact. An
+  entry's date or note is corrected in place when it is shown to be wrong, for
+  example when a report's publication date had been entered as the date of the
+  event.
+- **`location.precision`** — `exact` when the record ties the coordinate to the
+  facility itself (see the geocoding discipline above), `approximate` when it is
+  a best-effort placement such as a town or county centroid, a point on a single
+  contiguous campus, or a road-level placement, or `representative_multi_site`
+  when the facility spans multiple discrete sites, such as buildings at separate
+  addresses or a distributed fleet, and the coordinate is an illustrative point
+  only.
 
 Put together: follow the `sources`, weigh the `confidence`, and read the
 `statusHistory` — that is what "source-cited" means here, and it is the whole
 point of the project.
 
+## Source citation and licensing
+
+Compute Atlas publishes its dataset under CC-BY-4.0, which permits redistribution
+— so a source whose terms forbid redistribution cannot supply a fact here,
+because the fact would be re-licensed downstream in a way its copyright holder
+forbids.
+
+A few key distinctions:
+
+- **A permissive `robots.txt` is not a license.** The question `robots.txt`
+  answers — "may your crawler fetch this page" — is different from "may you
+  republish what you found." A site's Terms of Use answer the latter. Compute
+  Atlas checks both.
+- **A link is not redistribution.** The concern is ingesting facts as data, not
+  referencing pages as documentation. Citing a URL as a source is acceptable even
+  where redistribution of its full text is not.
+- **The legitimate path for aggregators.** An aggregator like Bright Data or
+  interconnection.fyi may discover a project, but the citation points to the
+  primary origin — the ISO/RTO's own interconnection queue, the SEC's EDGAR
+  database, the county's permit portal — rather than the aggregator's page. This
+  path is enforced in the discovery pipeline and validated by a regression test
+  in `lib/restricted-sources.ts`. Currently one domain is entirely restricted.
+  Commercial aggregators that are not licence-restricted (e.g. Baxtel,
+  datacentermap) are still cited but treated as weak corroboration rather than
+  primary evidence. As of 2026-09-14, no record marked `confidence: confirmed`
+  relies on aggregators alone, and 25 records cite aggregators exclusively at
+  lower confidence.
+
+## Stakeholders
+
+An optional `stakeholders[]` array names people and organizations with a
+documented stake in a specific facility. An entry's `kind` is `person` or
+`organization`; an entry with no `kind` is a person. Coverage is deliberately
+sparse — not because data is missing, but because the field follows a strict
+site-level standard that excludes most candidates.
+
+**The site-level standard:** A source must name the person or
+organization in connection with THIS facility, not merely its operator.
+"Zuckerberg runs Meta and Meta owns this site" does not qualify. The stake must
+be documented through a verifiable public source tied directly to the facility.
+This is why a record with 20 executives named in operator-level filings may
+carry zero stakeholders. The same standard applies to organizations: an
+infrastructure fund holding joint-venture equity in one campus qualifies, while
+an owner of the whole operator does not, because that is an operator-level
+relationship rather than a site-level one.
+
+**The operator-ownership layer:** Owners of a whole operating company are
+recorded separately, in `data/operator-ownership.json`, because they are real
+and citable but cover many sites and so cannot meet the site-level standard.
+Each row names one owner of one operator (matched on the exact operator name),
+with a role of `controlling_owner` or `investor`, an optional stake and start
+date, a neutral note, its own source and an `asOf` date. These rows appear on a
+facility page under "Through the operator", on the operator's page under
+"Ownership", and on the owner's stakeholder page under "Through operator
+ownership". They are never counted as site-level stakes: an owner's facility
+count includes only sites where a source ties them to that site.
+
+**Why `sourceIndex` and `asOf` are required:** Both are mandatory, unlike the
+optional `sourceIndex` on `jobs` and `community`. A name without a citation is
+not acceptable in a public record, and stakes change — a person's title or role
+at a facility may have shifted since a source was published, so `asOf` marks
+when that stake was documented.
+
+**Role categories:**
+
+- **Financial interests:** `founder`, `controlling_owner`, `investor`, `lender`,
+  `executive`, `board_member`, `landowner`. `lender` names a debt financier of
+  this specific project and is recorded for organizations only.
+- **Governmental role:** `public_official` — a person with a documented official
+  act on this site: approved, signed, issued, sponsored, or voted, in either
+  direction. The note states the direction of the act, never a motive. This is
+  NOT a financial interest; the facility page renders it as a separate group
+  with a caption saying listing does not imply financial involvement. It is
+  recorded for people only; an agency is not a public official.
+
+**How votes are recorded:** A recorded vote is listed only when every
+member who voted on it can be named from the acting body's own records.
+Listing some voters but not others would present one side of a decision, so a
+vote that cannot be named in full is left out.
+
+- **Every voter or none.** A roll call, or a roster of the members present
+  with a unanimous result, names every voter. A roster of the body's
+  membership does not, and neither does a voice vote that records only that
+  no one objected.
+- **The presiding officer is accounted for.** A chair, mayor or judge who was
+  present is either in the tally, or shown not to vote by the same records or
+  by a current law or charter quoted verbatim from an official source (for
+  example, a mayor who votes only to break a tie).
+- **Both directions, plus abstentions and recusals.** Votes against are
+  recorded the same way as votes for, and an abstention or recusal is
+  recorded as such.
+- **Only decisions count.** A planning commission or board recommendation to
+  another body is advisory and is not recorded. A planning body's vote is
+  recorded only where an official text shows that it decides the matter.
+- **Non-binding acts are recorded as worded.** A deciding body's stage
+  approval, or a governing board's resolution on one site, is recorded in the
+  record's own words.
+- **Approved or certified minutes.** Draft minutes are used only once a later
+  meeting has approved them. Minutes certified as the official record are used
+  without a later approval only in two forms: signed by the presiding officer,
+  attested by the clerk and sealed, all three; or attested and recorded by the
+  county clerk.
+- **Full names from records of the time.** A name comes from the minutes'
+  own roster or another official record from when the vote was taken.
+
+Party affiliation is never recorded. Campaign donations are not a stake in a
+facility and are not recorded.
+
+The field is excluded from both the automated discovery pipeline and public
+corrections. Stakeholders are added through maintainer research and human review
+only — a local model must never be able to name a private individual.
+
+## Emissions
+
+An optional `emissions` object records **permitted annual emission limits taken
+from a facility's air permit** (PSD, Title V, or a state construction permit).
+
+**These are regulatory ceilings, not measured output.** A permit states the most
+a facility is allowed to emit, which is not what it actually emitted. The facility
+page says so wherever the figures appear, and the two must never be presented
+interchangeably.
+
+**Nothing here is derived.** Converting capacity to tonnage would require a
+capacity factor and an emission rate — it would be an estimate wearing the
+clothes of a citation, and it is not done. Every value is a number printed in a
+permit, recorded in the permit's own units exactly as written. Units are never
+converted, short-term limits are never annualised, and a permit stating metric
+tonnes or a non-annual averaging period is recorded as written with the deviation
+noted rather than normalised.
+
+**`basis` is required whenever any tonnage is recorded**, because real permits
+are not uniform:
+
+- Some state **facility-wide** caps (PA DEP Plan Approval 32-00457A caps Homer
+  City at 1,142.8 tons/yr NOx across the whole site).
+- Others state **per-unit** caps (MDEQ PSD 0680-00119 caps each turbine at
+  5.60–15.47 tons/yr NOx depending on model, across 41 turbines).
+
+An unqualified number is ambiguous between those two readings, and reporting a
+per-turbine limit as a site total would be a serious error. `averagingPeriod`
+records whether a limit is a calendar year or a rolling 12-month total — permits
+commonly use the latter.
+
+**`unitsCovered` records what equipment the permit actually authorises**, in the
+permit's own words. A permit does not always cover the same equipment a record
+describes: a site may operate units beyond those a given permit authorises, and
+attaching that permit's limits to the whole site would cite real numbers against
+the wrong hardware.
+
+**A missing `co2e` does not mean "no greenhouse-gas limit."** Some permits
+constrain GHGs only as an efficiency *rate* (e.g. lb/MMBtu) with no annual
+tonnage at all. The field is left unset and the reason recorded in `notes`.
+
+Like `stakeholders`, this field is excluded from the automated discovery pipeline
+and from public corrections. It is added through maintainer research against the
+permit document itself.
+
+## AI classification
+
+An optional `aiClassification` field records how strongly a facility's public
+record ties it to AI compute. It drives the AI badge on a facility page and the
+denominators on `/ai`. The field exists on data-center and crypto-mining
+records only — a power-generation facility has no `aiClassification` field, by
+the same reasoning that excludes `mining` and `environmental` from that schema.
+The three values existed before this rule was written down; curators applied
+them from the tier descriptions rendered on `/about` without a documented
+standard for the cases those descriptions leave open.
+
+- **`confirmed`** — a source explicitly describes **this** facility as an AI or
+  GPU facility: an AI data center, AI campus, AI factory, GPU cluster, or an AI
+  training or inference site, or it names AI accelerator hardware deployed
+  there.
+- **`likely`** — a source states AI-specific indicators **for this facility**
+  without describing the facility itself as an AI site: a named AI tenant or
+  offtaker, GPU procurement for the site, an AI-specific power or lease
+  agreement, or rack-density and liquid-cooling figures the source itself
+  attributes to AI workloads.
+- **`mixed_use`** — a source describes the facility as multi-purpose with AI
+  among its workloads: cloud and AI, colocation with an AI tenant alongside
+  others, or an enterprise campus where AI is one named use among several.
+
+**Tie-breaker 1 — capability marketing is not a classification.** "AI-ready",
+"built for the AI era", "supports AI workloads" and similar phrases describe
+what an operator sells, not what runs at a site. They do not by themselves
+establish any tier. `confirmed` requires a source to describe this facility as
+an AI or GPU facility; `likely` requires a stated, facility-specific indicator.
+
+**Tie-breaker 2 — the indicator must be stated for this facility.** An
+operator's AI positioning, a sibling site's GPU deployment, or general industry
+context is not evidence about this facility. Where a source discusses a
+company-wide program without tying it to this site, the field is omitted.
+
+**Tie-breaker 3 — `confirmed` over `mixed_use` when AI is the defining use.** A
+source that presents AI as the facility's purpose reads `confirmed` even if it
+also mentions other workloads. `mixed_use` is for sources that present AI as
+one of several co-equal uses.
+
+**The absent value means NOT ASSESSED.** The enum has no member for "assessed,
+and not AI-related" — every member asserts some degree of AI use — and the
+field is optional, so a facility nobody has evaluated and a facility evaluated
+and found unrelated to AI are the same state on disk. A missing badge is
+therefore not a finding, and `/ai` states its denominator rather than implying
+the unclassified records are non-AI. Closing that gap needs a fourth enum
+member, which has been considered and declined.
+
+## Operational capacity
+
+The `capacityMw.operational` field is defined as the IT capacity that is online
+now, in megawatts. Planned capacity is a separate field; the unqualified-figure rule below applies to it too.
+
+- **Counts:** IT capacity in service, which sources may also call IT load or
+  critical IT load. For a crypto-mining site, a stated current power draw also
+  counts, such as "currently consumes about 240 megawatts"; it must be a draw in
+  effect now, not a projected, expected or planned one.
+- **Does not count:** a utility feed, a power supply figure, building power, a
+  UPS rating, or a generator figure. These describe how power reaches, backs up
+  or conditions the site, not how much computing it can run. For a
+  crypto-mining site, a projected, expected or planned draw, and a contracted,
+  interconnection, substation or building figure, do not count either.
+- **Unqualified figures:** a bare figure such as "a 50 MW facility" counts as IT
+  capacity unless the source describes it as a utility feed, power supply,
+  building power, substation, UPS or generator figure.
+
+The rule: Operational capacity is IT capacity only. A utility feed, power supply, building power, UPS or generator figure is not IT capacity. If a source states only such a figure, the field is left unrecorded and the figure is described in the notes as what it is. For a crypto-mining site, a stated current power draw (one in effect now, not projected, expected or planned) counts as operational capacity; a contracted, interconnection, substation or building figure does not.
+
+A figure of that kind is not entered in the field just because it is the only
+number available. The record carries a "Not recorded" marker with a short public
+reason, and the notes state the figure and what it measures, for example
+"available utility power".
+
+## Cooling type
+
+An optional `water.coolingType` field classifies a data center's heat-rejection
+method by water consumption — the axis rendered on the `/power` page as
+"Evaporative (high water)," "Hybrid," "Closed-loop (low water)," and
+"Air-cooled (minimal)." This rule was not written down before now; the four
+values existed but curators had no documented standard to apply them against.
+
+- **`evaporative`** — heat is rejected by evaporating water, as in a cooling
+  tower or adiabatic/evaporative assist. Water is consumed continuously.
+- **`hybrid`** — the design switches between evaporative and dry modes, for
+  example wet cooling in summer and dry cooling in winter. Water is consumed
+  seasonally. It does **not** mean a mix of air and liquid cooling inside the
+  building: that describes how heat is captured at the rack, not how it leaves
+  the site, and every value here classifies heat rejection.
+- **`closed_loop`** — a recirculating water or coolant circuit that is not
+  evaporated. Water is consumed only as occasional makeup.
+- **`air`** — no cooling water circuit at all: dry or direct air cooling,
+  described by the operator as "waterless" or "zero water for cooling." Water
+  use is limited to ordinary plumbing.
+- **`unknown`** — a source addresses cooling but does not identify the method.
+
+**The tie-breaker:** a facility with a water circuit that recirculates is
+recorded as `closed_loop`, even when heat is ultimately rejected to air via
+air-cooled chillers or dry coolers. `air` is reserved for designs with no
+cooling water circuit at all. Operators frequently market a closed-loop design
+as "air-cooled," so the marketing phrase alone does not decide the value — the
+presence of a recirculating water circuit does.
+
+## Fields left out on purpose
+
+A record can carry a `notRecorded` marker for a field that was deliberately
+left out, with a public reason, for example a figure that describes a whole
+company rather than this site. The facility page shows "Not recorded" and the
+reason for a marked field, including beside a recorded sibling capacity figure.
+A field cannot be both recorded and marked: validation rejects the record, so an
+approved submission that fills a marked field fails until a maintainer removes
+the mark. The field-extraction lane never selects a marked field as a gap, and
+the list of missing fields given to the discovery prompt counts a marked field
+as present. The marker covers planned and operational capacity, on-site
+generation, energy source, utility and cooling type. Only a maintainer sets it;
+public intake and discovery staging drop it.
+
+## Scope and known limitations
+
+Compute Atlas is a curated dataset, not a census. What follows is the honest
+shape of its coverage — the things worth knowing before using it for analysis.
+The figures below carry the date they were measured; they change as records are
+added, so cite them with that date.
+
+**Collection began on 2026-07-05.** There is no cutoff date and nothing is
+excluded for being old: the earliest dated event in the set is 1999. But the
+dataset is assembled from the public record that the current buildout
+generates — county planning portals, utility interconnection queues, securities
+filings, local reporting. That record is far thicker for sites being proposed
+and built now than for sites that opened a decade ago, so coverage skews recent.
+
+**It is not exhaustive.** The set is well short of the total US data center
+population, and no claim of completeness is made for any state, operator, or
+status. A facility's absence is not evidence it does not exist.
+
+**Coverage is uneven by status, and most so for operational sites.** Measured
+2026-09-03 across 1,351 records, the share of records carrying a dated
+`statusHistory` entry:
+
+| Status | Records | With a dated history |
+| --- | --- | --- |
+| `operational` | 616 | 189 (31%) |
+| `under_construction` | 238 | 195 (82%) |
+| `permitted` | 103 | 87 (84%) |
+| `proposed` | 336 | 254 (76%) |
+| `cancelled` | 58 | 41 (71%) |
+
+The dataset has since grown to 2,241 records (measured 2026-09-28). The table
+reflects the 2026-09-03 snapshot; measured 2026-09-28, 1,405 records (62.7%)
+carry at least one `statusHistory` entry bearing a `date` — the same rule the
+table above counts by.
+
+The operational cohort is the outlier. An announcement, a permit or a
+groundbreaking produces a dated public record; a site that has simply been
+running for years often produces none, so its commissioning date is frequently
+unrecoverable from citable sources. Of the operational records that *are* dated,
+62% fall in 2024 or later.
+
+⚠️ **This matters for any analysis comparing proposed against built.** The built
+side of that comparison is both less completely covered and less completely
+dated than the proposed side. A difference between the two cohorts may reflect
+that asymmetry in the sourcing rather than anything about the facilities. Treat
+the proposed/under-construction cohorts as the better-evidenced half.
+
+**Other things to know:**
+
+- **Absent is not zero.** Optional fields — capacity, water, jobs, subsidies,
+  emissions — are omitted when no citable source published a figure. An empty
+  field means "not established," never "none."
+- **21.7% of records cite at least one primary document** (a `permit`, `filing`,
+  `iso_queue`, or `subsidy` source). The rest rely on reporting. Measured
+  2026-09-28 across 2,241 records: 486 cite at least one primary document. Read
+  the `kind` mix alongside `confidence` (953 `confirmed`, 1,264 `reported`, 24
+  `rumored`).
+- **Coordinates vary in precision.** Measured 2026-09-28, before the 2026-10-30
+  precision review: 733 records are `exact` footprints; 1,499 are `approximate`
+  geocodes of a town or parcel centroid; 9 are `representative_multi_site`,
+  standing for a multi-building campus or distributed fleet. Check
+  `location.precision` before doing distance or spatial work.
+- **Some records are deliberately aggregates.** A multi-building campus or a
+  carrier hotel with many tenants may be one record rather than many, because
+  the site is the meaningful unit. Where this applies, `notes` says so.
+- **`retrievedAt` is the date a source was fetched**, not its publication date.
+  26 entries that conflated the two were corrected on 2026-09-03, and the schema
+  now requires a full `YYYY-MM-DD` date so the two cannot be confused again.
+
 ## See also
 
-- [`README.md`](../README.md) — what the dataset is and the public API.
+- [`README.md`](../README.md) — what the dataset is and how to cite it.
 - [`CONTRIBUTING.md`](../CONTRIBUTING.md) — how to add a facility or a correction.
 - [`discovery-pipeline.md`](discovery-pipeline.md) — the automated candidate pipeline.
 - [`lib/schema.ts`](../lib/schema.ts) — the authoritative Zod data model.

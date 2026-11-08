@@ -1,7 +1,9 @@
 import { describe, it, expect, vi } from "vitest";
 import { render, screen } from "@testing-library/react";
 import { PowerLinksSection, hasPowerLinks } from "./power-links";
+import { SectionGapPrompt } from "@/components/contribute/field-gap-prompt";
 import { getFacilityById } from "@/lib/data";
+import { findUnpoweredDataCenter } from "@/lib/test-fixtures/unpowered-facility";
 
 // next/link renders to <a> — mock to avoid Next.js router-context dependency in jsdom
 vi.mock("next/link", () => ({
@@ -37,7 +39,7 @@ describe("hasPowerLinks", () => {
   });
 
   it("returns false for a compute facility no plant powers", async () => {
-    const facility = await getFacilityById("meta-prineville-or");
+    const facility = await findUnpoweredDataCenter();
     expect(facility).toBeDefined();
     expect(await hasPowerLinks(facility!)).toBe(false);
   });
@@ -96,5 +98,34 @@ describe("PowerLinksSection — Powers (grid-region offtaker, no campus)", () =>
     expect(screen.getByText("Powers")).toBeInTheDocument();
     expect(screen.getByText("Microsoft")).toBeInTheDocument();
     expect(screen.queryByRole("link")).not.toBeInTheDocument();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// PowerLinksSection — whole-group gap (no power links data at all)
+// ---------------------------------------------------------------------------
+describe("PowerLinksSection — whole-group gap", () => {
+  it("renders exactly one SectionGapPrompt tip trigger when no plant powers the facility, instead of a heading", async () => {
+    const facility = await findUnpoweredDataCenter();
+    expect(facility).toBeDefined();
+    render(await PowerLinksSection({ facility: facility! }));
+
+    const triggers = screen.getAllByRole("button");
+    expect(triggers).toHaveLength(1);
+    expect(triggers[0]).toHaveTextContent(/its power supply/i);
+    expect(screen.queryByRole("link")).not.toBeInTheDocument();
+    expect(screen.queryByText("Power supply")).not.toBeInTheDocument();
+    expect(screen.queryByText("Powers")).not.toBeInTheDocument();
+  });
+
+  it("SectionGapPrompt used for the gap does not perform an eligibility check", () => {
+    render(
+      <SectionGapPrompt
+        facilityId="test-plant"
+        facilityName="Test Plant"
+        label="what this facility powers"
+      />
+    );
+    expect(screen.getByRole("button")).toHaveTextContent(/what this facility powers/i);
   });
 });

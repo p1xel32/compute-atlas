@@ -9,25 +9,30 @@ import {
   operatorSlug,
   getOperatorBySlug,
 } from "@/lib/data";
+import { previewSubset } from "@/lib/build-params";
 import { STATUS_ORDER, STATUS_META, getStatusColor } from "@/lib/status";
 import { FACILITY_TYPE_ORDER, FACILITY_TYPE_META } from "@/lib/facility-type";
-import { formatCapacity, formatLocation } from "@/lib/format";
-import { StatusBadge } from "@/components/status-badge";
+import { formatLocation, formatPower } from "@/lib/format";
+import { statesStat, statesPhrase } from "@/lib/us-states";
 import { Breadcrumb } from "@/components/breadcrumb";
+import { CollectionJsonLd } from "@/components/collection/collection-json-ld";
+import { FacilityListRow } from "@/components/facility-list-row";
+import { PageMasthead } from "@/components/page-masthead";
+import { SurveyStatRow } from "@/components/survey-stat-row";
+import { PercentageBar } from "@/components/percentage-bar";
+import { SectionHeading } from "@/components/section-heading";
+import { OperatorOwnerDetails, ownerDisplayName } from "@/components/operator-owner-details";
+import { OPERATOR_OWNER_ROLE_LABELS, getOperatorOwners } from "@/lib/operator-ownership";
+import { personSlug } from "@/lib/operator-slug";
 
-export const revalidate = 3600;
-
-/** Formats a MW figure as GW (1 decimal) above 1000, else whole MW. Avoids "0.0 GW" for small operators. */
-function formatPower(mw: number): string {
-  if (mw >= 1000) {
-    return `${(mw / 1000).toFixed(1)} GW`;
-  }
-  return `${Math.round(mw)} MW`;
-}
+export const revalidate = 86400;
 
 export async function generateStaticParams() {
   const names = await getOperators();
-  return names.map((name) => ({ operator: operatorSlug(name) }));
+  return previewSubset(
+    names.map((name) => ({ operator: operatorSlug(name) })),
+    10,
+  );
 }
 
 export async function generateMetadata({
@@ -45,7 +50,7 @@ export async function generateMetadata({
 
   return {
     title: `${operatorName} data centers`,
-    description: `${summary.count} data centers and compute facilities operated by ${operatorName} across ${summary.stateCount} state(s) — capacity, build status, and locations, each with a public source.`,
+    description: `${summary.count} data centers and compute facilities operated by ${operatorName} across ${statesPhrase(summary.stateCodes)} — capacity, build status, and locations, each with a public source.`,
     alternates: { canonical: `/operators/${slug}` },
   };
 }
@@ -74,8 +79,8 @@ export default async function OperatorPage({
   }
 
   const facilities = await getFacilitiesByOperator(operatorName);
+  const owners = await getOperatorOwners(operatorName);
 
-  // --- Templated overview prose (SEO Task 2.1) -----------------------------
   // Every figure below is read directly off `summary`/`facilities`; nothing
   // here is fetched, invented, or estimated. Each branch just phrases a zero
   // count gracefully instead of printing an awkward "0 MW" boast.
@@ -91,7 +96,8 @@ export default async function OperatorPage({
   } else {
     capacitySentence = "None have reported operational capacity or an active build phase yet.";
   }
-  const overviewSentence = `Compute Atlas tracks ${summary.count} facilit${summary.count === 1 ? "y" : "ies"} operated by ${operatorName} across ${summary.stateCount} state${summary.stateCount === 1 ? "" : "s"}. ${capacitySentence}`;
+  const overviewSentence = `Compute Atlas tracks ${summary.count} facilit${summary.count === 1 ? "y" : "ies"} operated by ${operatorName} across ${statesPhrase(summary.stateCodes)}. ${capacitySentence}`;
+  const statesTile = statesStat(summary.stateCodes);
 
   const topFacilityNames = facilities.slice(0, 3).map((f) => f.name);
   const facilitySentence =
@@ -99,32 +105,31 @@ export default async function OperatorPage({
       ? `The largest tracked site${topFacilityNames.length === 1 ? "" : "s"}, by capacity, ${topFacilityNames.length === 1 ? "is" : "are"} ${new Intl.ListFormat("en-US", { style: "long", type: "conjunction" }).format(topFacilityNames)}.`
       : null;
 
+  const crumbs = [
+    { label: "Explore", href: "/explore" },
+    { label: "Operators", href: "/operators" },
+    { label: operatorName },
+  ];
+
   return (
     <div
       data-content-width="4xl"
       className="mx-auto max-w-4xl px-4 py-8 sm:px-6 sm:py-12 space-y-10"
     >
-      <Breadcrumb items={[{ label: "Explore", href: "/explore" }, { label: "Operators", href: "/operators" }, { label: operatorName }]} />
+      <CollectionJsonLd crumbs={crumbs} facilities={facilities} />
 
-      {/* ------------------------------------------------------------------ */}
-      {/* Masthead                                                            */}
-      {/* ------------------------------------------------------------------ */}
-      <header className="space-y-4 pb-2">
-        <p className="font-mono text-xs uppercase tracking-widest text-primary">
-          Operator profile
-        </p>
-        <h1 className="font-display text-4xl leading-[1.05] text-foreground sm:text-5xl">
-          {operatorName} data centers
-        </h1>
-        <p className="text-base text-muted-foreground">
-          {summary.count} facilit{summary.count === 1 ? "y" : "ies"} tracked
-        </p>
-        <div className="border-t border-border" />
-      </header>
+      <Breadcrumb items={crumbs} />
 
-      {/* ------------------------------------------------------------------ */}
-      {/* Overview (SEO: templated, dataset-derived prose — no new fields)    */}
-      {/* ------------------------------------------------------------------ */}
+      <PageMasthead
+        eyebrow="Operator profile"
+        title={<>{operatorName} data centers</>}
+        dek={
+          <>
+            {summary.count} facilit{summary.count === 1 ? "y" : "ies"} tracked
+          </>
+        }
+      />
+
       <div className="max-w-2xl space-y-4">
         <p className="text-base leading-relaxed text-muted-foreground">
           {overviewSentence}
@@ -136,88 +141,44 @@ export default async function OperatorPage({
         )}
       </div>
 
-      {/* ------------------------------------------------------------------ */}
-      {/* Survey stats row                                                    */}
-      {/* ------------------------------------------------------------------ */}
-      <div className="flex flex-wrap gap-8 border-b border-border pb-10">
-        <div className="flex flex-col items-center gap-1 text-center">
-          <span className="font-mono tabular-nums text-4xl font-semibold text-foreground">
-            {summary.count}
-          </span>
-          <span className="font-mono text-xs uppercase tracking-widest text-muted-foreground">
-            Sites
-          </span>
-        </div>
-        <div className="flex flex-col items-center gap-1 text-center">
-          <span className="font-mono tabular-nums text-4xl font-semibold text-foreground">
-            {formatPower(summary.operationalMw)}
-          </span>
-          <span className="font-mono text-xs uppercase tracking-widest text-muted-foreground">
-            Operational
-          </span>
-        </div>
-        <div className="flex flex-col items-center gap-1 text-center">
-          <span className="font-mono tabular-nums text-4xl font-semibold text-foreground">
-            {formatPower(summary.plannedMw)}
-          </span>
-          <span className="font-mono text-xs uppercase tracking-widest text-muted-foreground">
-            Pipeline
-          </span>
-        </div>
-        <div className="flex flex-col items-center gap-1 text-center">
-          <span className="font-mono tabular-nums text-4xl font-semibold text-foreground">
-            {summary.stateCount}
-          </span>
-          <span className="font-mono text-xs uppercase tracking-widest text-muted-foreground">
-            States
-          </span>
-        </div>
-      </div>
+      <SurveyStatRow
+        stats={[
+          { value: summary.count, label: "Sites" },
+          { value: formatPower(summary.operationalMw), label: "Operational" },
+          { value: formatPower(summary.plannedMw), label: "Pipeline" },
+          { ...statesTile },
+        ]}
+      />
 
-      {/* ------------------------------------------------------------------ */}
-      {/* § By type                                                           */}
-      {/* ------------------------------------------------------------------ */}
+      <p className="text-sm leading-relaxed text-muted-foreground">
+        Capacity is disclosed for {summary.capacityReporting} of the{" "}
+        {summary.count} sites operated by {operatorName}. The megawatt
+        figures above sum those records only — read them as a floor, not an
+        operator total.
+      </p>
+
       {summary.count > 0 && (
         <section
           aria-labelledby="facility-type-heading"
           className="space-y-6 border-t border-border pt-10"
         >
-          <p className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
-            § By type
-          </p>
-          <h2
-            id="facility-type-heading"
-            className="font-display text-2xl text-foreground"
-          >
-            Facility type
-          </h2>
+          <SectionHeading kicker="By type" id="facility-type-heading" title="Facility type" />
           <div className="space-y-4">
             {FACILITY_TYPE_ORDER.filter((key) => summary.byType[key] > 0).map(
               (key) => {
                 const count = summary.byType[key];
                 const pct = summary.count > 0 ? (count / summary.count) * 100 : 0;
                 return (
-                  <div key={key} className="space-y-1.5">
-                    <div className="flex items-baseline justify-between gap-2 text-sm">
-                      <span className="text-foreground">
-                        {FACILITY_TYPE_META[key].label}
-                      </span>
-                      <span className="font-mono tabular-nums text-muted-foreground">
+                  <PercentageBar
+                    key={key}
+                    label={FACILITY_TYPE_META[key].label}
+                    valueLabel={
+                      <>
                         {count} &middot; {pct.toFixed(0)}%
-                      </span>
-                    </div>
-                    <div className="h-1.5 w-full overflow-hidden rounded-full bg-muted">
-                      <div
-                        aria-hidden="true"
-                        className="h-full rounded-full"
-                        style={{
-                          width: `${pct.toFixed(2)}%`,
-                          backgroundColor: "var(--primary)",
-                          opacity: 0.7,
-                        }}
-                      />
-                    </div>
-                  </div>
+                      </>
+                    }
+                    pct={pct}
+                  />
                 );
               }
             )}
@@ -225,89 +186,74 @@ export default async function OperatorPage({
         </section>
       )}
 
-      {/* ------------------------------------------------------------------ */}
-      {/* § By status                                                         */}
-      {/* ------------------------------------------------------------------ */}
       <section
         aria-labelledby="status-heading"
         className="space-y-6 border-t border-border pt-10"
       >
-        <p className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
-          § By status
-        </p>
-        <h2 id="status-heading" className="font-display text-2xl text-foreground">
-          Lifecycle status
-        </h2>
+        <SectionHeading kicker="By status" id="status-heading" title="Lifecycle status" />
         <div className="space-y-4">
           {STATUS_ORDER.filter((status) => summary.byStatus[status] > 0).map(
             (status) => {
               const count = summary.byStatus[status];
               const pct = summary.count > 0 ? (count / summary.count) * 100 : 0;
               return (
-                <div key={status} className="space-y-1.5">
-                  <div className="flex items-baseline justify-between gap-2 text-sm">
-                    <span className="text-foreground">
-                      {STATUS_META[status].label}
-                    </span>
-                    <span className="font-mono tabular-nums text-muted-foreground">
+                <PercentageBar
+                  key={status}
+                  label={STATUS_META[status].label}
+                  valueLabel={
+                    <>
                       {count} &middot; {pct.toFixed(0)}%
-                    </span>
-                  </div>
-                  <div className="h-1.5 w-full overflow-hidden rounded-full bg-muted">
-                    <div
-                      aria-hidden="true"
-                      className="h-full rounded-full transition-all"
-                      style={{
-                        width: `${pct.toFixed(2)}%`,
-                        backgroundColor: getStatusColor(status),
-                      }}
-                    />
-                  </div>
-                </div>
+                    </>
+                  }
+                  pct={pct}
+                  color={getStatusColor(status)}
+                  opacity={1}
+                  transition
+                />
               );
             }
           )}
         </div>
       </section>
 
-      {/* ------------------------------------------------------------------ */}
-      {/* § Facilities                                                        */}
-      {/* ------------------------------------------------------------------ */}
+      {owners.length > 0 && (
+        <section
+          aria-labelledby="ownership-heading"
+          className="space-y-4 border-t border-border pt-10"
+        >
+          <SectionHeading kicker="Ownership" id="ownership-heading" title={<>Who owns {operatorName}</>} />
+          <p className="max-w-2xl text-sm leading-relaxed text-muted-foreground">
+            These stakes are held in the operating company, not documented for
+            any one of its sites.
+          </p>
+          <ul className="divide-y divide-border">
+            {owners.map((owner) => (
+              <li key={owner.name} className="space-y-1 py-4 text-sm">
+                <span className="flex flex-wrap items-center gap-x-1">
+                  <Link
+                    href={`/stakeholders/${personSlug(owner.name)}`}
+                    className="inline-flex min-h-11 items-center font-medium text-foreground underline underline-offset-2 hover:text-primary focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"
+                  >
+                    {ownerDisplayName(owner)}
+                  </Link>
+                  {` · ${OPERATOR_OWNER_ROLE_LABELS[owner.role]}`}
+                </span>
+                <OperatorOwnerDetails owner={owner} />
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
+
       <section
         aria-labelledby="facilities-heading"
         className="space-y-4 border-t border-border pt-10"
       >
-        <p className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
-          § Facilities
-        </p>
-        <h2
-          id="facilities-heading"
-          className="font-display text-2xl text-foreground"
-        >
-          Facilities operated by {operatorName}
-        </h2>
+        <SectionHeading kicker="Facilities" id="facilities-heading" title={<>Facilities operated by {operatorName}</>} />
         <ul className="divide-y divide-border">
           {facilities.map((f) => (
             <li key={f.id}>
-              <Link
-                href={`/facilities/${f.id}`}
-                className="flex min-h-11 flex-col gap-1 py-3 sm:flex-row sm:items-center sm:justify-between sm:gap-4 transition-colors hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 rounded-sm"
-              >
-                <span className="flex flex-col gap-0.5 min-w-0">
-                  <span className="text-sm text-foreground truncate">
-                    {f.name}
-                  </span>
-                  <span className="text-xs text-muted-foreground truncate">
-                    {formatLocation(f)}
-                  </span>
-                </span>
-                <span className="flex shrink-0 items-center gap-3">
-                  <StatusBadge status={f.status} />
-                  <span className="font-mono tabular-nums text-xs text-muted-foreground">
-                    {formatCapacity(f)}
-                  </span>
-                </span>
-              </Link>
+              <FacilityListRow facility={f} secondary={formatLocation(f)} />
             </li>
           ))}
         </ul>

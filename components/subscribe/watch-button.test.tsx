@@ -24,15 +24,19 @@ describe("buildSubscribePayload", () => {
     });
   });
 
-  it("carries an absent targetId through as undefined (dropped by JSON.stringify)", () => {
-    const payload = buildSubscribePayload("jdoe@example.com", "all", undefined, "");
-    expect(payload.targetId).toBeUndefined();
-    expect(JSON.stringify(payload)).not.toContain("targetId");
+  it("carries the honeypot value through untouched", () => {
+    const payload = buildSubscribePayload("jdoe@example.com", "facility", "facility-1", "bot-filled-this");
+    expect(payload.website).toBe("bot-filled-this");
   });
 
-  it("carries the honeypot value through untouched", () => {
-    const payload = buildSubscribePayload("jdoe@example.com", "state", "TX", "bot-filled-this");
-    expect(payload.website).toBe("bot-filled-this");
+  it("builds a payload for a state target", () => {
+    const payload = buildSubscribePayload("jdoe@example.com", "state", "TX", "");
+    expect(payload).toEqual({
+      email: "jdoe@example.com",
+      targetType: "state",
+      targetId: "TX",
+      website: "",
+    });
   });
 });
 
@@ -58,6 +62,74 @@ describe("WatchButton — structure", () => {
     expect(screen.getByRole("button", { name: "Watch" })).toBeInTheDocument();
   });
 
+  it("renders a state target with its own accessible trigger name and default per-change copy", async () => {
+    const user = userEvent.setup();
+    render(<WatchButton targetType="state" targetId="TX" label="Watch Texas" />);
+
+    expect(screen.getByRole("button", { name: "Watch Texas" })).toBeInTheDocument();
+    // Distinct from the facility trigger's name — no accessible-name collision
+    // if both were ever rendered on the same page.
+    expect(screen.queryByRole("button", { name: "Watch this facility" })).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "Watch Texas" }));
+    expect(
+      screen.getByText("Get an email when this changes. One click to unsubscribe, anytime.")
+    ).toBeInTheDocument();
+  });
+
+  it("overrides the default description copy when one is passed, so a non-immediate cadence (e.g. monthly) is stated explicitly", async () => {
+    const user = userEvent.setup();
+    render(
+      <WatchButton
+        targetType="state"
+        targetId="TX"
+        label="Watch Texas — monthly digest"
+        description="Get a monthly email summarizing what changed in Texas. One click to unsubscribe, anytime."
+      />
+    );
+
+    await user.click(screen.getByRole("button", { name: "Watch Texas — monthly digest" }));
+
+    expect(
+      screen.getByText("Get a monthly email summarizing what changed in Texas. One click to unsubscribe, anytime.")
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByText("Get an email when this changes. One click to unsubscribe, anytime.")
+    ).not.toBeInTheDocument();
+  });
+
+  it("renders a quiet text-scale trigger when quiet is set, keeping a 44px touch target and the accessible name", async () => {
+    render(
+      <WatchButton
+        targetType="facility"
+        targetId="facility-1"
+        label="Watch this facility"
+        quiet
+      />
+    );
+
+    const trigger = screen.getByRole("button", { name: "Watch this facility" });
+    expect(trigger).toHaveClass("min-h-11");
+    expect(trigger).toHaveClass("underline");
+  });
+
+  it("keeps the expanded email form's submit button a real button when quiet is set", async () => {
+    const user = userEvent.setup();
+    render(
+      <WatchButton
+        targetType="facility"
+        targetId="facility-1"
+        label="Watch this facility"
+        quiet
+      />
+    );
+
+    await user.click(screen.getByRole("button", { name: "Watch this facility" }));
+
+    expect(screen.getByRole("button", { name: "Watch" })).toBeInTheDocument();
+    expect(screen.getByLabelText(/^email$/i)).toBeInTheDocument();
+  });
+
   it("keeps the honeypot out of the tab order", async () => {
     const user = userEvent.setup();
     render(<WatchButton targetType="facility" targetId="facility-1" label="Watch this facility" />);
@@ -81,8 +153,8 @@ function mockFetchOnce(response: { ok: boolean; status: number; json: () => Prom
 }
 
 async function openAndFillEmail(user: ReturnType<typeof userEvent.setup>) {
-  render(<WatchButton targetType="state" targetId="TX" label="Watch Texas" />);
-  await user.click(screen.getByRole("button", { name: "Watch Texas" }));
+  render(<WatchButton targetType="facility" targetId="facility-1" label="Watch this facility" />);
+  await user.click(screen.getByRole("button", { name: "Watch this facility" }));
   await user.type(screen.getByLabelText(/^email$/i), "jdoe@example.com");
 }
 
@@ -139,6 +211,24 @@ describe("WatchButton — submit outcomes", () => {
     expect(await screen.findByText(/too many subscriptions/i)).toBeInTheDocument();
   });
 
+  it("surfaces the outage message on 503", async () => {
+    mockFetchOnce({
+      ok: false,
+      status: 503,
+      json: async () => ({ error: "Subscriptions are temporarily unavailable. Please try again later." }),
+    });
+    const user = userEvent.setup();
+    await openAndFillEmail(user);
+
+    await user.click(screen.getByRole("button", { name: "Watch" }));
+
+    // The server distinguishes an outage from rate limiting on purpose; showing
+    // the generic "Something went wrong" here would throw that away.
+    expect(await screen.findByText(/temporarily unavailable/i)).toBeInTheDocument();
+    expect(screen.queryByText(/something went wrong/i)).not.toBeInTheDocument();
+    expect(screen.getByLabelText(/^email$/i)).toBeInTheDocument();
+  });
+
   it("surfaces a generic message on network failure", async () => {
     global.fetch = vi.fn().mockRejectedValue(new Error("network down")) as unknown as typeof fetch;
     const user = userEvent.setup();
@@ -183,8 +273,8 @@ describe("WatchButton — submit outcomes", () => {
     const body = JSON.parse(init.body as string);
     expect(body).toEqual({
       email: "jdoe@example.com",
-      targetType: "state",
-      targetId: "TX",
+      targetType: "facility",
+      targetId: "facility-1",
       website: "",
     });
   });

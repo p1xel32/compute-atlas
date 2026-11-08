@@ -1,0 +1,189 @@
+import { SuggestCorrection } from "@/components/contribute/suggest-correction";
+import { CORRECTABLE_KEYS, type CorrectableKey } from "@/lib/contribute-fields";
+import { QUIET_ACTION_CLASS } from "@/lib/utils";
+
+/**
+ * Print-only nil marker. Every gap prompt below is `print:hidden` — it is an
+ * affordance, useless on paper — which left the printed stat sheet rendering
+ * a bare label over whitespace. On a document meant to be cited, a blank
+ * reads as ZERO rather than UNKNOWN, so print says so explicitly.
+ *
+ * `hidden` is `display: none`, so the marker is absent from the screen
+ * accessibility tree without an `aria-hidden` that would also silence it in
+ * print. Kept quiet on the page — it is a nil marker, not data.
+ * (`text-muted-foreground` is 6.70:1 on parchment; see the contrast note on
+ * SECTION_LINK_CLASS below.)
+ *
+ * ⛔ The print visibility is NOT a `print:inline` utility on this element. It
+ * lives in app/globals.css, scoped under `[data-print-brief]`, because the
+ * marker is the bare words "Not recorded" and only means something where a
+ * `<dt>` prints beside it — i.e. the facility brief. This component also
+ * renders on /gaps, a page whose every row already IS a gap and which has no
+ * `<dt>` anywhere: unscoped, it printed 36 bare markers across 7 pages there
+ * (measured from a real PDF, 2026-09-11). Every other print rule in this
+ * codebase is scoped that way; this was the one exception.
+ *
+ * FIELD-level only, deliberately. It prints inline inside the `<dd>` of a
+ * dt/dd pair, where the `<dt>` already carries the label, so the marker is
+ * the bare words and reads as part of the grid. SECTION-level gaps have no
+ * `<dt>` and each self-naming line printed as its own orphan sentence; they
+ * are consolidated into one line at the foot of the brief instead — see
+ * components/facility/print-gap-summary.tsx.
+ */
+function NotRecorded() {
+  return (
+    <span data-print-nil className="hidden text-muted-foreground">
+      Not recorded
+    </span>
+  );
+}
+
+interface FieldGapPromptProps {
+  /** Raw field key, e.g. "jobs" or "airPermit" — not assumed correctable. */
+  field: string;
+  facilityId: string;
+  facilityName: string;
+  /** Human copy, e.g. "permanent jobs", "the air permit". */
+  label: string;
+  /**
+   * Set when this prompt stands in for a WHOLE group rather than one field —
+   * it replaces the group's heading and list, so there is no `<dt>` beside it
+   * and the print nil renders as a bare "Not recorded" naming nothing.
+   *
+   * The gap is NOT going unreported: the consolidated line at the foot of the
+   * brief (components/facility/print-gap-summary.tsx) already names the group,
+   * so the marker here is a duplicate as well as an orphan. Suppressing it
+   * removes a repetition, never a fact.
+   *
+   * ⛔ Do not "restore" the marker for completeness — an unlabelled nil is the
+   * defect this flag exists to prevent, and it is invisible in review because
+   * it only shows in rendered output (found in a printed PDF, 2026-09-11).
+   */
+  coveredByPrintSummary?: boolean;
+}
+
+/**
+ * The "Know a source for …? Send us a link." invite for a gap with no field of
+ * its own to correct. It opens the correction dialog on "Something else", so
+ * the tip (still source-cited) is sent to the leads intake from right here,
+ * with `label` as the topic, instead of sending the reader to another page.
+ */
+function TipPrompt({
+  facilityId,
+  facilityName,
+  label,
+  className,
+}: {
+  facilityId: string;
+  facilityName: string;
+  label: string;
+  className: string;
+}) {
+  return (
+    <SuggestCorrection
+      facilityId={facilityId}
+      facilityName={facilityName}
+      defaultField="other"
+      topic={label}
+      intent="add"
+      showIntro={false}
+      triggerLabel={`Know a source for ${label} on ${facilityName}? Send us a link.`}
+      // text-left: a <button> centres wrapped text, which the old inline link did not.
+      triggerClassName={`${className} text-left print:hidden`}
+    />
+  );
+}
+
+/**
+ * Turns a silent empty-field gap into a working invite. Eligibility is
+ * derived from membership in the imported CORRECTABLE_KEYS array — never a
+ * second, hand-maintained list — so widening CORRECTABLE_KEYS (the deferred
+ * water/energy/emissions/community/stakeholders fast-follow) lights up the
+ * correction affordance here automatically, with zero changes to this file.
+ */
+export function FieldGapPrompt({
+  field,
+  facilityId,
+  facilityName,
+  label,
+  coveredByPrintSummary = false,
+}: FieldGapPromptProps) {
+  const correctable = (CORRECTABLE_KEYS as readonly string[]).includes(field);
+  // Both branches below carry the same marker, so the decision is made once
+  // here — adding it to only one branch is how half a stat sheet gets printed.
+  const printNil = coveredByPrintSummary ? null : <NotRecorded />;
+
+  if (correctable) {
+    return (
+      <>
+        <SuggestCorrection
+          facilityId={facilityId}
+          facilityName={facilityName}
+          defaultField={field as CorrectableKey}
+          intent="add"
+          showIntro={false}
+          triggerLabel={`Know ${label}?`}
+          triggerClassName={`${QUIET_ACTION_CLASS} text-left print:hidden`}
+        />
+        {printNil}
+      </>
+    );
+  }
+
+  // Not (yet) correctable — offer the tip path instead of promising an edit
+  // the system can't apply automatically.
+  return (
+    <>
+      <TipPrompt
+        facilityId={facilityId}
+        facilityName={facilityName}
+        label={label}
+        className={QUIET_ACTION_CLASS}
+      />
+      {printNil}
+    </>
+  );
+}
+
+interface SectionGapPromptProps {
+  facilityId: string;
+  facilityName: string;
+  /** Human copy, e.g. "economic impact data", "a documented stakeholder". */
+  label: string;
+}
+
+// `text-muted-foreground` (#5C5344 on #F5F1E6) is 6.70:1 — see the contrast
+// audit in app/globals.css. This used to carry `/70` opacity to read
+// quieter than a populated section, but that composited to ~#8A8275 on
+// #F5F1E6 = 3.36:1, below the 4.5:1 AA floor for normal text (WCAG 1.4.3).
+// Full-opacity muted-foreground plus text-xs + italic still reads distinctly
+// quieter than LINK_CLASS (text-sm, non-italic) without sacrificing AA.
+const SECTION_LINK_CLASS =
+  "text-xs italic text-muted-foreground underline underline-offset-4 hover:text-foreground focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring rounded-sm";
+
+/**
+ * Whole-section/whole-group gap — an entire group has no data at all (e.g.
+ * every field in "Economics" is undefined, or a facility has no siting-
+ * context entry), so there is no single field key to target a correction
+ * at. Unlike FieldGapPrompt, this never does an eligibility check and
+ * always offers the tip path (see TipPrompt). Render exactly one per empty group —
+ * never one per hypothetical field inside it, which would be noise — and
+ * keep it visually quieter (smaller, muted, italic) than a populated
+ * section so an empty facility page doesn't read louder than a full one.
+ *
+ * Screen-only, and carries no print nil marker of its own: on paper the
+ * sections it stands in for are named together in one consolidated line
+ * (components/facility/print-gap-summary.tsx). Both read the SAME emptiness
+ * predicates from lib/facility-gaps.ts, so the summary and the sections
+ * cannot drift apart about what is missing.
+ */
+export function SectionGapPrompt({ facilityId, facilityName, label }: SectionGapPromptProps) {
+  return (
+    <TipPrompt
+      facilityId={facilityId}
+      facilityName={facilityName}
+      label={label}
+      className={SECTION_LINK_CLASS}
+    />
+  );
+}

@@ -1,10 +1,19 @@
 import { describe, it, expect } from "vitest";
 import {
   getFacilityMaxMw,
+  countDisclosedCapacity,
+  sortByMaxMwDesc,
   formatCapacity,
   formatLocation,
   formatStatusLabel,
   formatUsdCompact,
+  formatPower,
+  formatRatio,
+  formatMgd,
+  formatTonsPerYear,
+  stripLegalSuffix,
+  isOperatorRedundant,
+  nameConveysType,
 } from "./format";
 import type { DataCenterFacility } from "@/lib/schema";
 
@@ -156,5 +165,244 @@ describe("formatStatusLabel", () => {
 
   it("returns 'Cancelled' for cancelled", () => {
     expect(formatStatusLabel("cancelled")).toBe("Cancelled");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// formatPower
+// ---------------------------------------------------------------------------
+describe("formatPower", () => {
+  it("formats below the GW threshold as whole MW", () => {
+    expect(formatPower(999)).toBe("999 MW");
+  });
+
+  it("formats at the GW threshold as 1.0 GW", () => {
+    expect(formatPower(1000)).toBe("1.0 GW");
+  });
+
+  it("formats above the GW threshold as GW with one decimal", () => {
+    expect(formatPower(2500)).toBe("2.5 GW");
+  });
+
+  it("rounds a fractional MW value below the threshold", () => {
+    expect(formatPower(12.4)).toBe("12 MW");
+  });
+
+  it("rounds a GW tie up even when the binary float sits just below it", () => {
+    // 1450 / 1000 = 1.45, which is 1.4499999999999999556 in binary, so toFixed(1) gave "1.4".
+    expect(formatPower(1450)).toBe("1.5 GW");
+  });
+
+  it("rounds just under a GW tie down", () => {
+    expect(formatPower(1449)).toBe("1.4 GW");
+  });
+
+  it("rounds before the GW threshold, so a value that rounds to 1000 MW reads 1.0 GW, never 1000 MW", () => {
+    expect(formatPower(999.5)).toBe("1.0 GW");
+    expect(formatPower(999.6)).toBe("1.0 GW");
+    expect(formatPower(999.96)).toBe("1.0 GW");
+  });
+
+  it("keeps a value that rounds to 999 MW in MW", () => {
+    expect(formatPower(999.4)).toBe("999 MW");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// formatRatio
+// ---------------------------------------------------------------------------
+describe("formatRatio", () => {
+  it("formats a normal ratio to one decimal", () => {
+    expect(formatRatio(69203, 19372)).toBe("3.6 : 1");
+  });
+
+  it("formats an exact whole-number ratio with a trailing .0", () => {
+    expect(formatRatio(10, 5)).toBe("2.0 : 1");
+  });
+
+  it("returns an em dash when the denominator is zero", () => {
+    expect(formatRatio(100, 0)).toBe("—");
+  });
+
+  it("returns an em dash for a zero numerator and zero denominator", () => {
+    expect(formatRatio(0, 0)).toBe("—");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// formatMgd
+// ---------------------------------------------------------------------------
+describe("formatMgd", () => {
+  it("formats a fractional MGD value with one decimal", () => {
+    expect(formatMgd(3.25)).toBe("3.3 MGD");
+  });
+
+  it("formats a whole MGD value with a trailing .0", () => {
+    expect(formatMgd(10)).toBe("10.0 MGD");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// formatTonsPerYear
+// ---------------------------------------------------------------------------
+describe("formatTonsPerYear", () => {
+  it("formats a fractional tonnage with thousands separators", () => {
+    expect(formatTonsPerYear(245.5)).toBe("245.5 tons/yr");
+  });
+
+  it("formats a large tonnage with thousands separators", () => {
+    expect(formatTonsPerYear(1_250_000)).toBe("1,250,000 tons/yr");
+  });
+
+  // Regression: a permit can legitimately state a 0.0 limit for a pollutant a
+  // unit is prohibited from emitting. Collapsing that to an em dash or empty
+  // string would misreport a real regulatory fact.
+  it("formats 0 as '0 tons/yr', never an em dash or empty string", () => {
+    expect(formatTonsPerYear(0)).toBe("0 tons/yr");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// stripLegalSuffix
+// ---------------------------------------------------------------------------
+describe("stripLegalSuffix", () => {
+  it("strips a comma-separated 'Inc.' suffix", () => {
+    expect(stripLegalSuffix("CleanSpark, Inc.")).toBe("CleanSpark");
+  });
+
+  it("strips a space-separated 'Corporation' suffix", () => {
+    expect(stripLegalSuffix("Applied Digital Corporation")).toBe("Applied Digital");
+  });
+
+  it("strips compound suffixes by looping until stable", () => {
+    expect(stripLegalSuffix("Foo Holdings, LLC")).toBe("Foo");
+  });
+
+  it("leaves a name with no legal suffix unchanged", () => {
+    expect(stripLegalSuffix("Google")).toBe("Google");
+  });
+
+  it("does not strip an unrelated word that merely ends in a suffix-like substring", () => {
+    // "Sunoco" ends in "co" but it's not a comma/space-separated suffix token.
+    expect(stripLegalSuffix("Sunoco")).toBe("Sunoco");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// isOperatorRedundant
+// ---------------------------------------------------------------------------
+describe("isOperatorRedundant", () => {
+  it("is true when the operator (after stripping 'Inc.') is embedded in the name", () => {
+    // Regression: the raw strings share no substring because of ", Inc." —
+    // without suffix-stripping this would be a false negative.
+    expect(
+      isOperatorRedundant("CleanSpark Dalton Bitcoin Mining Facility", "CleanSpark, Inc.")
+    ).toBe(true);
+  });
+
+  it("is true when the operator (after stripping 'Corporation') is embedded in the name", () => {
+    expect(
+      isOperatorRedundant("Applied Digital Polaris Forge 1", "Applied Digital Corporation")
+    ).toBe(true);
+  });
+
+  it("is true when the name is embedded in the operator (reverse direction)", () => {
+    expect(isOperatorRedundant("Google Council Bluffs", "Google")).toBe(true);
+  });
+
+  it("is false for a genuinely distinct name and operator (no over-stripping)", () => {
+    expect(isOperatorRedundant("Colossus", "xAI")).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// nameConveysType
+// ---------------------------------------------------------------------------
+describe("nameConveysType", () => {
+  it("is true for a data_center name containing 'Data Center'", () => {
+    expect(nameConveysType("Meta Prineville Data Center Campus", "data_center")).toBe(true);
+  });
+
+  it("is true for a crypto_mining name containing 'Mining'", () => {
+    expect(
+      nameConveysType("CleanSpark Dalton Bitcoin Mining Facility", "crypto_mining")
+    ).toBe(true);
+  });
+
+  it("is true for a power_generation name containing 'Solar'", () => {
+    expect(nameConveysType("Sunrise Solar Array", "power_generation")).toBe(true);
+  });
+
+  it("is false when the name says nothing about the facility type", () => {
+    expect(nameConveysType("Colossus", "data_center")).toBe(false);
+  });
+
+  // A bare substring test suppressed the type label on any name that merely
+  // CONTAINED a keyword inside a longer word. Zero facilities tripped it when
+  // this shipped, so these pin the behaviour before a future record does.
+  it("is false when a keyword is glued inside a longer word", () => {
+    expect(nameConveysType("Windsor Energy Center", "power_generation")).toBe(false);
+    expect(nameConveysType("Winding Creek Station", "power_generation")).toBe(false);
+    expect(nameConveysType("Minerva Ridge Station", "crypto_mining")).toBe(false);
+    expect(nameConveysType("Solaris Holdings Center", "power_generation")).toBe(false);
+  });
+
+  it("still matches a keyword used as a real word, including plurals", () => {
+    expect(nameConveysType("Sunrise Wind Farm", "power_generation")).toBe(true);
+    expect(nameConveysType("Ark Data Centers Marion", "data_center")).toBe(true);
+    expect(nameConveysType("Compass Datacenters Lauderdale", "data_center")).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// countDisclosedCapacity
+// ---------------------------------------------------------------------------
+describe("countDisclosedCapacity", () => {
+  it("counts facilities that disclose operational or planned capacity", () => {
+    const facilities = [
+      makeFacility({ id: "a", capacityMw: { operational: 150 } }),
+      makeFacility({ id: "b", capacityMw: { planned: 400 } }),
+      makeFacility({ id: "c", capacityMw: undefined }),
+    ];
+    expect(countDisclosedCapacity(facilities)).toBe(2);
+  });
+
+  it("excludes cancelled facilities even when they disclose a capacity figure", () => {
+    const facilities = [
+      makeFacility({ id: "a", status: "cancelled", capacityMw: { planned: 800 } }),
+      makeFacility({ id: "b", status: "operational", capacityMw: { operational: 150 } }),
+    ];
+    expect(countDisclosedCapacity(facilities)).toBe(1);
+  });
+
+  it("returns 0 for an empty list", () => {
+    expect(countDisclosedCapacity([])).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// sortByMaxMwDesc
+// ---------------------------------------------------------------------------
+describe("sortByMaxMwDesc", () => {
+  it("orders facilities by disclosed capacity descending", () => {
+    const small = makeFacility({ id: "small", name: "Small", capacityMw: { operational: 50 } });
+    const large = makeFacility({ id: "large", name: "Large", capacityMw: { operational: 500 } });
+    const mid = makeFacility({ id: "mid", name: "Mid", capacityMw: { planned: 200 } });
+
+    expect([small, large, mid].sort(sortByMaxMwDesc)).toEqual([large, mid, small]);
+  });
+
+  it("sorts undisclosed capacity last", () => {
+    const disclosed = makeFacility({ id: "disclosed", name: "Disclosed", capacityMw: { operational: 10 } });
+    const undisclosed = makeFacility({ id: "undisclosed", name: "Undisclosed", capacityMw: undefined });
+
+    expect([undisclosed, disclosed].sort(sortByMaxMwDesc)).toEqual([disclosed, undisclosed]);
+  });
+
+  it("breaks ties alphabetically by name", () => {
+    const zebra = makeFacility({ id: "z", name: "Zebra Site", capacityMw: { operational: 100 } });
+    const alpha = makeFacility({ id: "a", name: "Alpha Site", capacityMw: { operational: 100 } });
+
+    expect([zebra, alpha].sort(sortByMaxMwDesc)).toEqual([alpha, zebra]);
   });
 });

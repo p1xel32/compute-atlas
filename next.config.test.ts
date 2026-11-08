@@ -1,0 +1,481 @@
+import { existsSync, readFileSync, readdirSync } from "node:fs";
+import { join } from "node:path";
+
+import { describe, expect, it } from "vitest";
+
+import { getPathMatch } from "next/dist/shared/lib/router/utils/path-match";
+import facilities from "@/data/facilities.json";
+import { CSP_REPORT_PATH } from "@/lib/csp-report";
+import { operatorSlug } from "@/lib/operator-slug";
+import { danglingDestinations, shadowedSources } from "@/lib/test-fixtures/redirect-guards";
+import nextConfig from "./next.config";
+
+/**
+ * A chain (one redirect's destination is another's source) costs a crawler
+ * an extra hop and happens when a survivor is itself retired later without
+ * repointing the earlier entries. Returns the offending destination paths.
+ */
+const chainedDestinations = (redirects: { source: string; destination: string }[]) => {
+  const sources = new Set(redirects.map((r) => r.source));
+  return redirects.map((r) => r.destination).filter((dest) => sources.has(dest));
+};
+
+describe("live-slug guard helpers", () => {
+  // The guards themselves; the checks that apply them to next.config's real
+  // redirects are in "retired-facility redirects" and "retired-operator
+  // redirects" below (shadowing) and next.config.dataset.test.ts (dangling).
+  const live = new Set(["survivor", "other"]);
+
+  it("shadowedSources flags a source that is still live", () => {
+    expect(shadowedSources(["retired", "survivor"], live)).toEqual(["survivor"]);
+    expect(shadowedSources(["retired"], live)).toEqual([]);
+  });
+
+  it("danglingDestinations flags a destination that is not live", () => {
+    expect(danglingDestinations(["survivor", "gone"], live)).toEqual(["gone"]);
+    expect(danglingDestinations(["survivor", "other"], live)).toEqual([]);
+  });
+});
+
+describe("chainedDestinations", () => {
+  it("detects a chained pair when one is present", () => {
+    expect(
+      chainedDestinations([
+        { source: "/facilities/a", destination: "/facilities/b" },
+        { source: "/facilities/b", destination: "/facilities/c" },
+      ])
+    ).toEqual(["/facilities/b"]);
+  });
+
+  it("returns nothing when no destination is also a source", () => {
+    expect(
+      chainedDestinations([
+        { source: "/facilities/a", destination: "/facilities/c" },
+        { source: "/facilities/b", destination: "/facilities/c" },
+      ])
+    ).toEqual([]);
+  });
+});
+
+/**
+ * Guards the retired-facility redirect list in `next.config.ts`.
+ *
+ * Both live-slug assertions have a real failure mode, and neither is satisfied
+ * by the list simply existing. The shadowing check runs here against the
+ * fixture ids (valid on any dataset); the dangling check needs the real
+ * dataset, because the survivors are absent from the fixture, and lives in
+ * next.config.dataset.test.ts:
+ *
+ * - A `source` that is a LIVE facility slug would shadow that facility's page,
+ *   because Next applies redirects before routing. The facility would silently
+ *   become unreachable.
+ * - A `destination` that is NOT a live facility slug redirects one 404 to
+ *   another, which is worse than the plain 404 it replaced — and this is the
+ *   likely failure over time, since a destination can itself be retired later.
+ */
+describe("retired-facility redirects", () => {
+  const liveSlugs = new Set((facilities as { id: string }[]).map((f) => f.id));
+  const slugOf = (path: string) => path.replace("/facilities/", "");
+
+  const facilityRedirects = async () => {
+    const all = (await nextConfig.redirects?.()) ?? [];
+    return all.filter((r) => r.source.startsWith("/facilities/"));
+  };
+
+  it("never redirects away from a slug that is still a live facility (fixture ids)", async () => {
+    const redirects = await facilityRedirects();
+    expect(redirects.length).toBeGreaterThan(0);
+    expect(shadowedSources(redirects.map((r) => slugOf(r.source)), liveSlugs)).toEqual([]);
+  });
+
+  it("marks retired-facility redirects permanent so link equity carries over", async () => {
+    for (const redirect of await facilityRedirects()) {
+      expect(redirect.permanent, `${redirect.source} should be permanent`).toBe(true);
+    }
+  });
+
+  /**
+   * The generic checks above only fail if an entry points at a dead or
+   * shadowing slug — they don't fail if the entry disappears entirely, since
+   * "for every entry" is vacuously true over an empty list. Retired
+   * 2026-09-27: galaxy-helios-dickens-tx duplicated
+   * galaxy-helios-dickens-county-tx (same Galaxy Digital Helios campus,
+   * Afton, Dickens County, TX); the county-tx slug holds the search equity
+   * and was kept as the survivor.
+   */
+  it("redirects the duplicate galaxy-helios-dickens-tx slug to its survivor", async () => {
+    const redirect = (await facilityRedirects()).find(
+      (r) => r.source === "/facilities/galaxy-helios-dickens-tx"
+    );
+    expect(redirect?.destination).toBe("/facilities/galaxy-helios-dickens-county-tx");
+  });
+
+  /**
+   * Retired 2026-10-16: lancium-crusoe-abilene-tx duplicated
+   * stargate-abilene-tx (same Crusoe / Lancium Clean Campus, Abilene, TX);
+   * the stargate slug was indexed at the 2026-09-26 inspection and was kept
+   * as the survivor.
+   */
+  it("redirects the duplicate lancium-crusoe-abilene-tx slug to its survivor", async () => {
+    const redirect = (await facilityRedirects()).find(
+      (r) => r.source === "/facilities/lancium-crusoe-abilene-tx"
+    );
+    expect(redirect?.destination).toBe("/facilities/stargate-abilene-tx");
+  });
+
+  /**
+   * Retired 2026-10-21: xai-southaven-ms duplicated
+   * xai-macrohardrr-southaven-ms (same xAI data center, Southaven, MS).
+   */
+  it("redirects the duplicate xai-southaven-ms slug to its survivor", async () => {
+    const redirect = (await facilityRedirects()).find(
+      (r) => r.source === "/facilities/xai-southaven-ms"
+    );
+    expect(redirect?.destination).toBe("/facilities/xai-macrohardrr-southaven-ms");
+  });
+
+  it("never chains a redirect source into another redirect's destination", async () => {
+    expect(chainedDestinations(await facilityRedirects())).toEqual([]);
+  });
+});
+
+/**
+ * Guards the retired-operator redirect list in `next.config.ts`.
+ *
+ * Mirrors the retired-facility guards above, plus one more: operator slugs
+ * are DERIVED (via `operatorSlug()`), not hand-assigned like facility ids, so
+ * a redirect chain (a source that is also some other redirect's destination)
+ * is a real failure mode here in a way it isn't for facilities — a future
+ * curation edit could easily add a new retirement pointing at an already-
+ * retired slug instead of the live one.
+ */
+describe("retired-operator redirects", () => {
+  const liveOperatorSlugs = new Set(
+    (facilities as { operator: string }[]).map((f) => operatorSlug(f.operator))
+  );
+  const slugOf = (path: string) => path.replace("/operators/", "");
+
+  const operatorRedirects = async () => {
+    const all = (await nextConfig.redirects?.()) ?? [];
+    return all.filter((r) => r.source.startsWith("/operators/"));
+  };
+
+  it("never redirects away from a slug that is still a live operator (fixture operators)", async () => {
+    const redirects = await operatorRedirects();
+    expect(redirects.length).toBeGreaterThan(0);
+    expect(shadowedSources(redirects.map((r) => slugOf(r.source)), liveOperatorSlugs)).toEqual([]);
+  });
+
+  it("marks retired-operator redirects permanent so link equity carries over", async () => {
+    for (const redirect of await operatorRedirects()) {
+      expect(redirect.permanent, `${redirect.source} should be permanent`).toBe(true);
+    }
+  });
+
+  it("never chains a redirect source into another redirect's destination", async () => {
+    expect(chainedDestinations(await operatorRedirects())).toEqual([]);
+  });
+});
+
+/**
+ * Guards the enforcing CSP in `next.config.ts` (issue #236, flipped
+ * 2026-09-07).
+ *
+ * Deliberately does NOT snapshot the full header value — that would make
+ * the test fail on every legitimate new map-tile host added later. Instead
+ * it checks presence plus a small, meaningful sample of directives: that
+ * defaults are locked down, plugins are disabled, and the policy names real
+ * evidenced origins rather than a wildcard.
+ */
+describe("Content-Security-Policy header", () => {
+  const headerOn = async (source: string, key: string) => {
+    const all = (await nextConfig.headers?.()) ?? [];
+    return all.find((rule) => rule.source === source)?.headers.find((h) => h.key === key);
+  };
+
+  const siteWideCsp = () => headerOn("/:path*", "Content-Security-Policy");
+
+  it("is present on the site-wide header rule", async () => {
+    expect(await siteWideCsp()).toBeDefined();
+  });
+
+  /**
+   * The whole point of #236 was to stop *reporting* violations and start
+   * blocking them. A regression that reintroduced the `-Report-Only` suffix
+   * would leave every other assertion in this file passing while the policy
+   * did nothing at all — the failure is invisible unless named explicitly.
+   */
+  it("enforces rather than only reporting", async () => {
+    expect(await headerOn("/:path*", "Content-Security-Policy-Report-Only")).toBeUndefined();
+  });
+
+  it("locks down defaults and disables plugins", async () => {
+    const csp = await siteWideCsp();
+    expect(csp?.value).toContain("default-src 'self'");
+    expect(csp?.value).toContain("object-src 'none'");
+  });
+
+  it("allowlists the map's real external origins, not a wildcard", async () => {
+    const csp = await siteWideCsp();
+    expect(csp?.value).toContain("nominatim.openstreetmap.org");
+    expect(csp?.value).not.toContain("*");
+  });
+
+  /**
+   * `frame-src` must stay stated OUTRIGHT. Its fallback chain is `child-src`
+   * first and `default-src` only after that — so with `child-src blob:` in
+   * the policy and no `frame-src` entry, framing silently resolved to
+   * `blob:` alone: same-origin iframes blocked, `blob:` iframes permitted.
+   * That is the inverse of what `default-src 'self'` reads as, and under the
+   * previous report-only header it never blocked anything, so nothing would
+   * have surfaced it. Confirmed in a browser against a real enforcing build,
+   * which reported `frame-src -> /table` for an appended same-origin iframe.
+   *
+   * Deleting this directive is therefore not a simplification — it is a
+   * behaviour change that this assertion exists to stop.
+   */
+  it("states frame-src explicitly rather than inheriting the child-src fallback", async () => {
+    const csp = await siteWideCsp();
+    expect(csp?.value).toContain("frame-src 'none'");
+    // The trap only exists because `child-src` is present; if that is ever
+    // dropped, this test's rationale changes and should be re-read.
+    expect(csp?.value).toContain("child-src blob:");
+  });
+
+  /**
+   * `report-uri` pointing anywhere but the route that exists produces an
+   * endpoint nothing ever posts to — which presents exactly like a site with
+   * no violations. Asserting against the shared constant (which the route
+   * directory is named for) is what keeps the producer and the receiver from
+   * drifting apart.
+   */
+  it("routes violation reports to the endpoint that actually exists", async () => {
+    const csp = await siteWideCsp();
+    expect(csp?.value).toContain(`report-uri ${CSP_REPORT_PATH}`);
+    expect(existsSync(join(process.cwd(), "app", CSP_REPORT_PATH, "route.ts"))).toBe(true);
+  });
+
+  /**
+   * Regression guard for the one genuine security regression the flip could
+   * have introduced. Per spec, a browser honouring an enforcing
+   * `frame-ancestors` ignores `X-Frame-Options` entirely — so a site-wide
+   * `frame-ancestors 'self'` with no admin override would silently demote
+   * `/admin/*` from its `X-Frame-Options: DENY` to same-origin framing.
+   * Under the previous report-only header this directive was inert, so the
+   * downgrade could only ever appear at the moment of the flip.
+   */
+  describe("admin framing", () => {
+    it("keeps the site-wide policy at same-origin framing", async () => {
+      expect((await siteWideCsp())?.value).toContain("frame-ancestors 'self'");
+    });
+
+    it("blocks framing outright on /admin, not merely same-origin", async () => {
+      const adminCsp = await headerOn("/admin/:path*", "Content-Security-Policy");
+      expect(adminCsp, "/admin must override the site-wide frame-ancestors").toBeDefined();
+      expect(adminCsp?.value).toContain("frame-ancestors 'none'");
+      expect(adminCsp?.value).not.toContain("frame-ancestors 'self'");
+    });
+
+    it("still sends X-Frame-Options: DENY for pre-CSP-Level-2 browsers", async () => {
+      expect((await headerOn("/admin/:path*", "X-Frame-Options"))?.value).toBe("DENY");
+    });
+
+    /**
+     * Header rules replace by key rather than merging directives, so the
+     * admin value must be a COMPLETE policy. Overriding with the one
+     * differing directive would drop `default-src`, `object-src` and the
+     * rest on precisely the site's most sensitive routes.
+     */
+    it("restates the full policy on /admin rather than one directive", async () => {
+      const adminCsp = await headerOn("/admin/:path*", "Content-Security-Policy");
+      expect(adminCsp?.value).toContain("default-src 'self'");
+      expect(adminCsp?.value).toContain("object-src 'none'");
+      expect(adminCsp?.value).toContain(`report-uri ${CSP_REPORT_PATH}`);
+    });
+  });
+});
+
+/**
+ * Guards the baseline security headers other than the CSP (added 2026-09-27
+ * after a live sweep measured `Permissions-Policy` and
+ * `Cross-Origin-Opener-Policy` absent on all five route shapes tested — a flat
+ * gap, not a coverage gap).
+ *
+ * Two of these assertions guard an ABSENCE, which is the unusual direction and
+ * the reason this block exists at all: `Cross-Origin-Embedder-Policy` and a
+ * blanket `Cross-Origin-Resource-Policy` are exactly the headers a future
+ * "harden the headers" pass would reach for, and both would break something
+ * this site deliberately supports. A test is the only place that reasoning
+ * survives being re-derived from a checklist.
+ */
+describe("baseline security headers", () => {
+  const allRules = async () => (await nextConfig.headers?.()) ?? [];
+
+  const baselineHeader = async (key: string) => {
+    const all = await allRules();
+    return all.find((rule) => rule.source === "/:path*")?.headers.find((h) => h.key === key);
+  };
+
+  const headerOnAnyRule = async (key: string) => {
+    const all = await allRules();
+    return all.flatMap((rule) =>
+      rule.headers.filter((h) => h.key.toLowerCase() === key.toLowerCase()).map((h) => ({
+        source: rule.source,
+        value: h.value,
+      }))
+    );
+  };
+
+  describe("Permissions-Policy", () => {
+    it("is present on the site-wide rule", async () => {
+      expect(await baselineHeader("Permissions-Policy")).toBeDefined();
+    });
+
+    it("denies the powerful features the app never uses", async () => {
+      const value = (await baselineHeader("Permissions-Policy"))?.value ?? "";
+      for (const feature of ["camera", "microphone", "payment", "usb"]) {
+        expect(value, `${feature} should carry an empty allowlist`).toContain(`${feature}=()`);
+      }
+    });
+
+    /**
+     * `geolocation=()` is an assertion about the app, not a safe default — an
+     * empty allowlist makes `navigator.geolocation` REJECT rather than prompt,
+     * so a "locate me" control added to the map later would fail silently with
+     * nothing but a console error to show for it.
+     *
+     * Written as a biconditional on purpose. Asserting only "the header says
+     * `geolocation=()`" would be a tautology over a constant in the file next
+     * door; asserting only "no source uses geolocation" would not fail if the
+     * header were loosened for no reason. This fails in BOTH directions: add a
+     * geolocation caller without loosening the header and it goes red, loosen
+     * the header without a caller and it also goes red.
+     */
+    it("keeps geolocation denied exactly as long as no source asks for a position", async () => {
+      const apiMarkers = ["getCurrentPosition", "watchPosition", "GeolocateControl"];
+      const sourceRoots = ["app", "components", "lib"];
+
+      const walk = (dir: string): string[] =>
+        readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
+          const full = join(dir, entry.name);
+          if (entry.isDirectory()) return walk(full);
+          return /\.tsx?$/.test(entry.name) && !/\.test\.tsx?$/.test(entry.name) ? [full] : [];
+        });
+
+      const callers = sourceRoots
+        .flatMap((root) => walk(join(process.cwd(), root)))
+        .filter((file) => {
+          const text = readFileSync(file, "utf8");
+          return apiMarkers.some((marker) => text.includes(marker));
+        });
+
+      const value = (await baselineHeader("Permissions-Policy"))?.value ?? "";
+
+      if (callers.length === 0) {
+        expect(value, "no source uses the Geolocation API, so it must stay denied").toContain(
+          "geolocation=()"
+        );
+      } else {
+        expect(
+          value,
+          `${callers.join(", ")} uses the Geolocation API — the header must allow it (self)`
+        ).toContain("geolocation=(self)");
+      }
+    });
+  });
+
+  describe("Cross-Origin-Opener-Policy", () => {
+    it("isolates the browsing context on the site-wide rule", async () => {
+      expect((await baselineHeader("Cross-Origin-Opener-Policy"))?.value).toBe("same-origin");
+    });
+  });
+
+  /**
+   * MapLibre loads vector tiles/glyphs/sprites from tiles.openfreemap.org and
+   * satellite rasters from services.arcgisonline.com. Neither sends
+   * `Cross-Origin-Resource-Policy`, so a COEP of `require-corp` would block
+   * both and render an empty map — a total failure of the site's primary
+   * surface, from a header that looks like pure hardening in review.
+   */
+  it("sets no Cross-Origin-Embedder-Policy, which would block the map's tile hosts", async () => {
+    expect(await headerOnAnyRule("Cross-Origin-Embedder-Policy")).toEqual([]);
+  });
+
+  /**
+   * `/data/*.geojson` is CC-BY-4.0 and meant to be hotlinked, `/embed/*` exists
+   * to be iframed by unknown third parties, and the public read API advertises
+   * `Access-Control-Allow-Origin: *`. A blanket `same-origin` CORP breaks all
+   * three silently — the asset still returns 200 and the embedder sees nothing.
+   *
+   * Asserted across EVERY rule rather than just the baseline one: a CORP added
+   * to `/data/:path+` would be the more likely mistake, and checking only
+   * `/:path*` would miss it.
+   */
+  it("sets no blanket Cross-Origin-Resource-Policy, which would break dataset reuse", async () => {
+    expect(await headerOnAnyRule("Cross-Origin-Resource-Policy")).toEqual([]);
+  });
+});
+
+/**
+ * Guards the static-asset `Cache-Control` rules (`/data`, `/basemap`) against
+ * shadowing a real app route.
+ *
+ * `getPathMatch` is Next's OWN compiled route matcher
+ * (`next/dist/shared/lib/router/utils/path-match`, the same function
+ * `headers()`/`redirects()`/`rewrites()` sources are compiled with) — not the
+ * top-level `path-to-regexp` package, whose v8 syntax is incompatible and
+ * throws on `:path*`/`:path+` entirely. Using anything else risks asserting
+ * on behaviour Next.js doesn't actually implement.
+ *
+ * The real failure mode: `:path*` matches zero-or-more segments, so
+ * `/data/:path*` also matches the bare `/data` route — a real page
+ * (`app/data/page.tsx`), not just a prefix for files under `public/data/`.
+ * That shadowed the page with an 86400s edge cache and a 604800s
+ * stale-while-revalidate tail (shipped to prod, caught 2026-09-05: the page
+ * served a stale record count for a full day). `:path+` requires at least
+ * one segment, which excludes the bare route while still matching real
+ * asset paths.
+ */
+describe("asset-cache headers don't shadow app routes", () => {
+  const assetCacheRules = async () => {
+    const all = (await nextConfig.headers?.()) ?? [];
+    // Identify the asset rules by their distinctive day-long edge TTL rather
+    // than by hardcoding "/data/:path+" — that would pass even if the fix
+    // were reverted to ":path*", since the string itself never changes.
+    return all.filter((rule) =>
+      rule.headers.some(
+        (h) => h.key === "Cache-Control" && h.value.includes("s-maxage=86400")
+      )
+    );
+  };
+
+  it("does not apply the day-long asset cache to the bare /data route", async () => {
+    for (const rule of await assetCacheRules()) {
+      const matches = getPathMatch(rule.source);
+      expect(matches("/data"), `${rule.source} should not match bare /data`).toBe(
+        false
+      );
+    }
+  });
+
+  it("still applies the asset cache to real files under /data", async () => {
+    const rules = await assetCacheRules();
+    const dataRule = rules.find((r) => r.source.startsWith("/data/"));
+    expect(dataRule, "expected a /data asset-cache rule to exist").toBeDefined();
+
+    const matches = getPathMatch(dataRule!.source);
+    expect(matches("/data/water.geojson")).not.toBe(false);
+  });
+
+  it("does not apply an asset-cache header to other real app routes", async () => {
+    const rules = await assetCacheRules();
+    for (const path of ["/", "/stats"]) {
+      for (const rule of rules) {
+        const matches = getPathMatch(rule.source);
+        expect(matches(path), `${rule.source} should not match ${path}`).toBe(
+          false
+        );
+      }
+    }
+  });
+});

@@ -1,0 +1,769 @@
+import { vi, describe, it, expect, beforeEach } from "vitest";
+import { render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+
+import type { AdminLeadRow, LeadSubmissionOutcome } from "@/lib/leads";
+import { type LeadStatus } from "@/lib/lead-fields";
+
+// vi.mock calls are hoisted above imports by Vitest. A plain top-level
+// `const mockX = vi.fn()` is NOT reliably safe to reference inside a
+// vi.mock factory once the mocked module chain imports multiple mocked
+// specifiers — route shared mocks through vi.hoisted() so initialization
+// is hoisted alongside the vi.mock calls themselves, matching
+// app/admin/submissions/submission-list.test.tsx.
+const {
+  mockPush,
+  mockRefresh,
+  mockToastSuccess,
+  mockToastError,
+  mockToastWarning,
+  mockMarkResearching,
+  mockStage,
+  mockDismiss,
+  mockResetToNew,
+} = vi.hoisted(() => ({
+  mockPush: vi.fn(),
+  mockRefresh: vi.fn(),
+  mockToastSuccess: vi.fn(),
+  mockToastError: vi.fn(),
+  mockToastWarning: vi.fn(),
+  mockMarkResearching: vi.fn(),
+  mockStage: vi.fn(),
+  mockDismiss: vi.fn(),
+  mockResetToNew: vi.fn(),
+}));
+
+vi.mock("next/navigation", () => ({
+  useRouter: () => ({ push: mockPush, refresh: mockRefresh }),
+}));
+
+vi.mock("sonner", () => ({
+  toast: {
+    success: mockToastSuccess,
+    error: mockToastError,
+    warning: mockToastWarning,
+  },
+}));
+
+vi.mock("./actions", () => ({
+  markLeadResearchingAction: mockMarkResearching,
+  stageLeadSubmissionAction: mockStage,
+  dismissLeadAction: mockDismiss,
+  resetLeadToNewAction: mockResetToNew,
+}));
+
+import { LeadList } from "./lead-list";
+
+function makeLead(overrides: Partial<AdminLeadRow> = {}): AdminLeadRow {
+  return {
+    id: "lead-1",
+    createdAt: new Date("2026-07-01T00:00:00Z"),
+    url: "https://example.com/tip",
+    note: "Saw excavators on the site",
+    attribution: "A Local",
+    status: "new",
+    triage: null,
+    reviewNote: null,
+    reviewedAt: null,
+    promotedSubmissionId: null,
+    ...overrides,
+  };
+}
+
+function renderList(
+  leads: AdminLeadRow[],
+  activeStatus: LeadStatus,
+  outcomes: Record<string, LeadSubmissionOutcome[]> = {}
+) {
+  return render(<LeadList leads={leads} activeStatus={activeStatus} outcomes={outcomes} />);
+}
+
+describe("LeadList — tabs and empty state", () => {
+  beforeEach(() => {
+    mockPush.mockClear();
+    mockRefresh.mockClear();
+  });
+
+  it("renders a tab for every lead status, in LEAD_STATUSES order", () => {
+    renderList([], "new");
+    expect(screen.getByRole("tab", { name: "New" })).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "Researching" })).toBeInTheDocument();
+    // `deferred` is the lane's own give-up state; it needs a queue a human
+    // can actually find, or the lane's failures are invisible.
+    expect(screen.getByRole("tab", { name: "Deferred" })).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "Promoted" })).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "Dismissed" })).toBeInTheDocument();
+
+    // Literal, NOT `LEAD_STATUSES.map(...)`: asserting the rendered order
+    // against the same constant that produces it cannot fail on a reorder.
+    // The tab order is the admin's workflow order, so pin it explicitly.
+    const tabNames = screen.getAllByRole("tab").map((tab) => tab.textContent);
+    expect(tabNames).toEqual(["New", "Researching", "Deferred", "Promoted", "Dismissed"]);
+  });
+
+  it("shows an empty-state message when there are no leads for the active tab", () => {
+    renderList([], "new");
+    expect(screen.getByText("No new leads.")).toBeInTheDocument();
+  });
+
+  it("navigates via router.push when a different tab is selected", async () => {
+    const user = userEvent.setup();
+    renderList([], "new");
+
+    await user.click(screen.getByRole("tab", { name: "Researching" }));
+
+    expect(mockPush).toHaveBeenCalledWith("/admin/leads?status=researching");
+  });
+});
+
+describe("LeadList — row rendering", () => {
+  it("renders the URL as a link, note, attribution, and createdAt", () => {
+    renderList([makeLead()], "new");
+
+    const link = screen.getByRole("link", { name: /https:\/\/example\.com\/tip \(opens in new tab\)/ });
+    expect(link).toHaveAttribute("href", "https://example.com/tip");
+    expect(link).toHaveAttribute("target", "_blank");
+    expect(link).toHaveAttribute("rel", "noreferrer noopener");
+    expect(screen.getByText("Saw excavators on the site")).toBeInTheDocument();
+    expect(screen.getByText(/A Local/)).toBeInTheDocument();
+  });
+
+  it('falls back to "anonymous" when attribution is missing', () => {
+    renderList([makeLead({ attribution: null })], "new");
+    expect(screen.getByText(/anonymous/)).toBeInTheDocument();
+  });
+
+  it('renders "Not checked yet" for a null triage, without any error styling', () => {
+    renderList([makeLead({ triage: null })], "new");
+
+    const status = screen.getByText("Not checked yet");
+    expect(status).toBeInTheDocument();
+    // A null triage means the fetch hadn't completed — must never render
+    // with the same destructive-text class used for an actual unreachable
+    // result below.
+    expect(status.closest("p")).not.toHaveClass("text-destructive");
+  });
+
+  it("renders an unreachable triage result with its error and http status", () => {
+    renderList(
+      [
+        makeLead({
+          triage: {
+            fetchedAt: "2026-08-19T00:00:00Z",
+            ok: false,
+            httpStatus: 404,
+            error: "Not Found",
+          },
+        }),
+      ],
+      "new"
+    );
+
+    expect(screen.getByText(/Source unreachable/)).toBeInTheDocument();
+    expect(screen.getByText(/HTTP 404/)).toBeInTheDocument();
+    expect(screen.getByText("Not Found")).toBeInTheDocument();
+  });
+
+  it("renders a reachable triage result with title, and flags a redirect to a different finalUrl", () => {
+    renderList(
+      [
+        makeLead({
+          url: "https://example.com/tip",
+          triage: {
+            fetchedAt: "2026-08-19T00:00:00Z",
+            ok: true,
+            httpStatus: 200,
+            title: "New Data Center Announced",
+            finalUrl: "https://example.com/tip/redirected",
+          },
+        }),
+      ],
+      "new"
+    );
+
+    expect(screen.getByText(/Reachable/)).toBeInTheDocument();
+    expect(screen.getByText(/New Data Center Announced/)).toBeInTheDocument();
+    expect(screen.getByText(/Redirected to/)).toBeInTheDocument();
+    expect(
+      screen.getByRole("link", { name: /https:\/\/example\.com\/tip\/redirected \(opens in new tab\)/ })
+    ).toBeInTheDocument();
+  });
+
+  it("does not flag a redirect when finalUrl matches the submitted url", () => {
+    renderList(
+      [
+        makeLead({
+          url: "https://example.com/tip",
+          triage: {
+            fetchedAt: "2026-08-19T00:00:00Z",
+            ok: true,
+            httpStatus: 200,
+            finalUrl: "https://example.com/tip",
+          },
+        }),
+      ],
+      "new"
+    );
+
+    expect(screen.queryByText(/Redirected to/)).not.toBeInTheDocument();
+  });
+
+  it("surfaces duplicateFacilityIds prominently as links to /facilities/<id>", () => {
+    renderList(
+      [
+        makeLead({
+          triage: {
+            fetchedAt: "2026-08-19T00:00:00Z",
+            ok: true,
+            duplicateFacilityIds: ["existing-site-1"],
+          },
+        }),
+      ],
+      "new"
+    );
+
+    expect(screen.getByText(/Possible duplicate/)).toBeInTheDocument();
+    const dupLink = screen.getByRole("link", {
+      name: /View existing facility existing-site-1 \(opens in new tab\)/,
+    });
+    expect(dupLink).toHaveAttribute("href", "/facilities/existing-site-1");
+  });
+
+  it("escapes attacker-controlled triage.title as plain text and never creates a live element from it", () => {
+    // Guards the security requirement: triage fields are scraped from an
+    // arbitrary public page and must render only as escaped JSX text.
+    const payload = "<img src=x onerror=alert(1)>";
+    renderList(
+      [
+        makeLead({
+          triage: {
+            fetchedAt: "2026-08-19T00:00:00Z",
+            ok: true,
+            httpStatus: 200,
+            title: payload,
+          },
+        }),
+      ],
+      "new"
+    );
+
+    // The text is visible verbatim...
+    expect(screen.getByText(new RegExp(payload.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")))).toBeInTheDocument();
+    // ...but never parsed into a live <img> element.
+    expect(document.querySelector("img")).not.toBeInTheDocument();
+  });
+
+  it("does not show forward status actions for a terminal (promoted) lead", () => {
+    renderList([makeLead({ status: "promoted" })], "promoted");
+
+    expect(screen.queryByRole("button", { name: "Start researching" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Mark promoted (no submission)" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Dismiss" })).not.toBeInTheDocument();
+  });
+
+  it("shows only Stage / Dismiss (not Start researching) for a researching lead", () => {
+    renderList([makeLead({ status: "researching" })], "researching");
+
+    expect(screen.queryByRole("button", { name: "Start researching" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Stage as submission" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Dismiss" })).toBeInTheDocument();
+  });
+});
+
+// `lead.url` is intake-validated — `httpUrlSchema` rejects every non-http(s)
+// scheme before `createLead` writes a row — so these payloads cannot reach the
+// admin UI today. That is exactly why the render guard needs its own test: the
+// schema lives in another module, nothing in this file would fail if it were
+// loosened, and a `javascript:` href here is stored XSS in the admin UI.
+describe("LeadList — lead.url render guard (defence in depth)", () => {
+  it("renders an http(s) lead url as a link", () => {
+    renderList([makeLead({ url: "https://example.com/tip" })], "new");
+
+    const link = screen.getByRole("link", {
+      name: /https:\/\/example\.com\/tip \(opens in new tab\)/,
+    });
+    expect(link).toHaveAttribute("href", "https://example.com/tip");
+  });
+
+  // One case per scheme family rather than a loop: a failure names the scheme
+  // that regressed, and the guard is asserted to be general, not
+  // `javascript:`-specific.
+  it.each([
+    ["javascript:", "javascript:alert(1)"],
+    ["data:", "data:text/html,<script>alert(1)</script>"],
+    ["vbscript:", "vbscript:msgbox(1)"],
+  ])("renders a %s lead url as text, never as a link", (_scheme, hostileUrl) => {
+    renderList([makeLead({ url: hostileUrl })], "new");
+
+    // The load-bearing assertion is the accessible-name one: it is the only
+    // check that bites for all three schemes. Measured against the guard
+    // removed — React 19 rewrites a `javascript:` href to its own
+    // "React has blocked a javascript: URL" throw, so the href-equality
+    // assertion below passes for that scheme with no guard at all, while
+    // `data:` and `vbscript:` hrefs are emitted verbatim. Keep both, and do
+    // not read the href check as covering `javascript:`.
+    //
+    // A getByText on the payload would also pass with OR without the guard —
+    // an anchor's text child matches too — so it stands in for neither.
+    const escaped = hostileUrl.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    expect(screen.queryByRole("link", { name: new RegExp(escaped) })).not.toBeInTheDocument();
+    expect(
+      [...document.querySelectorAll("a")].map((anchor) => anchor.getAttribute("href"))
+    ).not.toContain(hostileUrl);
+    // No anchor at all in the row: the only other link sources are duplicate
+    // facility ids and a triage finalUrl, neither of which this lead has.
+    expect(screen.queryAllByRole("link")).toHaveLength(0);
+    // The url is still shown to the admin, just inert.
+    expect(screen.getByText(hostileUrl)).toBeInTheDocument();
+  });
+});
+
+// The discovery lane queues `listLeadsForAdmin("new")` and nothing else, so
+// every status transition the UI offers removes a lead from that queue
+// permanently. "Return to new" is the only way back, and it MUST reach the
+// terminal statuses — a promoted/dismissed lead previously rendered no
+// buttons at all and needed a hand-written Neon UPDATE to recover.
+describe("LeadList — return to new (lane-queue escape hatch)", () => {
+  beforeEach(() => {
+    mockResetToNew.mockClear();
+    mockToastSuccess.mockClear();
+    mockToastError.mockClear();
+    mockRefresh.mockClear();
+  });
+
+  it("renders Return to new for a researching lead", () => {
+    renderList([makeLead({ status: "researching" })], "researching");
+    expect(screen.getByRole("button", { name: "Return to new" })).toBeInTheDocument();
+  });
+
+  it("renders Return to new for a dismissed lead", () => {
+    renderList([makeLead({ status: "dismissed" })], "dismissed");
+    expect(screen.getByRole("button", { name: "Return to new" })).toBeInTheDocument();
+  });
+
+  it("renders Return to new for a promoted lead", () => {
+    renderList([makeLead({ status: "promoted" })], "promoted");
+    expect(screen.getByRole("button", { name: "Return to new" })).toBeInTheDocument();
+  });
+
+  it("does not render Return to new for a lead already in new", () => {
+    renderList([makeLead({ status: "new" })], "new");
+    expect(screen.queryByRole("button", { name: "Return to new" })).not.toBeInTheDocument();
+  });
+
+  it("calls resetLeadToNewAction and refreshes on success", async () => {
+    mockResetToNew.mockResolvedValue({ ok: true });
+    const user = userEvent.setup();
+    renderList([makeLead({ status: "dismissed" })], "dismissed");
+
+    await user.click(screen.getByRole("button", { name: "Return to new" }));
+
+    await waitFor(() => expect(mockResetToNew).toHaveBeenCalledWith("lead-1"));
+    await waitFor(() => expect(mockToastSuccess).toHaveBeenCalledWith("Returned to new."));
+    expect(mockRefresh).toHaveBeenCalled();
+  });
+
+  it("shows an error toast and does not refresh when the reset fails", async () => {
+    mockResetToNew.mockResolvedValue({ ok: false, status: 409, error: "Lead already new" });
+    const user = userEvent.setup();
+    renderList([makeLead({ status: "promoted" })], "promoted");
+
+    await user.click(screen.getByRole("button", { name: "Return to new" }));
+
+    await waitFor(() => expect(mockToastError).toHaveBeenCalledWith("Lead already new"));
+    expect(mockRefresh).not.toHaveBeenCalled();
+  });
+});
+
+describe("LeadList — promoted-without-submission warning", () => {
+  it("warns when a promoted lead has no promotedSubmissionId", () => {
+    renderList([makeLead({ status: "promoted", promotedSubmissionId: null })], "promoted");
+
+    expect(
+      screen.getByText("Marked promoted manually — no submission was created.")
+    ).toBeInTheDocument();
+  });
+
+  it("does not warn when the promoted lead has a submission behind it", () => {
+    renderList([makeLead({ status: "promoted", promotedSubmissionId: "sub-1" })], "promoted");
+
+    expect(screen.queryByText(/no submission was created/)).not.toBeInTheDocument();
+  });
+
+  it("does not warn for a dismissed lead with no submission id", () => {
+    renderList([makeLead({ status: "dismissed", promotedSubmissionId: null })], "dismissed");
+
+    expect(screen.queryByText(/no submission was created/)).not.toBeInTheDocument();
+  });
+});
+
+describe("LeadList — status actions", () => {
+  beforeEach(() => {
+    mockMarkResearching.mockClear();
+    mockDismiss.mockClear();
+    mockToastSuccess.mockClear();
+    mockToastError.mockClear();
+    mockRefresh.mockClear();
+  });
+
+  it("calls markLeadResearchingAction and refreshes on success", async () => {
+    mockMarkResearching.mockResolvedValue({ ok: true });
+    const user = userEvent.setup();
+    renderList([makeLead()], "new");
+
+    await user.click(screen.getByRole("button", { name: "Start researching" }));
+
+    await waitFor(() => expect(mockMarkResearching).toHaveBeenCalledWith("lead-1"));
+    await waitFor(() => expect(mockToastSuccess).toHaveBeenCalled());
+    expect(mockRefresh).toHaveBeenCalled();
+  });
+
+  it("disables the dismiss confirm button until a non-empty reason is entered", async () => {
+    const user = userEvent.setup();
+    renderList([makeLead()], "new");
+
+    await user.click(screen.getByRole("button", { name: "Dismiss" }));
+
+    const confirmButton = screen.getByRole("button", { name: "Confirm dismiss" });
+    expect(confirmButton).toBeDisabled();
+
+    await user.type(screen.getByLabelText("Reason"), "   ");
+    expect(confirmButton).toBeDisabled();
+
+    await user.type(screen.getByLabelText("Reason"), "not relevant");
+    expect(confirmButton).not.toBeDisabled();
+  });
+
+  it("calls dismissLeadAction with the trimmed reason on confirm", async () => {
+    mockDismiss.mockResolvedValue({ ok: true });
+    const user = userEvent.setup();
+    renderList([makeLead()], "new");
+
+    await user.click(screen.getByRole("button", { name: "Dismiss" }));
+    await user.type(screen.getByLabelText("Reason"), "  not relevant  ");
+    await user.click(screen.getByRole("button", { name: "Confirm dismiss" }));
+
+    await waitFor(() => expect(mockDismiss).toHaveBeenCalledWith("lead-1", "not relevant"));
+    expect(mockToastSuccess).toHaveBeenCalled();
+  });
+});
+
+// --- deferred: the lane's give-up state is NOT terminal ----------------------
+
+describe("LeadList — a deferred lead", () => {
+  beforeEach(() => {
+    mockPush.mockClear();
+    mockRefresh.mockClear();
+    mockResetToNew.mockClear();
+  });
+
+  it("shows the forward actions AND 'Return to new' (deferred is not terminal)", () => {
+    renderList(
+      [makeLead({ status: "deferred", reviewNote: "leads-lane: could not geocode \"Austin, TX\"" })],
+      "deferred"
+    );
+
+    // Forward moves stay available: the machine gave up, a human has not.
+    expect(screen.getByRole("button", { name: "Stage as submission" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Dismiss" })).toBeInTheDocument();
+    // And the way back into the lane's `new` queue.
+    expect(screen.getByRole("button", { name: "Return to new" })).toBeInTheDocument();
+    // "Start researching" is a new-lead-only action.
+    expect(screen.queryByRole("button", { name: "Start researching" })).not.toBeInTheDocument();
+  });
+
+  it("renders the lane's diagnostic note, so a human can see why it gave up", () => {
+    renderList([makeLead({ status: "deferred", reviewNote: "leads-lane: model found no usable name/operator/state" })], "deferred");
+    expect(
+      screen.getByText("Note: leads-lane: model found no usable name/operator/state")
+    ).toBeInTheDocument();
+  });
+
+  it("returns a deferred lead to new", async () => {
+    mockResetToNew.mockResolvedValue({ ok: true, lead: { status: "new" } });
+    renderList([makeLead({ status: "deferred" })], "deferred");
+
+    await userEvent.click(screen.getByRole("button", { name: "Return to new" }));
+
+    await waitFor(() => expect(mockResetToNew).toHaveBeenCalledWith("lead-1"));
+  });
+});
+
+describe("LeadList — stage as submission", () => {
+  beforeEach(() => {
+    mockStage.mockReset();
+    mockToastSuccess.mockClear();
+    mockToastError.mockClear();
+    mockToastWarning.mockClear();
+    mockRefresh.mockClear();
+  });
+
+  function openDialog() {
+    const user = userEvent.setup();
+    return user.click(screen.getByRole("button", { name: "Stage as submission" })).then(() => user);
+  }
+
+  it("opens the dialog and no longer offers 'Mark promoted (no submission)'", async () => {
+    renderList([makeLead()], "new");
+    expect(screen.queryByRole("button", { name: "Mark promoted (no submission)" })).not.toBeInTheDocument();
+
+    await openDialog();
+
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+    expect(screen.getByLabelText("Payload JSON")).toBeInTheDocument();
+    expect(screen.getByRole("radio", { name: "New facility" })).toBeChecked();
+  });
+
+  it("shows an inline error and does not call the action on invalid JSON", async () => {
+    renderList([makeLead()], "new");
+    const user = await openDialog();
+
+    await user.type(screen.getByLabelText("Payload JSON"), "not json");
+    await user.click(screen.getByRole("button", { name: "Stage submission" }));
+
+    expect(screen.getByText("Payload is not valid JSON.")).toBeInTheDocument();
+    expect(mockStage).not.toHaveBeenCalled();
+  });
+
+  it("calls the action with the parsed payload, sources and note, then refreshes", async () => {
+    mockStage.mockResolvedValue({ ok: true, submissionId: "abcdef12-0000", leadPromoted: true });
+    renderList([makeLead()], "new");
+    const user = await openDialog();
+
+    await user.click(screen.getByLabelText("Payload JSON"));
+    await user.paste('{"id":"x"}');
+    await user.click(screen.getByLabelText("Extra source URLs (one per line, optional)"));
+    await user.paste("https://a.example/1\n\nhttps://a.example/2");
+    await user.type(screen.getByLabelText("Note (optional)"), "  hi  ");
+    await user.click(screen.getByRole("button", { name: "Stage submission" }));
+
+    await waitFor(() =>
+      expect(mockStage).toHaveBeenCalledWith("lead-1", {
+        kind: "create",
+        payload: { id: "x" },
+        extraSources: ["https://a.example/1", "https://a.example/2"],
+        note: "hi",
+      })
+    );
+    await waitFor(() =>
+      expect(mockToastSuccess).toHaveBeenCalledWith(
+        "Staged as submission abcdef12 — approve it in Submissions"
+      )
+    );
+    expect(mockRefresh).toHaveBeenCalled();
+  });
+
+  it("inserts a template pre-filled with the lead url for a new facility", async () => {
+    renderList([makeLead()], "new");
+    const user = await openDialog();
+
+    await user.click(screen.getByRole("button", { name: "Insert template" }));
+
+    const text = (screen.getByLabelText("Payload JSON") as HTMLTextAreaElement).value;
+    expect(JSON.parse(text).sources[0].url).toBe("https://example.com/tip");
+  });
+
+  it("defaults to update with the target prefilled when exactly one duplicate exists", async () => {
+    const triage = { ok: true, duplicateFacilityIds: ["existing-site"] } as AdminLeadRow["triage"];
+    renderList([makeLead({ triage })], "new");
+    const user = await openDialog();
+
+    expect(screen.getByRole("radio", { name: "Update existing facility" })).toBeChecked();
+    expect(screen.getByLabelText("Target facility id")).toHaveValue("existing-site");
+    expect(screen.getByText(/replace the existing value wholesale/)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Insert template" })).not.toBeInTheDocument();
+
+    await user.click(screen.getByLabelText("Payload JSON"));
+    await user.paste('{"status":"operational"}');
+    mockStage.mockResolvedValue({ ok: true, submissionId: "12345678", leadPromoted: true });
+    await user.click(screen.getByRole("button", { name: "Stage submission" }));
+
+    await waitFor(() =>
+      expect(mockStage).toHaveBeenCalledWith("lead-1", {
+        kind: "update",
+        targetFacilityId: "existing-site",
+        payload: { status: "operational" },
+      })
+    );
+  });
+
+  it("defaults to a new facility when there are several duplicates", async () => {
+    const triage = { ok: true, duplicateFacilityIds: ["a", "b"] } as AdminLeadRow["triage"];
+    renderList([makeLead({ triage })], "new");
+    await openDialog();
+
+    expect(screen.getByRole("radio", { name: "New facility" })).toBeChecked();
+  });
+
+  it("toasts the error and lists validation issues inline on failure", async () => {
+    mockStage.mockResolvedValue({
+      ok: false,
+      status: 400,
+      error: "Invalid facility",
+      issues: [{ path: ["location", "state"], message: "Required" }],
+    });
+    renderList([makeLead()], "new");
+    const user = await openDialog();
+
+    await user.click(screen.getByLabelText("Payload JSON"));
+    await user.paste("{}");
+    await user.click(screen.getByRole("button", { name: "Stage submission" }));
+
+    await waitFor(() => expect(mockToastError).toHaveBeenCalledWith("Invalid facility"));
+    expect(screen.getByText("location.state: Required")).toBeInTheDocument();
+    expect(mockRefresh).not.toHaveBeenCalled();
+  });
+
+  it("warns instead of succeeding when the lead could not be linked", async () => {
+    mockStage.mockResolvedValue({ ok: true, submissionId: "abcdef12-0000", leadPromoted: false });
+    renderList([makeLead()], "new");
+    const user = await openDialog();
+
+    await user.click(screen.getByLabelText("Payload JSON"));
+    await user.paste("{}");
+    await user.click(screen.getByRole("button", { name: "Stage submission" }));
+
+    await waitFor(() =>
+      expect(mockToastWarning).toHaveBeenCalledWith(expect.stringContaining("could not be linked"))
+    );
+    expect(mockToastSuccess).not.toHaveBeenCalled();
+  });
+
+  it("reports success, not a warning, when an already-promoted lead stages another", async () => {
+    mockStage.mockResolvedValue({ ok: true, submissionId: "abcdef12-0000", leadPromoted: false });
+    renderList([makeLead({ status: "promoted", promotedSubmissionId: "sub-1" })], "promoted");
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("button", { name: "Stage another submission" }));
+
+    await user.click(screen.getByLabelText("Payload JSON"));
+    await user.paste("{}");
+    await user.click(screen.getByRole("button", { name: "Stage submission" }));
+
+    await waitFor(() =>
+      expect(mockToastSuccess).toHaveBeenCalledWith(
+        "Staged as submission abcdef12 (lead already linked to an earlier submission)"
+      )
+    );
+    expect(mockToastWarning).not.toHaveBeenCalled();
+  });
+
+  it("wires the JSON error into the textarea's accessible description", async () => {
+    renderList([makeLead()], "new");
+    const user = await openDialog();
+
+    await user.type(screen.getByLabelText("Payload JSON"), "nope");
+    await user.click(screen.getByRole("button", { name: "Stage submission" }));
+
+    expect(screen.getByLabelText("Payload JSON")).toHaveAccessibleDescription("Payload is not valid JSON.");
+  });
+
+  it("resets the form each time the dialog is reopened", async () => {
+    renderList([makeLead()], "new");
+    const user = await openDialog();
+    await user.type(screen.getByLabelText("Payload JSON"), "{{}");
+    await user.click(screen.getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+
+    await user.click(screen.getByRole("button", { name: "Stage as submission" }));
+
+    expect(screen.getByLabelText("Payload JSON")).toHaveValue("");
+  });
+
+  it("hides the button for a dismissed lead", () => {
+    renderList([makeLead({ status: "dismissed" })], "dismissed");
+    expect(screen.queryByRole("button", { name: /Stage (as|another)/ })).not.toBeInTheDocument();
+  });
+
+  it("labels the button 'Stage another submission' for a promoted lead and links the staged one", () => {
+    renderList([makeLead({ status: "promoted", promotedSubmissionId: "sub-1" })], "promoted");
+
+    expect(screen.getByRole("button", { name: "Stage another submission" })).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "sub-1" })).toHaveAttribute("href", "/admin/submissions");
+  });
+});
+
+function makeOutcome(overrides: Partial<LeadSubmissionOutcome> = {}): LeadSubmissionOutcome {
+  return {
+    id: "11111111-aaaa-bbbb-cccc-000000000001",
+    kind: "create",
+    facilityId: "site-one",
+    status: "pending",
+    createdAt: new Date("2026-10-01T00:00:00Z"),
+    reviewedAt: null,
+    reviewNote: null,
+    ...overrides,
+  };
+}
+
+describe("LeadList — submission outcomes", () => {
+  const promoted = makeLead({ status: "promoted", promotedSubmissionId: "sub-1" });
+
+  it("shows Pending, Approved <UTC date> and Rejected <UTC date> with the reason", () => {
+    renderList([promoted], "promoted", {
+      "lead-1": [
+        makeOutcome({ id: "s-pending", facilityId: "site-pending" }),
+        makeOutcome({
+          id: "s-approved",
+          facilityId: "site-approved",
+          status: "approved",
+          // 23:30 UTC on Oct 9: a local-TZ formatter west of UTC would print Oct 8 or 9 inconsistently.
+          reviewedAt: new Date("2026-10-09T23:30:00Z"),
+        }),
+        makeOutcome({
+          id: "s-rejected",
+          facilityId: "site-rejected",
+          status: "rejected",
+          reviewedAt: new Date("2026-10-10T00:30:00Z"),
+          reviewNote: "Source does not support it",
+        }),
+      ],
+    });
+
+    expect(screen.getByText("Pending")).toBeInTheDocument();
+    expect(screen.getByText("Approved Oct 9, 2026")).toBeInTheDocument();
+    expect(screen.getByText("Rejected Oct 10, 2026")).toBeInTheDocument();
+    expect(screen.getByText("Reason: Source does not support it")).toBeInTheDocument();
+  });
+
+  it("links an approved row's facility id to its page, in a new tab", () => {
+    renderList([promoted], "promoted", {
+      "lead-1": [
+        makeOutcome({ status: "approved", reviewedAt: new Date("2026-10-09T12:00:00Z") }),
+      ],
+    });
+
+    const link = screen.getByRole("link", { name: "View facility site-one (opens in new tab)" });
+    expect(link).toHaveAttribute("href", "/facilities/site-one");
+    expect(link).toHaveAttribute("target", "_blank");
+  });
+
+  it("links a pending row to /admin/submissions, not the facility page", () => {
+    renderList([promoted], "promoted", { "lead-1": [makeOutcome()] });
+
+    expect(screen.getByRole("link", { name: /Submission .* in Submissions/ })).toHaveAttribute(
+      "href",
+      "/admin/submissions"
+    );
+    expect(screen.queryByRole("link", { name: /View facility/ })).not.toBeInTheDocument();
+  });
+
+  it("does not show the legacy warning when outcomes exist, even without a promotedSubmissionId", () => {
+    renderList([makeLead({ status: "promoted", promotedSubmissionId: null })], "promoted", {
+      "lead-1": [makeOutcome()],
+    });
+
+    expect(screen.queryByText(/no submission was created/)).not.toBeInTheDocument();
+  });
+
+  it("keeps the legacy warning for a promoted lead with no id and no outcomes", () => {
+    renderList([makeLead({ status: "promoted", promotedSubmissionId: null })], "promoted", {});
+
+    expect(screen.getByText(/no submission was created/)).toBeInTheDocument();
+  });
+
+  it("renders no outcomes list on a new lead", () => {
+    renderList([makeLead()], "new");
+
+    expect(screen.queryByRole("list", { name: "Staged submissions" })).not.toBeInTheDocument();
+  });
+});

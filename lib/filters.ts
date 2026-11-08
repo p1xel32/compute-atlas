@@ -1,5 +1,6 @@
 import { STATUS_ORDER, type Status } from "@/lib/status";
 import type { Facility } from "@/lib/schema";
+import type { FilterableFacility, MapPoint } from "@/lib/facility-slim";
 import { facilityTypeEnum } from "@/lib/schema";
 import { getFacilityMaxMw } from "@/lib/format";
 
@@ -18,10 +19,10 @@ export interface FacilityFilters {
  * Returns facilities that match ALL provided filters.
  * Empty or omitted filter arrays / undefined values → no constraint applied.
  */
-export function filterFacilities(
-  facilities: Facility[],
+export function filterFacilities<T extends FilterableFacility>(
+  facilities: T[],
   f: FacilityFilters
-): Facility[] {
+): T[] {
   return facilities.filter((facility) => {
     // Status: include if filter is empty/undefined OR facility.status is in the list
     if (f.statuses && f.statuses.length > 0) {
@@ -67,6 +68,24 @@ export function filterFacilities(
   });
 }
 
+/**
+ * The slice of the filters a `MapPoint` can answer on its own. Operator and
+ * minimum-capacity need data the /map client no longer holds; they resolve
+ * through `GET /api/map/match` and intersect with this result.
+ */
+export type MapPointFilters = Pick<FacilityFilters, "statuses" | "states" | "facilityTypes">;
+
+export function filterMapPoints<T extends MapPoint>(points: T[], f: MapPointFilters): T[] {
+  return points.filter((p) => {
+    if (f.statuses && f.statuses.length > 0 && !f.statuses.includes(p.status)) return false;
+    if (f.states && f.states.length > 0 && !f.states.includes(p.location.state)) return false;
+    if (f.facilityTypes && f.facilityTypes.length > 0 && !f.facilityTypes.includes(p.facilityType)) {
+      return false;
+    }
+    return true;
+  });
+}
+
 export interface FilterOptions {
   /** Only statuses present in the dataset, ordered by STATUS_ORDER. */
   statuses: Status[];
@@ -83,7 +102,7 @@ export interface FilterOptions {
 /**
  * Derives available filter values from the given facilities array.
  */
-export function getFilterOptions(facilities: Facility[]): FilterOptions {
+export function getFilterOptions(facilities: FilterableFacility[]): FilterOptions {
   const presentStatuses = STATUS_ORDER.filter((s) =>
     facilities.some((f) => f.status === s)
   );

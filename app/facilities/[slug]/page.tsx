@@ -1,39 +1,69 @@
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import type { Metadata } from "next";
-import { Info } from "lucide-react";
+import { Info, Flag } from "lucide-react";
 
-import { getAllFacilities, getFacilityByIdCached, operatorSlug } from "@/lib/data";
+import { getAllFacilityIds, getFacilityByIdCached, operatorSlug, countySlug } from "@/lib/data";
+import { previewSubset } from "@/lib/build-params";
+import { getOperatorOwnership } from "@/lib/operator-ownership";
+import { getSitingContext } from "@/lib/siting-context";
 import { getStatusMeta } from "@/lib/status";
+import { toMiniMapFacility } from "@/lib/facility-slim";
 import { FACILITY_TYPE_META } from "@/lib/facility-type";
 import {
   formatCapacity,
   formatLocation,
   AI_CLASSIFICATION_LABELS,
   CONFIDENCE_LABELS,
+  isOperatorRedundant,
+  nameConveysType,
 } from "@/lib/format";
 import { stateNameFromCode, stateSlugFromCode } from "@/lib/us-states";
-import { facilityJsonLdString, breadcrumbJsonLdString } from "@/lib/seo";
+import { formatCountyLabel } from "@/lib/metros";
+import { buildFacilityJsonLd, facilityJsonLdString, breadcrumbJsonLdString } from "@/lib/seo";
 import type { Facility } from "@/lib/schema";
+import { cn, QUIET_ACTION_CLASS } from "@/lib/utils";
 import { StatusBadge } from "@/components/status-badge";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent } from "@/components/ui/card";
 import { Separator } from "@/components/ui/separator";
+import { MastheadFactGrid, MastheadFactRow, NotRecordedText } from "@/components/facility/fact-row";
 import { StatusTimeline } from "@/components/facility/status-timeline";
 import { ProvenancePanel } from "@/components/facility/provenance-panel";
 import { FacilityMiniMapDynamic } from "@/components/facility/facility-mini-map-dynamic";
-import { CivicImpactSection, hasCivicImpact } from "@/components/facility/civic-impact";
-import { PowerLinksSection, hasPowerLinks } from "@/components/facility/power-links";
+import { CivicImpactSection } from "@/components/facility/civic-impact";
+import { StakeholdersSection } from "@/components/facility/stakeholders";
+import { PowerLinksSection } from "@/components/facility/power-links";
+import { SitingContextSection } from "@/components/facility/siting-context";
 import { RelatedFacilities } from "@/components/facility/related-facilities";
+import { PrintBriefButton } from "@/components/facility/print-brief-button";
+import { PrintGapSummary } from "@/components/facility/print-gap-summary";
+import { PrintProvenanceFooter } from "@/components/facility/print-provenance-footer";
+import { CiteThisFacility } from "@/components/facility/cite-this-facility";
+import { submissionNotifyEnabled } from "@/lib/submission-notify";
 import { Breadcrumb } from "@/components/breadcrumb";
+import { CorrectionNotifyProvider } from "@/components/contribute/correction-notify-context";
 import { SuggestCorrection } from "@/components/contribute/suggest-correction";
+import { SourceCorrectionNote } from "@/components/contribute/source-correction-note";
+import { FieldGapPrompt } from "@/components/contribute/field-gap-prompt";
+import { ConfirmFactPrompt } from "@/components/contribute/confirm-fact-prompt";
+import {
+  capacityGapField,
+  capacityShownField,
+  correctableDisplayValues,
+} from "@/lib/contribute-fields";
 import { WatchButton } from "@/components/subscribe/watch-button";
+import { ShareButton } from "@/components/share-button";
+import { SupportCta } from "@/components/support-cta";
 
-export const revalidate = false;
+export const revalidate = 86400;
 
 export async function generateStaticParams() {
-  const facilities = await getAllFacilities();
-  return facilities.map((f) => ({ slug: f.id }));
+  const ids = await getAllFacilityIds();
+  return previewSubset(
+    ids.map((id) => ({ slug: id })),
+    10,
+  );
 }
 
 /**
@@ -70,16 +100,25 @@ export async function generateMetadata({
   const titleLocation = city ? `${city}, ${state}` : stateNameFromCode(state) ?? state;
 
   // Omit the operator when it's already embedded in the facility name (or
-  // vice versa) — e.g. name "Google Council Bluffs", operator "Google" —
-  // to avoid "Google Council Bluffs — Google data center in ...".
-  const nameLower = facility.name.toLowerCase();
-  const operatorLower = facility.operator.toLowerCase();
-  const operatorInName =
-    nameLower.includes(operatorLower) || operatorLower.includes(nameLower);
+  // vice versa, modulo legal suffixes like "Inc."/"LLC") — e.g. name
+  // "Google Council Bluffs", operator "Google" — to avoid "Google Council
+  // Bluffs — Google data center in ...". Likewise omit the type label when
+  // the name already conveys the type — e.g. "... Bitcoin Mining Facility"
+  // already says crypto-mining. Both keep titles from carrying two names
+  // for the same thing; see lib/format.ts for the redundancy checks.
+  const operatorRedundant = isOperatorRedundant(facility.name, facility.operator);
+  const typeRedundant = nameConveysType(facility.name, facility.facilityType);
 
-  const title = operatorInName
-    ? `${facility.name} — ${typeLabel} in ${titleLocation}`
-    : `${facility.name} — ${facility.operator} ${typeLabel} in ${titleLocation}`;
+  const descriptor = [
+    operatorRedundant ? null : facility.operator,
+    typeRedundant ? null : typeLabel,
+  ]
+    .filter(Boolean)
+    .join(" ");
+
+  const title = descriptor
+    ? `${facility.name} — ${descriptor} in ${titleLocation}`
+    : `${facility.name} — ${titleLocation}`;
 
   const capacity = formatCapacity(facility);
   const hasCapacity = Boolean(capacity) && capacity !== "—";
@@ -90,6 +129,12 @@ export async function generateMetadata({
 
   return { title, description, alternates: { canonical: `/facilities/${slug}` } };
 }
+
+// notRecorded key for each correctable capacity field.
+const CAPACITY_NOT_RECORDED_KEY = {
+  capacityOperationalMw: "capacityMw.operational",
+  capacityPlannedMw: "capacityMw.planned",
+} as const;
 
 /**
  * Facility detail page — static server component.
@@ -110,7 +155,36 @@ export default async function FacilityPage({
     notFound();
   }
 
+  // One siting read per render, shared by the section and the print gap summary.
+  const [siting, ownership] = await Promise.all([
+    getSitingContext(facility.id),
+    getOperatorOwnership(facility.operator),
+  ]);
   const location = formatLocation(facility);
+  const capacity = formatCapacity(facility);
+  // Keyed on the field, not the reason text: two fields may share a reason.
+  const capacityNotRecorded = (
+    [
+      ["capacityMw.operational", "Operational"],
+      ["capacityMw.planned", "Planned"],
+    ] as const
+  ).flatMap(([field, label]) => {
+    const reason = facility.notRecorded?.[field];
+    return reason === undefined ? [] : [{ field, label, reason }];
+  });
+  // The fill prompt targets one capacity field (by status); it is suppressed
+  // only when THAT field is marked, not when its sibling is.
+  const capacityGapMarked =
+    facility.notRecorded?.[CAPACITY_NOT_RECORDED_KEY[capacityGapField(facility.status)]] !==
+    undefined;
+  // Shown as "Currently: …" in the page's correction dialogs (masthead, bottom
+  // CTA, ConfirmFactPrompt). FieldGapPrompt dialogs don't get it: they only
+  // render for an empty field and fall back to "not recorded".
+  const currentValues = correctableDisplayValues(facility);
+  // Reuses the same canonical absolute URL the page's own JSON-LD already
+  // builds (buildFacilityJsonLd's `url` field), rather than hand-
+  // concatenating siteConfig.url + a path a second time.
+  const canonicalUrl = buildFacilityJsonLd(facility).url;
   const isProvisional =
     facility.status === "proposed" || facility.status === "permitted";
   const isRumored = facility.confidence === "rumored";
@@ -124,8 +198,22 @@ export default async function FacilityPage({
     { label: facility.name },
   ];
 
-  return (
-    <div data-content-width="4xl" className="mx-auto max-w-4xl px-4 py-8 sm:px-6 sm:py-12 space-y-10">
+  // Read at render time, never at module scope. This page is ISR, so the
+  // value is fixed per regeneration; an env change needs a new deployment
+  // anyway, and that re-renders it. Passed down as a plain boolean; the
+  // correction dialog (a client component) never reads process.env itself.
+  const notifyEnabled = submissionNotifyEnabled();
+
+  // data-print-brief is the hook globals.css's @media print block uses to
+  // re-typeset this record as a dense stat sheet (see the print comment
+  // there) — scoped to this container so other printable pages keep the
+  // screen rhythm.
+  const content = (
+    <div
+      data-content-width="4xl"
+      data-print-brief
+      className="mx-auto max-w-4xl px-4 py-8 sm:px-6 sm:py-12 space-y-10"
+    >
       <script
         type="application/ld+json"
         dangerouslySetInnerHTML={{ __html: facilityJsonLdString(facility) }}
@@ -138,13 +226,17 @@ export default async function FacilityPage({
           ),
         }}
       />
-      <Breadcrumb items={crumbs} />
+      {/* Screen navigation chrome — the printed brief carries its canonical
+          URL in the provenance footer instead. */}
+      <Breadcrumb items={crumbs} className="print:hidden" />
 
       {/* Plate masthead */}
       <header className="space-y-3">
         <p className="font-mono text-xs uppercase tracking-widest text-primary">
           {location}
-          {facility.location.county ? ` · ${facility.location.county} County` : ""}
+          {facility.location.county
+            ? ` · ${formatCountyLabel(facility.location.county, facility.location.state)}`
+            : ""}
           {" · "}
           <span
             aria-label={`Coordinates: ${facility.location.lat.toFixed(3)} degrees north, ${Math.abs(facility.location.lon).toFixed(3)} degrees west`}
@@ -158,17 +250,17 @@ export default async function FacilityPage({
         <p className="text-base text-muted-foreground">
           <Link
             href={`/operators/${operatorSlug(facility.operator)}`}
-            className="underline-offset-4 transition-colors hover:text-foreground hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 rounded-sm"
+            className="underline-offset-4 transition-colors hover:text-foreground hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring rounded-sm"
           >
             {facility.operator}
           </Link>
         </p>
         <div className="flex flex-wrap items-center gap-2 pt-1">
+          <StatusBadge status={facility.status} />
           <Badge variant="outline">
             {FACILITY_TYPE_META[facility.facilityType]?.label ??
               facility.facilityType}
           </Badge>
-          <StatusBadge status={facility.status} className="text-base" />
           {(facility.facilityType === "data_center" ||
             facility.facilityType === "crypto_mining") &&
             facility.aiClassification && (
@@ -183,6 +275,45 @@ export default async function FacilityPage({
         </div>
         <div className="border-t border-border" />
       </header>
+
+      {/* Compact CTA strip — print trigger plus the same two actions as the
+          full-size CTAs at the end of the page (SuggestCorrection /
+          WatchButton below), reachable without scrolling past the whole
+          record. Kept quiet (text-scale, no bordered card) so it doesn't
+          compete with the H1; the bottom pair stays put as the canonical
+          full-size CTA — this is additive. The strip itself is print:hidden
+          and PrintBriefButton carries the variant too (belt and suspenders —
+          it must never appear in the printout it produces). Every item is
+          one text-sm baseline (QUIET_ACTION_CLASS) with its own
+          `min-h-11` touch target and a leading icon (aria-hidden, so it
+          never leaks into the accessible name), rather than a mix of
+          default/sm Buttons and a bare text link at four different heights. */}
+      <div className="flex flex-wrap items-center gap-x-5 print:hidden">
+        <PrintBriefButton />
+        <ShareButton title={facility.name} url={canonicalUrl} />
+        <SuggestCorrection
+          facilityId={facility.id}
+          facilityName={facility.name}
+          currentValues={currentValues}
+          showIntro={false}
+          triggerLabel={
+            <>
+              <Flag className="size-3.5" aria-hidden="true" />
+              Spot an error?
+            </>
+          }
+          triggerClassName={cn(
+            QUIET_ACTION_CLASS,
+            "inline-flex items-center gap-1.5 min-h-11"
+          )}
+        />
+        <WatchButton
+          targetType="facility"
+          targetId={facility.id}
+          label="Watch this facility"
+          quiet
+        />
+      </div>
 
       {/* Provisional / rumored banner */}
       {showBanner && (
@@ -226,72 +357,101 @@ export default async function FacilityPage({
         <h2 id="key-facts-heading" className="font-display text-xl text-foreground mb-4">
           Key facts
         </h2>
-        <dl className="neatline grid grid-cols-1 gap-x-8 gap-y-4 rounded-sm border border-border p-5 sm:grid-cols-2">
-          <div>
-            <dt className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
-              Location
-            </dt>
-            <dd className="mt-1 text-sm">
-              {facility.location.street ? (
-                <span className="block">{facility.location.street}</span>
-              ) : null}
-              {location}
-              {facility.location.postalCode ? ` ${facility.location.postalCode}` : ""}
-              {facility.location.county ? ` · ${facility.location.county} County` : ""}
-            </dd>
-          </div>
+        <MastheadFactGrid>
+          <MastheadFactRow label="Location">
+            {facility.location.street ? (
+              <span className="block">{facility.location.street}</span>
+            ) : null}
+            {location}
+            {facility.location.postalCode ? ` ${facility.location.postalCode}` : ""}
+            {/* County links to its /counties hub. Deliberately carries no
+                resting color or underline — only hover/focus affordances —
+                so the printed stat sheet renders it as the plain text it
+                replaced (a link is meaningless on paper). Same treatment as
+                the operator link in the masthead above, which already sits
+                inside [data-print-brief]. The masthead's county eyebrow is
+                left as plain text: it is a dense mono metadata line, and one
+                link per fact is enough. */}
+            {facility.location.county ? (
+              <>
+                {" · "}
+                <Link
+                  href={`/counties/${countySlug(facility.location.county, facility.location.state)}`}
+                  className="underline-offset-4 rounded-sm transition-colors motion-reduce:transition-none hover:text-primary hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"
+                >
+                  {formatCountyLabel(facility.location.county, facility.location.state)}
+                </Link>
+              </>
+            ) : null}
+          </MastheadFactRow>
 
-          <div>
-            <dt className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
-              Capacity
-            </dt>
-            <dd className="mt-1 text-sm font-mono tabular-nums">
-              {formatCapacity(facility)}
-            </dd>
-          </div>
+          <MastheadFactRow label="Capacity" valueClassName="mt-1 text-sm font-mono tabular-nums">
+            {capacity === "—" ? (
+              !capacityGapMarked && (
+                <FieldGapPrompt
+                  field={capacityGapField(facility.status)}
+                  facilityId={facility.id}
+                  facilityName={facility.name}
+                  label="the capacity"
+                />
+              )
+            ) : (
+              <>
+                {capacity}
+                <div className="mt-1">
+                  <ConfirmFactPrompt
+                    field={capacityShownField(facility)}
+                    facilityId={facility.id}
+                    facilityName={facility.name}
+                    label="the capacity"
+                    vintage={facility.lastUpdated}
+                    currentValues={currentValues}
+                  />
+                </div>
+              </>
+            )}
+            {capacityNotRecorded.map(({ field, label, reason }) => (
+              <div key={field} className="font-sans">
+                <NotRecordedText reason={reason} label={label} />
+              </div>
+            ))}
+          </MastheadFactRow>
 
-          <div>
-            <dt className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
-              Powered by
-            </dt>
-            <dd className="mt-1 text-sm">
-              {facility.poweredBy ?? "—"}
-            </dd>
-          </div>
+          <MastheadFactRow label="Powered by">
+            {facility.poweredBy ?? (
+              <FieldGapPrompt
+                field="poweredBy"
+                facilityId={facility.id}
+                facilityName={facility.name}
+                label="who powers this facility"
+              />
+            )}
+          </MastheadFactRow>
 
-          <div>
-            <dt className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
-              Announced
-            </dt>
-            <dd className="mt-1 text-sm font-mono tabular-nums">
-              {facility.announcedDate ?? "—"}
-            </dd>
-          </div>
+          <MastheadFactRow label="Announced" valueClassName="mt-1 text-sm font-mono tabular-nums">
+            {facility.announcedDate ?? (
+              <FieldGapPrompt
+                field="announcedDate"
+                facilityId={facility.id}
+                facilityName={facility.name}
+                label="the announcement date"
+              />
+            )}
+          </MastheadFactRow>
 
-          <div>
-            <dt className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
-              Last updated
-            </dt>
-            <dd className="mt-1 text-sm font-mono tabular-nums">
-              <time dateTime={facility.lastUpdated}>{facility.lastUpdated}</time>
-            </dd>
-          </div>
-        </dl>
+          <MastheadFactRow label="Last updated" valueClassName="mt-1 text-sm font-mono tabular-nums">
+            <time dateTime={facility.lastUpdated}>{facility.lastUpdated}</time>
+          </MastheadFactRow>
+        </MastheadFactGrid>
       </section>
 
-      {(await hasPowerLinks(facility)) && (
-        <>
-          <Separator />
-          <PowerLinksSection facility={facility} />
-        </>
-      )}
+      <SitingContextSection facility={facility} siting={siting} />
 
-      {hasCivicImpact(facility) && (
-        <>
-          <Separator />
-          <CivicImpactSection facility={facility} />
-        </>
-      )}
+      <PowerLinksSection facility={facility} />
+
+      <CivicImpactSection facility={facility} />
+
+      <StakeholdersSection facility={facility} ownership={ownership} />
 
       <Separator />
 
@@ -313,13 +473,24 @@ export default async function FacilityPage({
         <h2 id="map-heading" className="font-display text-xl text-foreground mb-4">
           Location
         </h2>
-        <FacilityMiniMapDynamic facility={facility} />
+        <FacilityMiniMapDynamic facility={toMiniMapFacility(facility)} />
       </section>
 
       <Separator />
 
       {/* Provenance */}
       <ProvenancePanel facility={facility} />
+
+      {/* Agent-quotable contribution note — plain server-rendered prose (not
+          print:hidden; it reads fine on a printout too), separate from the
+          interactive SuggestCorrection CTA below so a retrieval agent or
+          search snippet can quote the fact even though it can't click a
+          button. See components/contribute/source-correction-note.tsx. */}
+      <SourceCorrectionNote className="text-sm leading-relaxed text-muted-foreground" />
+
+      {/* Visible citation in the /data format; access date is filled
+          client-side (ISR-cached page). Print is covered by the footer. */}
+      <CiteThisFacility name={facility.name} url={canonicalUrl} />
 
       {/* Related facilities — same operator / same state. Renders its own
           leading Separator + heading when it has content, and nothing at
@@ -330,7 +501,11 @@ export default async function FacilityPage({
 
       {/* Correction — interactive CTA, not useful on a printed page */}
       <div className="print:hidden">
-        <SuggestCorrection facilityId={facility.id} facilityName={facility.name} />
+        <SuggestCorrection
+          facilityId={facility.id}
+          facilityName={facility.name}
+          currentValues={currentValues}
+        />
       </div>
 
       {/* Watch — interactive CTA, not useful on a printed page */}
@@ -341,6 +516,40 @@ export default async function FacilityPage({
           label="Watch this facility"
         />
       </div>
+
+      <Separator />
+
+      {/* Support — the page's closing ask. 1,064 facility pages previously
+          carried none of the site's three existing SupportCta placements
+          (about/support/contribute), despite being the pages an organic
+          search visitor actually lands on. One honest line, no dollar
+          figures, per CLAUDE.md's de-sell editorial voice; print:hidden
+          since an ask has no place in the printed brief. */}
+      <section aria-labelledby="support-heading" className="print:hidden space-y-3">
+        <h2 id="support-heading" className="font-display text-xl text-foreground">
+          Support
+        </h2>
+        <p className="text-sm text-muted-foreground">
+          Compute Atlas is maintained by one person, source by source — if
+          that&rsquo;s useful to you, a one-off tip helps keep it running.
+        </p>
+        <SupportCta />
+      </section>
+
+      {/* Print-only: one line naming every section this record has no data
+          for. Sits immediately above the provenance footer so the sheet ends
+          with what is known about the record, then what is not. */}
+      <PrintGapSummary facility={facility} siting={siting} />
+
+      {/* Print-only: what makes the printout citable — where it came from,
+          when the record was curated, when it was printed, and the data
+          licence. Must stay the LAST child of the container. */}
+      <PrintProvenanceFooter
+        name={facility.name}
+        url={canonicalUrl}
+        lastUpdated={facility.lastUpdated}
+      />
     </div>
   );
+  return <CorrectionNotifyProvider enabled={notifyEnabled}>{content}</CorrectionNotifyProvider>;
 }

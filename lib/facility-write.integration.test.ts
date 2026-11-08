@@ -16,7 +16,13 @@ import { facilitiesTable, facilityHistoryTable } from "@/lib/db/schema";
 import type { DataCenterFacility, PowerGenerationFacility, Source } from "@/lib/schema";
 
 // Imported after the mocks above so the mocked @/lib/db/client is in effect.
-import { createFacility, deleteFacility, updateFacility, writeStatusUpdate } from "@/lib/facility-write";
+import {
+  createFacility,
+  deleteFacility,
+  updateFacility,
+  writeStatusUpdate,
+  writeEnrichmentUpdate,
+} from "@/lib/facility-write";
 
 function makeSource(label: string): Source {
   return {
@@ -145,6 +151,236 @@ describe("writeStatusUpdate", () => {
   });
 });
 
+describe("writeEnrichmentUpdate", () => {
+  it("fills a missing field (energy.source) and appends the corroborating source", async () => {
+    const seedDoc = makeSeedDoc(); // energy is undefined on the seed
+    await seedFacility(tdb.db, seedDoc);
+
+    const result = await writeEnrichmentUpdate(seedDoc.id, {
+      date: "2026-07-30",
+      sources: [makeSource("enrichment-source")],
+      fields: { energy: { source: "grid" } },
+    });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+
+    expect(result.facility.energy?.source).toBe("grid");
+    expect(result.facility.sources).toHaveLength(seedDoc.sources.length + 1);
+
+    const facilityRows = await tdb.db
+      .select()
+      .from(facilitiesTable)
+      .where(eq(facilitiesTable.id, seedDoc.id));
+    expect((facilityRows[0].doc as DataCenterFacility).energy?.source).toBe("grid");
+
+    const historyRows = await tdb.db
+      .select()
+      .from(facilityHistoryTable)
+      .where(eq(facilityHistoryTable.facilityId, seedDoc.id));
+    expect(historyRows).toHaveLength(1);
+    expect(historyRows[0].changeType).toBe("update");
+  });
+
+  it("does not overwrite a curated field that is already set", async () => {
+    const seedDoc = { ...makeSeedDoc(), investmentUsd: 1_000_000 };
+    await seedFacility(tdb.db, seedDoc);
+
+    const result = await writeEnrichmentUpdate(seedDoc.id, {
+      date: "2026-07-30",
+      sources: [makeSource("enrichment-source")],
+      fields: { investmentUsd: 999_999_999 },
+    });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+
+    expect(result.facility.investmentUsd).toBe(1_000_000);
+  });
+
+  it("404s when the facility id does not exist", async () => {
+    const result = await writeEnrichmentUpdate("does-not-exist", {
+      date: "2026-07-30",
+      sources: [makeSource("s0")],
+      fields: { investmentUsd: 1 },
+    });
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.status).toBe(404);
+  });
+
+  it("400s on an invalid intent (empty sources array)", async () => {
+    const seedDoc = makeSeedDoc();
+    await seedFacility(tdb.db, seedDoc);
+
+    const result = await writeEnrichmentUpdate(seedDoc.id, {
+      date: "2026-07-30",
+      sources: [],
+      fields: { investmentUsd: 1 },
+    });
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.status).toBe(400);
+  });
+
+  it("400s on an out-of-range sourceRel", async () => {
+    const seedDoc = makeSeedDoc();
+    await seedFacility(tdb.db, seedDoc);
+
+    const result = await writeEnrichmentUpdate(seedDoc.id, {
+      date: "2026-07-30",
+      sources: [makeSource("s0")],
+      fields: { community: { status: "supported", sourceRel: 5 } },
+    });
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.status).toBe(400);
+  });
+
+  it("remaps a sourceRel to an absolute sourceIndex end-to-end (appendBase + sourceRel)", async () => {
+    const seedDoc = makeSeedDoc();
+    delete seedDoc.community;
+    // Seed carries 1 existing source ("s0") so appendBase === 1.
+    seedDoc.sources = [makeSource("s0")];
+    await seedFacility(tdb.db, seedDoc);
+
+    const result = await writeEnrichmentUpdate(seedDoc.id, {
+      date: "2026-07-30",
+      sources: [makeSource("community-source")],
+      fields: { community: { status: "supported", sourceRel: 0 } },
+    });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+
+    expect(result.facility.community?.sourceIndex).toBe(1);
+  });
+});
+
+describe("updateFacility", () => {
+  it("404s when the facility id does not exist", async () => {
+    const result = await updateFacility("does-not-exist", { name: "New Name" });
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.status).toBe(404);
+  });
+
+  it("shallow-merges a partial location patch, keeping lat, lon and an exact precision", async () => {
+    const seedDoc = makeSeedDoc(); // location: { lat: 33.4, lon: -84.4, state: "GA", precision: "exact" }
+    await seedFacility(tdb.db, seedDoc);
+
+    const result = await updateFacility(seedDoc.id, { location: { city: "New" } });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.facility.location).toEqual({ ...seedDoc.location, city: "New" });
+    expect(result.facility.location.precision).toBe("exact");
+  });
+
+  it("stores a restated pin without precision as approximate, never exact by omission, and drops the old city and county", async () => {
+    const seedDoc = makeSeedDoc(); // precision "exact"
+    seedDoc.location = { ...seedDoc.location, city: "Atlanta", county: "Fulton" };
+    await seedFacility(tdb.db, seedDoc);
+
+    const result = await updateFacility(seedDoc.id, {
+      location: { lat: 35, lon: -80, state: "NC" },
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.facility.location).toEqual({ lat: 35, lon: -80, state: "NC", precision: "approximate" });
+  });
+
+  it("merges a precision-only patch, keeping the stored coordinates", async () => {
+    const seedDoc = makeSeedDoc();
+    await seedFacility(tdb.db, seedDoc);
+
+    const result = await updateFacility(seedDoc.id, { location: { precision: "approximate" } });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.facility.location).toEqual({ ...seedDoc.location, precision: "approximate" });
+  });
+
+  it("400s a state-only location patch, as it did before the merge existed", async () => {
+    const seedDoc = makeSeedDoc();
+    await seedFacility(tdb.db, seedDoc);
+
+    const result = await updateFacility(seedDoc.id, { location: { state: "SC" } });
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.status).toBe(400);
+  });
+
+  it("replaces a complete location, so omitting an optional key clears it (the admin form's contract)", async () => {
+    const seedDoc = makeSeedDoc();
+    seedDoc.location = { ...seedDoc.location, city: "Atlanta", county: "Fulton" };
+    await seedFacility(tdb.db, seedDoc);
+
+    // The admin form drops `city`/`county` from the payload when the field is blanked.
+    const result = await updateFacility(seedDoc.id, {
+      location: { lat: 33.4, lon: -84.4, state: "GA", precision: "exact" },
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.facility.location).toEqual({ lat: 33.4, lon: -84.4, state: "GA", precision: "exact" });
+  });
+
+  it("still replaces top-level fields other than location wholesale", async () => {
+    const seedDoc = makeSeedDoc();
+    await seedFacility(tdb.db, seedDoc);
+    const sources = [makeSource("only")];
+
+    const result = await updateFacility(seedDoc.id, {
+      sources,
+      statusHistory: [{ status: "permitted", date: "2025-06-01", sourceIndex: 0 }],
+      community: { status: "supported", sourceIndex: 0 },
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.facility.sources).toHaveLength(1);
+  });
+
+  it.each([
+    ["null", null],
+    ["a string", "abc"],
+    ["an array", [1, 2]],
+    ["a number", 7],
+  ])("400s when the whole patch is %s and leaves the stored doc untouched", async (_label, patch) => {
+    const seedDoc = makeSeedDoc();
+    await seedFacility(tdb.db, seedDoc);
+
+    // The admin PATCH route passes request.json() through unvalidated.
+    const result = await updateFacility(seedDoc.id, patch);
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.status).toBe(400);
+
+    const [row] = await tdb.db.select().from(facilitiesTable).where(eq(facilitiesTable.id, seedDoc.id));
+    expect(row.doc).toEqual(seedDoc);
+  });
+
+  it.each([
+    ["null", null],
+    ["a string", "Atlanta"],
+    ["an array", [33.4, -84.4]],
+  ])("rejects a non-object location (%s) with a 400 instead of merging it", async (_label, location) => {
+    const seedDoc = makeSeedDoc();
+    await seedFacility(tdb.db, seedDoc);
+
+    const result = await updateFacility(seedDoc.id, { location });
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.status).toBe(400);
+  });
+});
+
+describe("deleteFacility", () => {
+  it("404s when the facility id does not exist", async () => {
+    const result = await deleteFacility("does-not-exist");
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.status).toBe(404);
+  });
+});
+
 describe("revalidateForFacility (scoped tag invalidation, not the old global nuke)", () => {
   it("createFacility busts facility:<id> and state:<STATE>, never the old global 'facilities' tag", async () => {
     const doc = makeSeedDoc();
@@ -206,5 +442,90 @@ describe("revalidateForFacility (scoped tag invalidation, not the old global nuk
     const calledTags = vi.mocked(revalidateTag).mock.calls.map((c) => c[0]);
     expect(calledTags).toContain("power-generation");
     expect(calledTags).not.toContain("facilities");
+  });
+});
+
+describe("recordFacilityHistory failure handling (WriteResult.historyRecorded)", () => {
+  it("createFacility succeeds and reports historyRecorded: true on a clean history insert", async () => {
+    const doc = makeSeedDoc();
+    doc.id = "history-ok-test-facility";
+
+    const result = await createFacility(doc);
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.historyRecorded).toBe(true);
+  });
+
+  it("still saves the facility and returns historyRecorded: false when the facility_history insert fails", async () => {
+    // Simulate a facility_history-only DB failure: intercept `db.insert`,
+    // reject just for facilityHistoryTable, and pass every other table
+    // (facilitiesTable etc.) through to the real PGlite-backed insert.
+    //
+    // The simulated error carries a REAL SQLSTATE so the log assertion below can
+    // pin it. A bare `new Error(...)` has no `code`, so `redactedErrorCode` would
+    // return "unknown" — and "unknown" is exactly what a redaction that extracted
+    // nothing would print, making the assertion a false proxy.
+    const simulatedError = Object.assign(
+      new Error("simulated facility_history insert failure"),
+      { code: "42P01" } // undefined_table — the migration-not-applied case
+    );
+    const originalInsert = tdb.db.insert.bind(tdb.db);
+    const insertSpy = vi.spyOn(tdb.db, "insert").mockImplementation((table: unknown) => {
+      if (table === facilityHistoryTable) {
+        return {
+          values: () => Promise.reject(simulatedError),
+        } as unknown as ReturnType<typeof tdb.db.insert>;
+      }
+      return originalInsert(table as never);
+    });
+    const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    try {
+      const doc = makeSeedDoc();
+      doc.id = "history-failure-test-facility";
+
+      const result = await createFacility(doc);
+
+      // The facility write itself must still succeed — a hiccup in the
+      // audit table must never fail a successful facility save (the
+      // documented judgment call in lib/facility-write.ts).
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+      expect(result.facility.id).toBe(doc.id);
+      expect(result.historyRecorded).toBe(false);
+
+      // The failure is still logged, on top of being carried on the result for
+      // the caller to surface — but as a SQLSTATE only. The insert binds the
+      // facility's whole diff and DrizzleQueryError.message embeds its bound
+      // params, so passing `err` to console.error put that payload into the
+      // runtime log (see lib/db-error.ts).
+      const historyCalls = consoleErrorSpy.mock.calls.filter(
+        (call) =>
+          typeof call[0] === "string" && call[0].startsWith("facility_history insert failed")
+      );
+      expect(historyCalls).toHaveLength(1);
+      // One argument only. A trailing second argument is precisely how the error
+      // object used to reach the log, so arity is the assertion that catches a
+      // regression — not just the text of the message.
+      expect(historyCalls[0]).toHaveLength(1);
+      const logged = historyCalls[0][0] as string;
+      expect(logged).toContain(doc.id);
+      expect(logged).toContain("(create)");
+      expect(logged).toContain("sqlstate: 42P01"); // the useful half survived
+      expect(logged).not.toContain(simulatedError.message); // the dangerous half did not
+
+      // And the facility really did land in the DB, not just in the
+      // in-memory `result.facility` — a failed audit row must not roll
+      // back the facility mutation.
+      const saved = await tdb.db
+        .select({ id: facilitiesTable.id })
+        .from(facilitiesTable)
+        .where(eq(facilitiesTable.id, doc.id));
+      expect(saved).toHaveLength(1);
+    } finally {
+      insertSpy.mockRestore();
+      consoleErrorSpy.mockRestore();
+    }
   });
 });

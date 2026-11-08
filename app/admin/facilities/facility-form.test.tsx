@@ -2,6 +2,7 @@ import { vi, describe, it, expect, beforeEach } from "vitest";
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
+import { mergeFacilityPatch } from "@/lib/facility-patch";
 import type { Facility } from "@/lib/schema";
 
 // vi.mock calls are hoisted above imports by Vitest. A plain top-level
@@ -10,14 +11,21 @@ import type { Facility } from "@/lib/schema";
 // specifiers — route shared mocks through vi.hoisted() so initialization
 // is hoisted alongside the vi.mock calls themselves. Mirrors
 // app/admin/facilities/facility-table.test.tsx.
-const { mockPush, mockToastSuccess, mockToastError, mockCreateFacilityAction, mockUpdateFacilityAction } =
-  vi.hoisted(() => ({
-    mockPush: vi.fn(),
-    mockToastSuccess: vi.fn(),
-    mockToastError: vi.fn(),
-    mockCreateFacilityAction: vi.fn(),
-    mockUpdateFacilityAction: vi.fn(),
-  }));
+const {
+  mockPush,
+  mockToastSuccess,
+  mockToastWarning,
+  mockToastError,
+  mockCreateFacilityAction,
+  mockUpdateFacilityAction,
+} = vi.hoisted(() => ({
+  mockPush: vi.fn(),
+  mockToastSuccess: vi.fn(),
+  mockToastWarning: vi.fn(),
+  mockToastError: vi.fn(),
+  mockCreateFacilityAction: vi.fn(),
+  mockUpdateFacilityAction: vi.fn(),
+}));
 
 vi.mock("next/navigation", () => ({
   useRouter: () => ({ push: mockPush }),
@@ -26,6 +34,7 @@ vi.mock("next/navigation", () => ({
 vi.mock("sonner", () => ({
   toast: {
     success: mockToastSuccess,
+    warning: mockToastWarning,
     error: mockToastError,
   },
 }));
@@ -82,7 +91,7 @@ describe("emptyFacilityFormState", () => {
     expect(state.jobs).toEqual({});
     expect(state.community).toEqual({});
     expect(state.location.multiSite.enabled).toBe(false);
-    expect(state.location.precision).toBe("exact");
+    expect(state.location.precision).toBe("approximate");
   });
 });
 
@@ -148,6 +157,19 @@ describe("buildFacilityPayload — shallow-merge safety", () => {
     expect(location.state).toBe("TX");
     expect(location.city).toBe("Austin");
     expect(location.precision).toBe("exact");
+  });
+
+  it("submits a location that replaces the stored one under the patch merge, so a blanked city and county are cleared", () => {
+    const stored = makeFacility({
+      location: { lat: 30, lon: -90, state: "TX", city: "Austin", county: "Travis", precision: "exact" },
+    });
+    const state = facilityToFormState(stored);
+    state.location.city = "";
+    state.location.county = "";
+
+    const merged = mergeFacilityPatch(stored, buildFacilityPayload(state));
+
+    expect(merged.location).toEqual({ lat: 30, lon: -90, state: "TX", precision: "exact" });
   });
 
   it("always submits capacityMw as a complete object even when only one sub-field is set", () => {
@@ -224,6 +246,7 @@ describe("FacilityForm — create mode", () => {
   beforeEach(() => {
     mockPush.mockClear();
     mockToastSuccess.mockClear();
+    mockToastWarning.mockClear();
     mockToastError.mockClear();
     mockCreateFacilityAction.mockClear();
     mockUpdateFacilityAction.mockClear();
@@ -235,7 +258,13 @@ describe("FacilityForm — create mode", () => {
   });
 
   it("resets the type-conditional state slice when facilityType changes", async () => {
-    const user = userEvent.setup();
+    // `delay: null` disables user-event's per-keystroke `setTimeout` round-trip
+    // (see fillRequiredFields below) — with the default `delay: 0`, each of the
+    // ~35 characters typed by this test still schedules a real macrotask via
+    // `setTimeout(resolve, 0)`, and under full-suite CPU contention those add up
+    // to multiple seconds, blowing the default 5000ms testTimeout with no
+    // functional failure (flaky under load, passes reliably in isolation).
+    const user = userEvent.setup({ delay: null });
     const state = emptyFacilityFormState();
     state.facilityType = "crypto_mining";
     state.mining = { hashRateThPerS: 500 };
@@ -287,7 +316,7 @@ describe("FacilityForm — create mode", () => {
   }
 
   it("surfaces field-level errors from a 400 response's issues array", async () => {
-    const user = userEvent.setup();
+    const user = userEvent.setup({ delay: null });
     mockCreateFacilityAction.mockResolvedValue({
       ok: false,
       status: 400,
@@ -307,7 +336,7 @@ describe("FacilityForm — create mode", () => {
   });
 
   it("redirects to /admin/facilities and toasts on success", async () => {
-    const user = userEvent.setup();
+    const user = userEvent.setup({ delay: null });
     mockCreateFacilityAction.mockResolvedValue({
       ok: true,
       facility: { id: "new-dc", name: "New DC" },
@@ -320,6 +349,28 @@ describe("FacilityForm — create mode", () => {
 
     await waitFor(() => expect(mockPush).toHaveBeenCalledWith("/admin/facilities"));
     expect(mockToastSuccess).toHaveBeenCalled();
+  });
+
+  // Regression coverage for lib/facility-write.ts's recordFacilityHistory:
+  // the facility write can succeed while its facility_history audit row
+  // fails to insert. That must still redirect (the write itself succeeded)
+  // but warn instead of silently celebrating a clean success.
+  it("shows a warning toast (not success) when created but the audit row failed to record", async () => {
+    const user = userEvent.setup({ delay: null });
+    mockCreateFacilityAction.mockResolvedValue({
+      ok: true,
+      facility: { id: "new-dc", name: "New DC" },
+      historyRecorded: false,
+    });
+
+    render(<FacilityForm mode="create" initialState={emptyFacilityFormState()} />);
+
+    await fillRequiredFields(user);
+    await user.click(screen.getByRole("button", { name: /create facility/i }));
+
+    await waitFor(() => expect(mockPush).toHaveBeenCalledWith("/admin/facilities"));
+    expect(mockToastWarning).toHaveBeenCalled();
+    expect(mockToastSuccess).not.toHaveBeenCalled();
   });
 });
 
@@ -337,7 +388,7 @@ describe("FacilityForm — edit mode", () => {
   });
 
   it("calls updateFacilityAction with the id and a shape-complete payload", async () => {
-    const user = userEvent.setup();
+    const user = userEvent.setup({ delay: null });
     mockUpdateFacilityAction.mockResolvedValue({
       ok: true,
       facility: { id: "test-facility", name: "Test Facility" },

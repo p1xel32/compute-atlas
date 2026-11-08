@@ -1,0 +1,159 @@
+// Shared field-kind declarations for the field-extraction bench -- imported by BOTH
+// run.mjs (builds the model prompt) and rescore.mjs (scores the result).
+//
+// Precedent: quote.mjs is a shared module for exactly this reason ("a gate
+// bug must be fixable without re-spending a model run" / "so rescore.mjs
+// can RECOMPUTE it"). This module exists so the field-kind/vocabulary map
+// can't drift between the file that prompts the model and the file that
+// scores it -- declare it ONCE, here, and import it on both sides.
+
+export const KIND = {
+  NUMERIC: "numeric",
+  ENUM: "enum",
+  TEXT: "text",
+};
+
+// field -> kind. The four existing capacity/generation fields stay NUMERIC
+// (scored via the original num()/close() 5%-tolerance path, unchanged).
+export const FIELD_KINDS = {
+  capacityAny: KIND.NUMERIC,
+  capacityPlanned: KIND.NUMERIC,
+  capacityOperational: KIND.NUMERIC,
+  onSiteGenerationMw: KIND.NUMERIC,
+  coolingType: KIND.ENUM,
+  energySource: KIND.ENUM,
+  energyUtility: KIND.TEXT,
+  aiClassification: KIND.ENUM,
+  aiClassificationStated: KIND.ENUM,
+  aiClassificationConfirmed: KIND.ENUM,
+};
+
+/** kind for a field, defaulting to NUMERIC for anything undeclared -- keeps
+ * pre-existing behaviour for any field this map doesn't yet know about. */
+export function fieldKind(field) {
+  return FIELD_KINDS[field] ?? KIND.NUMERIC;
+}
+
+// Closed vocabularies for ENUM fields. Copied from lib/schema.ts:
+//   coolingType      <- waterSchema.coolingType   (the DATA CENTER cooling
+//                        system -- NOT miningSchema.coolingType, which is a
+//                        separate field with its own "immersion"/"hydro" values
+//                        and no "evaporative"/"closed_loop")
+//   energySource     <- energySchema.source
+//   aiClassification <- aiClassificationEnum
+// Verified against lib/schema.ts on 2026-09-01: coolingType and energySource
+// match exactly. aiClassification verified against lib/schema.ts (aiClassificationEnum,
+// `z.enum(["confirmed", "likely", "mixed_use"])`) on 2026-09-12: matches exactly.
+// Unlike coolingType (has "unknown") and energySource (has "other"), this
+// vocabulary has NO abstention/"unknown" member and NO member meaning "not
+// AI" -- every member asserts SOME tie to AI compute. A page that does not
+// tie the facility to AI is represented by `null` (not asserting a value),
+// never by a vocabulary member.
+//
+// aiClassificationStated is the SAME task as aiClassification with the
+// `likely` tier removed -- a deliberate variant run, NOT a duplicate to be
+// deduplicated away. Both must coexist so the two vocabularies can be
+// measured against each other on the same pages.
+// It is NOT a schema change and NOT "a subset of lib/schema.ts's enum" in
+// any sense that should propagate: aiClassificationEnum still has three
+// members (`confirmed`, `likely`, `mixed_use`) and is unchanged. This
+// two-value vocabulary is a BENCH INSTRUMENT only -- it exists to measure a
+// prompt, and nothing may write it to a facility.
+export const FIELD_ENUM_VALUES = {
+  coolingType: ["evaporative", "air", "closed_loop", "hybrid", "unknown"],
+  energySource: ["grid", "on_site_gas", "nuclear", "solar", "wind", "hydro", "mixed", "other"],
+  aiClassification: ["confirmed", "likely", "mixed_use"],
+  aiClassificationStated: ["confirmed", "mixed_use"],
+  // The ONE-value variant. Same task again, vocabulary narrowed to a single
+  // member, to test whether the two-value run's "confirmed answered 14 times,
+  // right 14 times" survives the removal of the tier that was absorbing the
+  // marketing pages. That section of the README warns in as many words that it
+  // must not be assumed to.
+  // A one-member enum is not a degenerate case to optimise away: `confirmed`
+  // vs abstain is a real binary task, and the vocabulary machinery
+  // (isInVocabulary, normalizeEnum) is what keeps its scoring identical to the
+  // other two runs rather than a second scoring path that could differ.
+  // ⛔ BENCH INSTRUMENT ONLY, like aiClassificationStated. lib/schema.ts's
+  // aiClassificationEnum still has three members and is unchanged; nothing may
+  // write this to a facility.
+  aiClassificationConfirmed: ["confirmed"],
+};
+
+export function isInVocabulary(normalizedValue, vocabulary) {
+  // Array.isArray is not ceremony: a STRING vocabulary would silently fall
+  // through to String.prototype.includes and do a SUBSTRING match instead of
+  // an exact one — e.g. "air" would "match" the string "hybrid,air,unknown".
+  // Fail closed on a wrong-typed argument rather than scoring against it.
+  return Array.isArray(vocabulary) && vocabulary.includes(normalizedValue);
+}
+
+// ── Normalisation ───────────────────────────────────────────────────────
+
+/** ENUM normaliser: lowercase, trim, collapse whitespace, treat "-" and
+ * whitespace as "_" -- so "closed loop" / "Closed-Loop" / "CLOSED_LOOP"
+ * all normalise to the single token "closed_loop". Returns null for
+ * null/undefined/empty input (an abstention, not a value). */
+export function normalizeEnum(v) {
+  if (v === null || v === undefined) return null;
+  const s = String(v).toLowerCase().trim().replace(/\s+/g, " ").replace(/[\s-]/g, "_");
+  return s || null;
+}
+
+/** TEXT normaliser: lowercase, trim, collapse internal whitespace, strip
+ * trailing punctuation. Deliberately NOT fuzzy / edit-distance -- a fuzzy
+ * matcher would make the bench's own scoring a source of error. A labeller
+ * who needs a variant to match lists it in truth.json's accept<Field>
+ * alternates array instead (e.g. "Georgia Power" / "Georgia Power
+ * Company"), the same mechanism numeric fields already use. */
+export function normalizeText(v) {
+  if (v === null || v === undefined) return null;
+  const s = String(v).toLowerCase().trim().replace(/\s+/g, " ").replace(/[.,;:!?]+$/, "");
+  return s || null;
+}
+
+/** Normalised exact-match for ENUM fields. */
+export function enumEquals(a, b) {
+  const na = normalizeEnum(a);
+  const nb = normalizeEnum(b);
+  return na !== null && nb !== null && na === nb;
+}
+
+/** Normalised exact-match for TEXT fields. */
+export function textEquals(a, b) {
+  const na = normalizeText(a);
+  const nb = normalizeText(b);
+  return na !== null && nb !== null && na === nb;
+}
+
+// ── NUMERIC (moved here verbatim from rescore.mjs, unchanged, so the
+// comparison logic for ALL three kinds is testable from one module rather
+// than trapped inside rescore.mjs's main loop) ─────────────────────────────
+
+/** Coerce a value to a number by pulling the first number-looking substring
+ * out of it. Returns null if nothing numeric is found. */
+export function numericValue(v) {
+  if (v === null || v === undefined) return null;
+  if (typeof v === "number") return v;
+  const m = String(v).match(/-?[\d,.]+/);
+  if (!m) return null;
+  const n = Number(m[0].replace(/,/g, ""));
+  return Number.isFinite(n) ? n : null;
+}
+
+/** 5%-relative-tolerance numeric match. */
+export function numericClose(a, b) {
+  return a !== null && b !== null && Math.abs(a - b) / Math.max(Math.abs(a), Math.abs(b), 1) < 0.05;
+}
+
+/** The capacityMw.operational prompt, shared by run.mjs (bench) and pinned
+ * equal to extract-fields.ts FIELD_DESCRIPTIONS["capacityMw.operational"] by
+ * fields.test.ts. The four rule sentences are verbatim from
+ * docs/methodology.md#operational-capacity (Ed's ruling 2, research3, 2026-10-28,
+ * plus rulings (a) crypto current draw and (b) UPS, 2026-10-29, and the
+ * 2026-10-30 tightening: Ed, projected, expected or planned crypto draws do not count). */
+export const CAPACITY_OPERATIONAL_DESCRIPTION =
+  "the facility's CURRENTLY OPERATIONAL (already online) capacity, in megawatts (MW). " +
+  "Operational capacity is IT capacity only. A utility feed, power supply, building power, UPS or generator figure is not IT capacity. " +
+  "If a source states only such a figure, the field is left unrecorded and the figure is described in the notes as what it is. " +
+  "For a crypto-mining site, a stated current power draw (one in effect now, not projected, expected or planned) counts as operational capacity; a contracted, interconnection, substation or building figure does not. " +
+  "A figure the page calls IT load, critical IT load or IT capacity counts. So if the page states only a utility, building, generator, UPS or power-supply figure, answer null and say in reasonIfNull what that figure measures.";

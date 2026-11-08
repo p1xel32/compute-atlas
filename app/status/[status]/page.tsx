@@ -2,40 +2,17 @@ import { notFound } from "next/navigation";
 import type { Metadata } from "next";
 
 import { getFacilitiesByStatus } from "@/lib/data";
-import { STATUS_ORDER, STATUS_META, type Status } from "@/lib/status";
-import type { Facility } from "@/lib/schema";
+import {
+  STATUS_CAPACITY_LABEL,
+  capacityTierForStatus,
+  sumCapacityMw,
+} from "@/lib/capacity-sums";
+import { formatPower } from "@/lib/format";
+import { STATUS_ORDER, STATUS_META, parseStatus, type Status } from "@/lib/status";
+import { statesPhrase } from "@/lib/us-states";
 import { CollectionPage } from "@/components/collection/collection-page";
 
-export const revalidate = 3600;
-
-/** Formats a MW figure as GW (1 decimal) above 1000, else whole MW. Mirrors app/states/[state]/page.tsx's formatPower. */
-function formatPower(mw: number): string {
-  if (mw >= 1000) {
-    return `${(mw / 1000).toFixed(1)} GW`;
-  }
-  return `${Math.round(mw)} MW`;
-}
-
-/**
- * The capacity figure shown in each status page's stat row: operational
- * capacity for the operational status, planned capacity for every other
- * (announced-but-not-yet-running) status — a cancelled project's "planned"
- * figure is the capacity that was announced before the cancellation.
- */
-function sumCapacityForStatus(facilities: Facility[], status: Status): number {
-  if (status === "operational") {
-    return facilities.reduce((sum, f) => sum + (f.capacityMw?.operational ?? 0), 0);
-  }
-  return facilities.reduce((sum, f) => sum + (f.capacityMw?.planned ?? 0), 0);
-}
-
-const CAPACITY_STAT_LABEL: Record<Status, string> = {
-  operational: "Operational capacity",
-  under_construction: "Planned capacity",
-  permitted: "Planned capacity",
-  proposed: "Planned capacity",
-  cancelled: "Planned capacity (cancelled)",
-};
+export const revalidate = 86400;
 
 /**
  * Per-status editorial copy — title (inherits the root layout's
@@ -84,10 +61,6 @@ const STATUS_PAGE_META: Record<
   },
 };
 
-function parseStatus(raw: string): Status | undefined {
-  return STATUS_ORDER.find((s) => s === raw);
-}
-
 export async function generateStaticParams() {
   return STATUS_ORDER.map((status) => ({ status }));
 }
@@ -134,19 +107,19 @@ export default async function StatusPage({
   const facilities = await getFacilitiesByStatus(status);
   const meta = STATUS_PAGE_META[status];
   const statusLabel = STATUS_META[status].label;
-  const capacityMw = sumCapacityForStatus(facilities, status);
+  const capacityMw = sumCapacityMw(facilities, capacityTierForStatus(status));
 
   // Dataset-derived fact line: distinct state count mirrors getStats()'s
   // `new Set(...).size` math. facilities.length is reused rather than a
   // separate getStatusCounts() call — getFacilitiesByStatus already gives
   // the exact per-status count. Omitted entirely when the status is empty
   // (the CollectionPage emptyMessage below covers that case instead).
-  const stateCount = new Set(facilities.map((f) => f.location.state)).size;
+  const stateCodes = new Set(facilities.map((f) => f.location.state));
   const factLine =
     facilities.length > 0
       ? `${facilities.length} ${statusLabel.toLowerCase()} facilit${
           facilities.length === 1 ? "y" : "ies"
-        }, spanning ${stateCount} state${stateCount === 1 ? "" : "s"}.`
+        }, spanning ${statesPhrase(stateCodes)}.`
       : null;
 
   return (
@@ -165,7 +138,7 @@ export default async function StatusPage({
       ]}
       statRow={[
         { label: "Sites", value: String(facilities.length) },
-        { label: CAPACITY_STAT_LABEL[status], value: formatPower(capacityMw) },
+        { label: STATUS_CAPACITY_LABEL[status], value: formatPower(capacityMw) },
       ]}
       facilities={facilities}
       emptyMessage={`No ${statusLabel.toLowerCase()} facilities are on file yet.`}

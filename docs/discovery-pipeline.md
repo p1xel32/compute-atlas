@@ -1,15 +1,15 @@
-# Discovery pipeline (Phase 5)
+# Discovery pipeline
 
 A local, scheduled, subscription-powered pipeline that proposes candidate
-facilities into the Phase 4 staging queue AND re-checks existing facilities
+facilities into the staging queue AND re-checks existing facilities
 for genuine status changes. It NEVER writes live facilities — every candidate
 (new or updated) lands as a `pending` row in `submissions`, reviewed and
-approved/rejected by a human via the Phase 4 CLI.
+approved/rejected by a human via the `submissions` CLI.
 
 ## Architecture
 
 ```
-run.sh (launchd, daily)
+run.sh (launchd, Mon/Wed/Fri)
   1. kill switch check (fail-closed)
   2. pick next state from a rotation cursor
   3. fetch existing-facilities projection for state
@@ -22,7 +22,13 @@ run.sh (launchd, daily)
   each candidate against `facilitySchema`, dedupes against the live facility
   set (by `id` and by case-insensitive `name`+`state`+`city`), classifies as
   `create`/`update`, caps how many it submits per run, and POSTs to
-  `/api/submissions` with `Authorization: Bearer $API_ADMIN_TOKEN`.
+  `/api/submissions` with `Authorization: Bearer <token>`, where the token is
+  `API_INTAKE_TOKEN || API_ADMIN_TOKEN` (`submissionToken()`). The intake token is
+  accepted by that one route and nothing else. The scheduled run sets
+  `DISCOVERY_REQUIRE_INTAKE_TOKEN=1`, which drops the admin fallback; manual runs keep it.
+  This narrows submissions only: the pipeline still holds the owner `DATABASE_URL` in
+  `.env.local` for the leads lane, retention-prune and publish-heartbeat. See the `API_INTAKE_TOKEN` section in
+  `docs/maintainers.md`.
 - `scripts/discovery/run.sh` — the scheduled harness. Owns the kill switch,
   the state-rotation cursor, the existing-facilities fetch, the single
   `claude -p` research call, and coordination with source-liveness checks.
@@ -32,9 +38,14 @@ run.sh (launchd, daily)
   also runs under a `timeout`/`gtimeout` wall-clock cap when one is available
   (macOS ships neither by default — in that case it runs uncapped and logs a
   WARN).
+- `scripts/discovery/verify-source.ts`, `ollama-client.ts`, `fetch-page-text.ts`,
+  `net-guard.ts` — the source verification gate. Before a candidate can be
+  staged, its source URLs are fetched and mechanically checked against the
+  claim using a local Ollama model. See "Source verification gate" below.
 - `scripts/discovery/discovery-prompt.txt` — the bounded, single-session
-  research prompt template. Contains two responsibilities: (1) discover
-  net-new facilities, (2) re-check existing facilities for status changes.
+  research prompt template. Contains four responsibilities: (1) discover
+  net-new facilities, (2) re-check existing facilities for genuine status changes,
+  (3) enrich missing facts on existing facilities, and (4) re-source dead links.
   Uses `{{STATE}}` and `{{EXISTING_FACILITIES}}` placeholders substituted
   by `run.sh`.
 - `scripts/discovery/existing-facilities.ts` — projects a compact line-per-facility
@@ -49,19 +60,20 @@ run.sh (launchd, daily)
 
 ## The combined-pass model
 
-Since Phase 5 launch (s30, 2026-07-14), each scheduled invocation now does
+Each scheduled invocation does
 **both** discovery of net-new facilities AND re-checking of existing facilities
-in a single daily `claude -p` call, driven by a two-responsibility prompt.
+in a single per-run `claude -p` call, driven by a four-responsibility prompt.
 
-- **Single call, dual responsibility:** `discovery-prompt.txt` directives:
+- **Single call, four responsibilities:** `discovery-prompt.txt` directives:
   (1) research net-new AI/crypto/power facilities in the state, (2) re-check
   existing facilities in that state for genuine status changes since their
-  `statusHistory` was last updated. Both results are combined into one output
+  `statusHistory` was last updated, (3) enrich missing facts on existing
+  facilities, and (4) re-source dead links. Results are combined into one output
   array and submitted in a single batch.
 - **{{EXISTING_FACILITIES}} injection:** `existing-facilities.ts` projects
   a compact line-per-facility view, one per line:
-  `id | name | operator | status | <latest statusHistory date> | <primary source url>`.
-  Kept compact (~100 chars/line) so a large state (TX, ~43 facilities) stays
+  `id | name | operator | status | <latest statusHistory date> | <primary source url> | missing:<comma-separated enrichable families, or "none">`.
+  The `missing:` field lists enrichable fields (capacity, energy, water, jobs, community, etc.) that Compute Atlas does not yet have for that facility, driving Responsibility 3 (enrichment). Kept compact (~100 chars/line) so a large state stays
   well under 5KB in the prompt. `run.sh` fetches this projection fail-open
   (logs a warning to the run log and `existing-facilities.err` on failure;
   proceeds with an empty string if unavailable), and injects it via a
@@ -69,56 +81,314 @@ in a single daily `claude -p` call, driven by a two-responsibility prompt.
   content — critical because facility names, operators, and URLs may contain
   slashes, ampersands, newlines, and shell metacharacters.
 
-## Full-document update semantics
+## Update and enrichment semantics: append-only intent model
 
-When the discovery prompt finds a genuine status change (e.g., "proposed" →
-"under_construction" → "operational") and emits an update for an existing
-facility:
+Discovery (Responsibilities 2, 3, and 4) never reconstructs full facility documents.
+Instead, it emits compact, append-only intents that the server applies safely:
 
-- **Complete vs. partial:** The update MUST be a complete, valid facility
-  document (same schema, same `id`), NOT a partial patch. The staging queue
-  classification logic (`submit-candidates.ts:150-155`) matches by `id` to
-  determine whether a submission is a `create` or `update`. An update then
-  routes to `approveSubmission` → `updateFacility`, which replaces the
-  entire facility record.
-- **statusHistory semantics:** APPEND a new entry to the existing
-  `statusHistory` array (new status + today's date), never replace or reorder.
-  The entry includes the index of the new source that corroborates the change.
-  Existing history must remain intact — `statusHistory` is the immutable audit
-  trail.
-- **Field rules:**
-  - `status`: updated to the new, source-backed status.
-  - `lastUpdated`: bumped to today's date.
-  - `sources`: APPEND the new corroborating source to the existing sources
-    array. If you cannot reconstruct the full prior sources array, include
-    at minimum the projection's primary source URL plus your new source, so
-    the array stays non-empty and traceable.
-  - **All other fields** (name, operator, location, capacity, type, confidence):
-    carried through unchanged. This is a status-only refresh, not a full-fact
-    refresh — do not attempt to verify/update anything except status/history/
-    sources/lastUpdated.
-- **Fail-safe:** If the prompt cannot find a genuine, citable status change
-  for a facility listed in the projection, do not emit an entry for it at all.
-  Do not "refresh" or touch a facility merely because it appeared in the list
-  — omit it entirely from the output.
+### Status updates (Responsibility 2)
+
+When a genuine status change is found (e.g., "proposed" → "under_construction"),
+emit a `statusUpdate` intent:
+```json
+{ "statusUpdate": { "targetFacilityId": "<exact id from projection>",
+  "status": "<new status>", "date": "<today, YYYY-MM-DD>",
+  "note": "<brief sourced explanation>",
+  "sources": [ { "url": "...", "label": "...", "retrievedAt": "...", "kind": "..." } ]
+}, "provenance": { "sources": ["<url>"], "confidence": "confirmed", ... } }
+```
+The server appends the new source(s) to the facility's sources array, adds a
+statusHistory entry (with sourceIndex pointing to the first appended source),
+and preserves all existing fields. The facility never loses prior sources,
+history entries, or sourceIndex references.
+
+**Fail-safe:** If no genuine, citable status change is found, emit nothing for that facility.
+
+### Enrichment updates (Responsibility 3)
+
+For missing facts listed in the `missing:` token, emit an `enrichmentUpdate` intent.
+The enrichable families go inside a strict `fields` object (the server rejects unknown
+keys), and `sources` / `date` sit alongside it:
+```json
+{ "enrichmentUpdate": { "targetFacilityId": "<id>",
+  "date": "<today, YYYY-MM-DD>",
+  "sources": [ { "url": "...", "label": "...", "retrievedAt": "...", "kind": "..." } ],
+  "fields": { "capacityMw": { "operational": 100 }, "energy": { "source": "solar" } }
+}, "provenance": { ... } }
+```
+Fill ONLY families listed in that facility's `missing:` token (`capacityMw`, `energy`,
+`water`, `location`, `investmentUsd`, `landAcres`, `aiClassification`, `jobs`,
+`community`, `subsidies`). Enrichment is fill-missing, not overwrite: the server sets a
+family only when the curated record doesn't already have it, and appends the new
+sources — it never reorders or drops existing sources. Families that carry their own
+citation (`jobs`, `community`, `subsidies`) include a `sourceRel` index into this
+intent's own `sources[]`.
+
+### Source refresh (Responsibility 4)
+
+When a facility's projection carries a trailing `=== DEAD SOURCES (re-source these) ===`
+block (`facilityId | deadUrl` lines, fed from the prior check-sources report), find a
+currently-live replacement citation for the same fact and fold it into that facility's
+`enrichmentUpdate`: include the replacement in `sources`, and add a `reSourced` entry —
+`{ "replacesUrl": "<exact dead url>", "sourceRel": <index of the replacement within this
+intent's sources[]> }`. The dead source is never removed — the server only appends the
+fresh citation (a human prunes later). Responsibility 3 fills and Responsibility 4
+re-sourcing for the same facility may be combined into one `enrichmentUpdate` element.
+
+**Key principle:** Every intent is validated against the facility schema server-side.
+Never restate fields you cannot see from the projection or prior submissions.
+Omit a field if you have no new citable source for it.
+
+## Source verification gate (local Ollama)
+
+Every candidate source URL is fetched and mechanically checked against the claim
+it is cited for before that candidate can become a `pending` submission. The
+gate lives in `submit-candidates.ts` and is **on by default** — `verify-source.ts`
+runs the check, `ollama-client.ts` talks to a local Ollama instance, and
+`fetch-page-text.ts` (behind `net-guard.ts`) does the SSRF-guarded fetch.
+
+**Why a local model.** Measured beforehand: a local model is unreliable at
+*proposing* facts — 0/5 source URLs survived an open-ended discovery test, every
+one fabricated — but strong at *checking* a grounded claim against fetched page
+text (12/12). The gate only ever asks it to check a claim it has been handed,
+never to propose one. Verification runs entirely on the machine; it never calls
+a metered API.
+
+### Configuration
+
+All optional; defaults come from `ollama-client.ts`.
+
+| Variable | Default | Notes |
+|---|---|---|
+| `OLLAMA_BASE_URL` | `http://localhost:11434` | |
+| `OLLAMA_VERIFY_MODEL` | `gpt-oss:20b` | must be pulled locally |
+| `OLLAMA_TIMEOUT_MS` | `120000` | per-call abort timeout; used when it parses as a positive finite number, otherwise the default |
+| `VERIFY_SOURCES_ENABLED` | gate is on | `false` is the only opt-out |
+
+For installation and setup, see [discovery-runbook.md](./discovery-runbook.md).
+
+### When Ollama is unreachable
+
+If the daemon is down or the model is not pulled, the gate returns `unavailable`
+and the run **aborts rather than submitting unverified candidates**. This is
+deliberate: `unavailable` means "we could not check", never "the source is bad".
+Collapsing the two would make an Ollama outage indistinguishable from a run that
+caught a dozen fabrications. A `http_error_404` reason is the likeliest
+real-world trigger — the model is not pulled (fresh machine, pruned model, or a
+typo in `OLLAMA_VERIFY_MODEL`).
+
+One exception: a single model call that hits the per-call timeout
+(`OLLAMA_TIMEOUT_MS`) is flagged `modelTimedOut` on its result. The submit gate
+then probes Ollama (`GET /api/tags` within 5 s, verify model present). If the
+probe is healthy, that source does not verify and the remaining sources are
+still checked: if another source verified the candidate stages normally; if
+another escalated it stages with an escalation note that also names the
+timed-out URL; if none did, the candidate is held for manual review (counted in
+`skippedUnverified`, logged as `skip unverified: <id> — verification call timed
+out while Ollama was healthy …`) and the run continues. If the probe fails, the
+run aborts as above (a probe that throws counts as failed). At most 3 such
+timeouts are tolerated per `runSubmit` invocation; the 4th aborts, because Ollama is then degraded. Any other
+`unavailable` cause (network error, non-2xx, malformed or empty content) aborts
+immediately with no probe.
+
+### Performance
+
+Measured with `gpt-oss:20b` on Ollama 0.32.7, Apple Silicon:
+
+- **~8–13s per verification call** — 8.4s at ~12k chars of page text, 12.6s at
+  ~22.5k.
+- **Parallelisation (default vs. tuned):** At the default `OLLAMA_NUM_PARALLEL=1`,
+  Ollama serialises requests on the GPU, achieving only 1.04× speedup at 5-way
+  concurrency — the overhead barely recoups fetch-bound gains. Setting
+  `OLLAMA_NUM_PARALLEL=4` does raise throughput to ~1.25×–1.31×, but with a
+  critical tradeoff: determinism breaks. At `temperature: 0`, identical input
+  yields different answers when sharing a `-np 4` batch with other prompts —
+  one extraction (`crane-pdx02`, `capacityMw.operational`) returned `48`
+  consistently when run alone, but flipped to `null` roughly 1-in-6 in a
+  concurrent batch. This reproducibility loss invalidates any benchmark and
+  makes bulk runs unauditable. **Parallelism is not used for this reason.** If
+  throughput ever binds, the answer is more machines or a smaller model, not
+  higher concurrency.
+- Page text is capped at `MAX_PAGE_TEXT_CHARS` (60,000) in `verify-source.ts`,
+  coupled to the client's `num_ctx` of 32768 — **raising one requires revisiting
+  the other.** Not cosmetic: submitting ~11,572 tokens at `num_ctx=2048` was
+  measured to evict ~97% of the prompt, system prompt included, after which the
+  model followed an instruction injected at the end of the page text.
+
+### Known limitation: name matching, not entity resolution
+
+The model matches names near-literally. Same page, same gate, only the entity
+name changed: `springfieldohio.gov`'s "5C Data Center FAQs" page *verifies* the
+name `5C Data Center` but *rejects* `5C Group / Vultr Data Center (Prime Ohio)`,
+which is that facility's `name` in the dataset. A source that refers to a site by
+a different name — subsidiary, tenant, project codename, operator rather than
+site — can be rejected even though the citation is genuine. 241 of 937 records
+(26%) **as measured 2026-08-14** carry composite names of that shape. Read gate output with that in mind: a
+rejection is not proof that a citation is bad.
+
+## Restricted-source guard (legal compliance)
+
+Before any fetch, `verifySource()` checks the candidate's URL domain against a
+shared blocklist in `lib/restricted-sources.ts`. Each blocked domain carries a
+reason and the date its terms were read. A restricted URL is rejected
+immediately — the page is never requested. Currently: `interconnection.fyi`.
+
+**Why it exists.** A permissive `robots.txt` answers "you may crawl this page";
+Terms of Use answer "you may not republish what you found." Compute Atlas
+publishes under CC-BY-4.0 — explicit redistribution — so upstream terms bind
+harder precisely because our licence is permissive. A link to a restricted source
+is not redistribution and is not guarded. This gate prevents **data ingestion**,
+not citation.
+
+**Three test layers:** (1) unit tests on the matcher, (2) pipeline tests asserting
+the fetcher is never called for a restricted URL (zero network calls), and (3) a
+dataset regression test over `data/facilities.json` that names offending
+facility ids and URLs.
+
+**Why a guard, not one-off cleanup.** An earlier pass swept these citations by
+hand with no guard, and the pipeline re-introduced them within days. The guard
+prevents silent regression. The legitimate route when discovery identifies a
+promising project: use an aggregator by hand to *find* it, then cite the
+infrastructure operator's own published queue (the ISO's interconnection
+request list, an RTO's generation queue) rather than the aggregator.
 
 ## Safety properties
 
-- **Staging-only:** the pipeline only ever calls `POST /api/submissions`. It
-  never calls `/api/facilities` and never edits `data/facilities.json`.
+- **Staging-only:** the pipeline's only write is `POST /api/submissions`. It
+  reads the existing facilities directly from Neon via `DATABASE_URL`, falling
+  back loudly to `data/facilities.json`, and never edits `data/facilities.json`.
   Promotion to a live facility (new or updated) happens only via `npm run submissions --
-  approve <id>` (Phase 4), a deliberate human action.
+  approve <id>`, a deliberate human action.
 - **Fail-closed kill switch:** `run.sh` exits 0 immediately unless
   `DISCOVERY_ENABLED=true` is set in the environment, or if
   `discovery-logs/DISABLED` exists. The launchd plist deliberately does NOT
   set `DISCOVERY_ENABLED` — enabling it is a separate, deliberate step.
-- **Bounded per run:** one state per run (rotation cursor), `--max` candidates
-  (new + updated combined) submitted per run (default 5, override via `MAX_CANDIDATES`).
+- **Bounded per run:** `STATES_PER_RUN` states per run (default **3** since
+  2026-10-09; was 2 from 2026-08-14 — see below) from the rotation cursor, each
+  capped at `--max` candidates (new + updated combined). The cap **self-reverts**: burst for the
+  first 20 days from the burst-start date baked into `run.sh`, then the steady
+  value — no manual step to revert. `STEADY_CAP` was raised **25 → 30**
+  (2026-09-13, +20%: 2×25=50/day → 2×30=60/day) alongside the rotation
+  expansion below; `BURST_CAP` stayed at 25. The burst window expired
+  2026-08-19 and is confirmed still inactive as of 2026-09-13 (45 days past
+  `BURST_START_DATE`, past `BURST_DAYS=20`), so `compute_cap()` returns
+  `STEADY_CAP` unconditionally today and this change has no burst-side effect
+  right now. It would if `BURST_START_DATE` is ever re-dated to reactivate a
+  burst window without also raising `BURST_CAP` to at least `STEADY_CAP` —
+  that would make the "burst" briefly LOWER the cap than steady instead of
+  exceeding it, so whoever re-dates it next must raise `BURST_CAP` too.
+  `STATES_PER_RUN` was deliberately **not** raised in this same change (see
+  "Cadence" below for why); the cap increase, not a batch-size increase, is
+  this round's throughput lever.
+  The cap applies **per submit call**: one per state inside the rotation loop,
+  **plus** a separate enrichment submit that runs once per batch outside it. So
+  the real per-run ceiling is `(STATES_PER_RUN × cap) + cap` — **120** at the
+  current defaults (3 × 30 + 30, since 2026-10-09). It was **90** at 2 states
+  (2 × 30 + 30) and **75** before the 2026-09-13 cap raise (2 × 25 + 25). This
+  counts only the per-state and enrichment `submit-candidates` calls; the
+  leads lane (`LEADS_LIMIT`, see the runbook) is bounded separately. It is a ceiling,
+  not a target: measured from Neon on 2026-09-09, the prior 14 days ran
+  ~14–34 approved submissions/day across all states, against a pending queue
+  of 0. `MAX_CANDIDATES` in the environment overrides the computed cap
+  (escape hatch / tests).
+- **Fail-loud source verification:** every candidate's source URLs are fetched
+  and mechanically checked against the claim before staging (see the gate
+  above). If the local Ollama model is unreachable or not pulled, the check
+  returns `unavailable` and the run **aborts** — it never falls back to
+  submitting unverified candidates (a lone per-call timeout with a healthy Ollama
+  holds that one candidate instead; see "When Ollama is unreachable").
+  `unavailable` means "we could not check", not "the source is bad"; the two are deliberately kept distinct so an Ollama
+  outage can't look like a run that caught fabrications. The only opt-out is an
+  explicit `VERIFY_SOURCES_ENABLED=false`.
 - **No silent drops:** every skipped candidate (invalid schema, missing
   sources, duplicate, over cap, no genuine status change) is logged with a
   reason, both to stdout and to a JSON run summary in `discovery-logs/run-<runId>.json`.
+- **Survives a session-limit / unparseable reply:** if the `claude -p` call
+  exits nonzero (e.g. "You've hit your session limit") or returns no parseable
+  JSON array, the run no longer crashes under `set -e` — it logs a WARN, skips
+  the submit step (nothing to stage), still runs the source-liveness check, and
+  records the outcome in the heartbeat below.
+- **Heartbeat:** every real (non-dry-run) invocation writes
+  `discovery-logs/heartbeat.json` — top-level `lastRunAt`, `status`
+  (`ok` | `degraded`) and `failureCount`, plus a `states[]` array of
+  `{ runId, state, claudeStatus, elapsedSecs }`. A stale `lastRunAt` means the
+  scheduled job isn't running (a launchd sleep-skip or crash); `claudeStatus:
+  no_array` means the run reached `claude` but got a session-limit/prose reply
+  rather than candidates. A manual dry-run deliberately does not write the
+  heartbeat, so it never masks a real launchd failure.
+- **Alerting — the signal you can rely on is off-machine.** ⚠️ From 2026-08-08
+  to 2026-08-14 the heartbeat recorded `claudeStatus: no_array` — total failure
+  — **every day for six days and nothing surfaced it.** The instrument worked;
+  nobody read it. A failed run and a perfect one were indistinguishable from
+  outside: both logged, both wrote a heartbeat, both exited 0.
+
+  *The response then (2026-08-14):* any state that produces no parseable array,
+  fails to submit, or overruns the wall-clock cap is recorded in a failure
+  ledger, and at the very end of the run that ledger (a) fires a desktop
+  notification via `terminal-notifier` (falling back to `osascript`) and (b)
+  makes `run.sh` **exit 1**, so launchd records a failed run too.
+  `DISCOVERY_NOTIFY=false` suppresses only the notification. The alert is
+  deliberately the *last* thing in the script — after submit, source-liveness
+  and heartbeat — so it can never cost the run work it would otherwise have
+  completed, and a clean run stays silent and exits 0.
+
+  ⚠️ *Why that was not sufficient (measured 2026-09-28):* **neither half is a
+  delivered signal.** Through the outage `notify()` ended both of its arms in
+  `>/dev/null 2>&1 || true`, so a send that reached nobody was indistinguishable
+  from one that landed and nothing recorded which happened, and its
+  `DISCOVERY_NOTIFY` early return was equally silent. `notify()` in
+  `scripts/discovery/run.sh` was made legible on 2026-09-28: each arm's
+  status is captured with `|| rc=$?` and every call logs one of four outcomes —
+  `SUPPRESSED` (the `DISCOVERY_NOTIFY` early return at the top of `notify()`),
+  `NO NOTIFIER DISPATCHED`, `dispatched`, or `FAILED`. That
+  makes the *attempt* auditable, not the delivery — both notifiers exit 0 with
+  the banner swallowed by Focus or a revoked permission, which is why the log
+  says `dispatched` and never `delivered`. The
+  `exit 1` reaches only launchd, where it surfaces as the status column of
+  `launchctl list` — a place nobody reads daily. It then failed in exactly that
+  shape again: the pipeline failed three consecutive days (2026-09-26/27 an
+  expired Claude Code OAuth session; 2026-09-28 `claude` missing from the
+  launchd PATH), every one of those runs exited nonzero, and the maintainer
+  found out by noticing an absence of results.
+
+  **The durable signal is the heartbeat row, read off-machine.** Every
+  non-dry-run invocation publishes the heartbeat to a `discovery_heartbeat` row
+  in Neon (`scripts/discovery/publish-heartbeat.ts`), and
+  `.github/workflows/discovery-watchdog.yml` reads that row Mon/Wed/Fri at 23:00 UTC
+  via `scripts/discovery/check-heartbeat.ts`. It fails when the row is missing,
+  when `last_run_at` is stale — no run happened — and, **since 2026-09-28**,
+  when the row is fresh but its status is not `ok` — a run happened and failed.
+  That last check is what the 2026-09-26..28 outage needed: those runs each
+  published a perfectly fresh `status="degraded"` heartbeat, so the
+  freshness-only watchdog passed throughout (measured 2026-09-28: 23 consecutive
+  successes with no failures back to 2026-09-06 — re-check with `gh run list
+  --workflow=discovery-watchdog.yml --limit 30` rather than trusting that
+  number). **A pipeline that runs and fails on every scheduled run is maximally fresh**, so
+  freshness alone can never see it. Mechanics, error types and the fails-closed
+  list: `docs/discovery-runbook.md` → *Discovery watchdog*.
+
+  **Residual gap (known):** the failure ledger only fires when `run.sh` actually
+  runs. It cannot detect "launchd never fired at all" — that is the stale-row
+  case the off-machine watchdog owns. `run.sh`'s stale-heartbeat check is the
+  on-machine partial mitigation: on startup, a previous `lastRunAt` older than
+  `DISCOVERY_STALE_HOURS` (default 84) is logged as a WARN and passed to the
+  same best-effort `notify()`, so missed days surface in the run log of the next
+  run that happens.
+- **The wall-clock cap is enforced, and its failure is detected.**
+  `DISCOVERY_TIMEOUT_SECS` (default 3000) is passed to `timeout` together with
+  `-k DISCOVERY_KILL_AFTER_SECS` (default 120), which escalates to SIGKILL.
+  This matters: **measured on macOS, `timeout 2` against a process that ignores
+  SIGTERM let it run the full 31s and still exited 124** — so `-k` is what
+  actually enforces, and exit status 124 can never prove the cap worked.
+  Because of that, every `claude` invocation is also timed, and a run whose
+  wall-clock exceeds `cap + kill-after + DISCOVERY_OVERRUN_GRACE_SECS`
+  (default 60) is flagged as a cap-enforcement failure. That is the only way to
+  catch the machine-sleep case, where macOS pauses `ITIMER_REAL` and *both*
+  timers stop counting — observed 2026-08-11/12 as 106-minute runs against a
+  600s cap. Note a run can produce perfectly valid candidates and *still* be
+  flagged: an overrun is a failure of the guard, not of the output.
 - **Source-liveness check:** read-only, never auto-edits. Runs unconditionally
-  every daily invocation (even in dry-run) and reports classifications to
+  every scheduled invocation (even in dry-run) and reports classifications to
   `discovery-logs/source-health-<timestamp>.json`. Current implementation is
   FLAG-ONLY: no admin UI or automated actions yet (fast-follow planned).
 
@@ -131,108 +401,151 @@ state, capped to `--max` submissions (new + updated combined, default 5).
 There is no fan-out, no multi-agent workflow, and no `/data-wave` invocation
 from this pipeline.
 
-**Cadence unchanged:** The combined-pass model runs on the same daily schedule
-as before — one state per 24-hour cycle, one state per launchd invocation, cursor
-rotation through 15 states for a roughly two-week full cycle. No new launchd
-units, no increase in claude cost.
+**Cadence:** The combined-pass model runs Mon/Wed/Fri via launchd, processing
+`STATES_PER_RUN` states per invocation (default **3** since 2026-10-09; 2 from
+2026-08-14 until then) from a rotation cursor. Raising it to 3 was Ed's
+decision on 2026-10-09, based on zero OVERRUN warnings since 2026-09-16 and
+2-state batches taking 68–118 min (`run.sh` comment at `STATES_PER_RUN`). The
+2026-10-05..07 failures were an expired Claude login, not load. The reasoning
+below was the case for NOT raising it on 2026-09-13. `STATES_PER_RUN` was
+deliberately NOT raised alongside the
+2026-09-13 rotation expansion below — see "Bounded per run" above for the
+three reasons (wall-clock cap known not to reliably enforce; the 2026-09-09
+cap bump is only four days old as of this change; stacking a second unmeasured
+throughput change on the simultaneous 2.3x rotation-size change would make any
+regression unattributable to either). This round's throughput lever is
+`STEADY_CAP` instead (25 → 30). Re-evaluation trigger: revisit after ~1 week
+of nights at 51 states / cap 30, looking at wall-clock overrun WARNs, `blocked`
+classifications, and whether full submit cycles complete in time — measure
+those, then decide, not "raise it again on a timer."
 
-## Running manually
+**Rotation (rebalanced 2026-08-14, expanded 2026-09-13).** The rotation was 15
+states holding 555 of 941 live facilities — meaning **386 facilities lived in
+states the pipeline never visited**, and so were never re-checked, never
+enriched, never deepened. IA, NE, WA, OR, MN, MO and UT are major hyperscaler
+markets that were sitting at 8–26 records with zero pipeline attention, so they
+led the rotation from that point. Nothing was removed: dropping the saturated
+states (TX at 106, VA at 110) would have silently stopped re-checking their
+facilities for status changes.
 
-```bash
-# Dry run — no claude call, no POSTs, just exercises the harness end to end.
-# Skips existing-facilities fetch but still runs check-sources (read-only).
-DISCOVERY_ENABLED=true DISCOVERY_DRY_RUN=true bash scripts/discovery/run.sh
+2026-09-13 expanded the rotation again, from 22 states to **all 50 states plus
+DC (51 tokens)**, derived from `lib/us-states.ts`'s `US_STATE_NAMES` — the
+repo's single source of truth for state codes. The prior 22 stay first in the
+list (same reasoning as above: the cursor file holds a state code, not an
+index, so preserving the existing order keeps a live cursor valid across the
+change); the 29 states newly added were not in the rotation at all before this
+change — not even pre-2026-08-14 — so a flat `lastUpdated` in one of them means
+nobody has ever looked, a stronger signal than a flat `lastUpdated` in one of
+the original 22 (which only means the pipeline looked and found nothing).
+With `STATES_PER_RUN` at **3** (raised from 2 on 2026-10-09), 51 states cycle
+in exactly **17 days**. At the prior default of 2, 51 states cycled in about
+**26 days** (until 2026-10-09) — the real cost of covering every state without
+losing re-check coverage on the rest, stated plainly so nobody discovers it by
+surprise. 22 states cycled in about 11 days at 2 per run (up from 7.5 before
+the first rebalance). 51 divides evenly by 3, so the same triples of states
+recur together every cycle rather than shifting; the old 22/2 and 15/2
+rotations and 51/2 vary cycle to cycle. Both are fine and intended, not a bug.
 
-# Real run — fetches existing-facilities projection, spends subscription usage
-# on one `claude -p` call (with both responsibilities), then submits candidates
-# and runs source-liveness checks.
-DISCOVERY_ENABLED=true bash scripts/discovery/run.sh
+`DISCOVERY_STATES` overrides the rotation entirely (space-separated). That is
+the supported way to drive a targeted run without editing the script, and it is
+what the BATS suite pins so cursor tests survive the next rebalance.
 
-# Fetch existing-facilities projection for a state (CLI debug).
-npx tsx --env-file=.env.local scripts/discovery/existing-facilities.ts --state=TX
+## Field extraction from existing sources
 
-# Check source liveness (read-only, generates report).
-npx tsx --env-file=.env.local scripts/discovery/check-sources.ts
+`scripts/discovery/extract-fields.ts` fills missing structured fields on
+*existing* facilities by re-reading sources those facilities already cite,
+using a local Ollama model. This is an enrichment tool, not a discovery tool —
+it never proposes new facilities and it never overwrites a curated value.
 
-# Submit an already-prepared candidates file directly (no claude call at all).
-npx tsx --env-file=.env.local scripts/discovery/submit-candidates.ts \
-  path/to/candidates.json --run-id=manual-test --dry-run
+**This lane runs on every scheduled run.** `run.sh` invokes `extract-fields.ts` (then
+`submit-candidates.ts` on its output) and `verify-fields.ts` once per batch, after
+the per-state discovery loop and the source-liveness check. It can still be run by
+hand the same way. Two conditions the scheduled invocation has to keep meeting:
 
-# Run tests (unit + integration).
-npx vitest run scripts/discovery/*.test.ts
-bats tests/discovery/run.bats
+- **`--fields` is passed explicitly** — two of the six extractable fields were
+  bench-measured as not safe to ship, so `extract-fields.ts` refuses to guess.
+  Since 2026-09-11 (#276) its own `parseArgs` fails closed, throwing `--fields is
+  required` when the flag is absent *or* present with no usable value
+  (`--fields=`, or a bare trailing `--fields`). ⚠️ The shared `parseFieldsArg`
+  helper it calls still defaults to all six when the raw value is `undefined`,
+  and that default is deliberate and load-bearing: `verify-fields.ts` imports
+  the same function and depends on it, being read-only and staging nothing. The
+  requirement is layered on top for `extract-fields.ts` specifically — do not
+  move it down into the shared helper. `run.sh` pins the extract lane to one
+  field (`EXTRACT_FIELDS="water.coolingType"`) and `tests/discovery/run.bats` asserts the
+  flag is present for both tools (mutation-tested: deleting it fails the suite).
+  The extract lane's pinned field is `water.coolingType` (P=95%/R=95%, measured 2026-09-01).
+  `capacityMw.operational` was unpinned on 2026-10-29: its P=100%/R=100% measured a drifted
+  prompt on a corpus with no distractors (see `scripts/discovery/bench/README.md`). On every scheduled run,
+  `verify-fields` (`VERIFY_FIELDS`) still re-checks both fields. `energy.source` and `energy.utility` remain extractable but are not pinned —
+  they were unmeasured (the bench could not score non-numeric fields until 2026-09-01,
+  and neither ever carried a label or appeared in a result file), so they do not
+  run on the schedule. Re-add either only after measuring.
+- **The `pending` staging gate is untouched.** Everything the lane produces goes
+  through `submit-candidates.ts` and needs a human `approve`, exactly as before.
+
+Both tools are bounded by `ENRICHMENT_LIMIT` (default 60) and `VERIFY_LIMIT`
+(default 40), because an unbounded sweep over the current gap set is roughly 10
+hours (2,190 gaps across the former two-field pin, measured 2026-09-01; a proportional
+rescale of the previously measured 12h/2,525-gap figure, not a fresh timing run; the one-field
+extract list is smaller and not re-measured). Note these are validated in `run.sh` rather than trusted: an unparseable
+`--limit` parses to `undefined` in both scripts, and an undefined limit **skips the
+bounding slice entirely** — so a malformed value would silently unbound the run
+instead of failing. That mattered little when a human ran it and watched; it
+matters now that launchd does.
+
+### Provenance and review workflow
+
+Every candidate carries `provenance.note` with the format:
+```
+field=value (quote: "…", source: <url>)
 ```
 
-## Installing the launchd job
+This metadata is what makes the `pending`-queue review fast enough to work —
+human reviewers see exactly which quote backed which value. The note must not
+be stripped; a real reviewed example shows the problem it solves: a candidate
+proposed `capacityMw.operational = 25` from a quote reading "permitted … up to
+75 MW, yet … as low as 25 MW" — a genuine figure, but the wrong field. That was
+caught in seconds only because the quote travelled with the value.
 
-```bash
-# Fill the template's __REPO_PATH__ placeholders and install a copy.
-sed "s|__REPO_PATH__|$(pwd)|g" \
-  scripts/discovery/com.compute-atlas.discovery.plist \
-  > ~/Library/LaunchAgents/com.compute-atlas.discovery.plist
+### Screening rules
 
-# Enable it: uncomment DISCOVERY_ENABLED + API_BASE_URL in the installed copy's
-# EnvironmentVariables dict (the committed template ships them commented so the
-# job is fail-closed by default).
+- **`>= 500 MW` on a `data_center`** is flagged for human review (flag in
+  `provenance.note` as `REVIEW: ...`), not an alarm. Of 1,091 data_center records (as of 2026-09-01),
+  151 already have capacityMw.operational or capacityMw.planned >= 500 MW, so this is a routine queue item, not a red flag.
 
-# Load into the GUI domain (so `claude -p` can reach your subscription auth).
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.compute-atlas.discovery.plist
-launchctl print gui/$(id -u)/com.compute-atlas.discovery   # verify: state, runs, path
-```
+### Known limits and caveats
 
-The job runs daily at 13:00 local, one state per run (the cursor rotates
-through 15 states — roughly a full cycle every two weeks). It stays a no-op
-until you uncomment `DISCOVERY_ENABLED=true` (fail-closed by default — see the
-kill switch above).
+- **Yield figures:** A prior 100-gap run measured ~9% fill rate and concluded
+  most remaining gaps are real absences rather than unmined data. This is
+  **provisional** — two defects found during shipping undermine that conclusion.
+  A Unicode-dash bug meant pages whose only capacity figure used an en/em dash
+  were silently skipped, and a separate fetch failure caused a full sweep to
+  report 1455 of 1545 gaps as unfetchable. Do not cite the older "5,650 field-gaps"
+  headline — it is retracted. Re-run a sweep before drawing yield conclusions.
+- **Unmeasured fields** (`energy.source`, `energy.utility`): remain extractable
+  but are not pinned on the schedule because they have never been measured. The bench
+  covered only numeric fields until 2026-09-01, when `water.coolingType` became
+  the first non-numeric field measured (P=95%/R=95%) — but that machinery has
+  not been pointed at these two. Re-add either to the pinned list only after
+  measuring and confirming safety.
+- **PDF sources were unreadable until PR #199**, and the yield figure above was
+  measured while they were. Every `.pdf` source was skipped outright — 96 of them
+  across the dataset, disproportionately the permits and filings most likely to
+  state a figure — so "most remaining gaps are real absences" was partly a
+  statement about the fetcher, not about the world. They are now read via
+  `pdftotext -layout`; re-measure before citing any yield number.
+- **No batching:** asking for several fields in one model call was measured at
+  2/7 recall against 4/4 for one-field-per-call. The reason is recall, not
+  determinism — do not conflate this with the `OLLAMA_NUM_PARALLEL`
+  reproducibility finding above, which is a separate result about concurrency.
 
-Midday (rather than overnight) is deliberate: macOS `launchd` defers a missed
-`StartCalendarInterval` to the next wake, so an early-morning slot is simply
-skipped whenever the Mac is asleep. 13:00 assumes the machine is normally awake
-and lid-open then — if your usage differs, pick an hour when the Mac is reliably
-on, or move the job off the laptop entirely (e.g. a cron/CI runner with an API
-key instead of the subscription).
+For usage, benchmark, and operational details, see [discovery-runbook.md](./discovery-runbook.md).
 
-**PATH gotcha:** launchd runs with a bare `PATH`, so the plist's
-`EnvironmentVariables` must list wherever `claude`/`node`/`npx` live
-(`/opt/homebrew/bin` on a Homebrew install). Without it the job cannot find
-them and fails in `discovery-logs/launchd.err`.
+## Running the pipeline
 
-**Auth note:** `claude -p` needs an authenticated Claude Code subscription
-session. Verified (2026-07-15): it authenticates fine from the background
-launchd context — a scheduled run reaches your subscription without an
-interactive shell. If it ever regresses, `discovery-logs/launchd.err` is where
-it surfaces; the fallbacks are a login-session launcher or the manual
-invocation above.
+For day-to-day operations, including running manually, installing the launchd job, and reviewing submissions, see [discovery-runbook.md](./discovery-runbook.md).
 
-To reload after editing the plist:
-`launchctl bootout gui/$(id -u)/com.compute-atlas.discovery && launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.compute-atlas.discovery.plist`
+## Leads lane
 
-To disable without unloading: `touch discovery-logs/DISABLED`.
-To remove entirely: `launchctl bootout gui/$(id -u)/com.compute-atlas.discovery`.
-
-## Reviewing candidates and updates
-
-Every candidate the pipeline submits (new or updated) lands as a `pending` row
-in the submissions staging queue. Review with the Phase 4 CLI:
-
-```bash
-npm run submissions -- list pending
-npm run submissions -- approve <id> "looks good, verified sources"
-npm run submissions -- reject <id> "source doesn't support the claim"
-```
-
-When approving an update submission, the operation replaces the entire facility
-record with the updated document (matching the same `id`), so the existing
-`statusHistory` is preserved and appended with the new status entry.
-
-Nothing becomes a live facility without one of these explicit human calls.
-
-## Source-health reporting
-
-The `check-sources.ts` utility runs after every discovery invocation and probes
-the liveness of every source URL across all facilities. It generates a JSON
-report at `discovery-logs/source-health-<timestamp>.json` with per-URL status
-classifications: `ok` (2xx), `redirected` (3xx), `dead` (4xx/5xx), `timeout`,
-`error`. This is a flag/report-only tool — it never modifies facilities or
-submissions. A future Phase 5.1 enhancement may wire these reports into an
-admin dashboard or automated deprecation workflow.
+For details on the leads lane tool (`scripts/discovery/leads-lane.ts`), see [discovery-runbook.md](./discovery-runbook.md).

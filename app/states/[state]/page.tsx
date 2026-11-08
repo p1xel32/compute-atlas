@@ -16,21 +16,20 @@ import {
 } from "@/lib/us-states";
 import { STATUS_ORDER, STATUS_META, getStatusColor } from "@/lib/status";
 import { FACILITY_TYPE_ORDER, FACILITY_TYPE_META } from "@/lib/facility-type";
-import { formatCapacity, formatLocation, AI_CLASSIFICATION_CONFIDENCE_LABELS } from "@/lib/format";
-import { StatusBadge } from "@/components/status-badge";
+import { formatLocation, formatPower, AI_CLASSIFICATION_CONFIDENCE_LABELS } from "@/lib/format";
 import { Breadcrumb } from "@/components/breadcrumb";
+import { CollectionJsonLd } from "@/components/collection/collection-json-ld";
+import { FacilityListRow } from "@/components/facility-list-row";
+import { PageMasthead } from "@/components/page-masthead";
+import { SurveyStatRow } from "@/components/survey-stat-row";
+import { PercentageBar } from "@/components/percentage-bar";
+import { SectionHeading } from "@/components/section-heading";
+import { StateEmbedSnippet } from "@/components/states/state-embed-snippet";
 import { WatchButton } from "@/components/subscribe/watch-button";
 import { aiClassificationEnum } from "@/lib/schema";
+import { siteConfig } from "@/lib/site";
 
-export const revalidate = false;
-
-/** Formats a MW figure as GW (1 decimal) above 1000, else whole MW. Avoids "0.0 GW" for small states. */
-function formatPower(mw: number): string {
-  if (mw >= 1000) {
-    return `${(mw / 1000).toFixed(1)} GW`;
-  }
-  return `${Math.round(mw)} MW`;
-}
+export const revalidate = 86400;
 
 export async function generateStaticParams() {
   const codes = await getStates();
@@ -48,12 +47,11 @@ export async function generateMetadata({
   const { state: slug } = await params;
   const code = stateCodeFromSlug(slug);
   const summary = code ? await getStateSummaryCached(code) : null;
+  const stateName = code ? stateNameFromCode(code) : undefined;
 
-  if (!code || !summary) {
+  if (!code || !summary || !stateName) {
     return { title: "State not found" };
   }
-
-  const stateName = stateNameFromCode(code)!;
 
   return {
     title: `Data centers in ${stateName}`,
@@ -87,9 +85,12 @@ export default async function StatePage({
   }
 
   const facilities = await getFacilitiesByStateCached(code);
-  const stateName = stateNameFromCode(code)!;
+  const stateName = stateNameFromCode(code);
+  if (!stateName) {
+    notFound();
+  }
 
-  // Cross-link callout (SEO Task 3.3): only fetched when this state has
+  // Cross-link callout: only fetched when this state has
   // documented friction, since a zero-friction state renders no callout.
   const stateOppositionCase =
     summary.communityFriction > 0
@@ -98,7 +99,7 @@ export default async function StatePage({
         )
       : undefined;
 
-  // Cross-link callout (SEO Task 6.3): per-classification AI counts for this
+  // Cross-link callout: per-classification AI counts for this
   // state; the callout below renders nothing when the total is zero.
   const aiCounts = await getStateAiClassificationCounts(code);
   const totalAiClassified =
@@ -108,7 +109,6 @@ export default async function StatePage({
   const displayedOperators = summary.topOperators.slice(0, TOP_OPERATORS_DISPLAY);
   const extraOperators = summary.topOperators.length - displayedOperators.length;
 
-  // --- Templated overview prose (SEO Task 1.1) ----------------------------
   // Every figure below is read directly off `summary`; nothing here is
   // fetched, invented, or estimated. Each branch just phrases a zero count
   // gracefully instead of printing an awkward "0 MW" / "0 sites" line.
@@ -137,33 +137,37 @@ export default async function StatePage({
       ? `The leading operator${topOperatorNames.length === 1 ? "" : "s"} in ${stateName}, by facility count, ${topOperatorNames.length === 1 ? "is" : "are"} ${new Intl.ListFormat("en-US", { style: "long", type: "conjunction" }).format(topOperatorNames)}.`
       : null;
 
+  const crumbs = [
+    { label: "Explore", href: "/explore" },
+    { label: "States", href: "/states" },
+    { label: stateName },
+  ];
+
+  // Embed snippet + citation — both point at this exact page, so both are
+  // built from the same canonical URL rather than each deriving it separately.
+  const canonicalUrl = `${siteConfig.url}/states/${slug}`;
+  const embedUrl = `${siteConfig.url}/embed/states/${slug}`;
+  const embedSnippet = `<iframe src="${embedUrl}" width="100%" height="480" style="border:0" loading="lazy" title="Data centers in ${stateName} — Compute Atlas"></iframe>`;
+
   return (
     <div
       data-content-width="4xl"
       className="mx-auto max-w-4xl px-4 py-8 sm:px-6 sm:py-12 space-y-10"
     >
-      <Breadcrumb items={[{ label: "Explore", href: "/explore" }, { label: "States", href: "/states" }, { label: stateName }]} />
+      <CollectionJsonLd crumbs={crumbs} facilities={facilities} />
 
-      {/* ------------------------------------------------------------------ */}
-      {/* Masthead                                                            */}
-      {/* ------------------------------------------------------------------ */}
-      <header className="space-y-4 pb-2">
-        <p className="font-mono text-xs uppercase tracking-widest text-primary">
-          State profile
-        </p>
-        <h1 className="font-display text-4xl leading-[1.05] text-foreground sm:text-5xl">
-          Data centers in {stateName}
-        </h1>
-        <p className="text-base text-muted-foreground">
-          {stateName} &middot; {summary.count} facilit{summary.count === 1 ? "y" : "ies"} tracked
-        </p>
-        <WatchButton targetType="state" targetId={code} label={`Watch ${stateName}`} />
-        <div className="border-t border-border" />
-      </header>
+      <Breadcrumb items={crumbs} />
 
-      {/* ------------------------------------------------------------------ */}
-      {/* Overview (SEO: templated, dataset-derived prose — no new fields)    */}
-      {/* ------------------------------------------------------------------ */}
+      <PageMasthead
+        eyebrow="State profile"
+        title={<>Data centers in {stateName}</>}
+        dek={
+          <>
+            {stateName} &middot; {summary.count} facilit{summary.count === 1 ? "y" : "ies"} tracked
+          </>
+        }
+      />
+
       <div className="max-w-2xl space-y-4">
         <p className="text-base leading-relaxed text-muted-foreground">
           {overviewSentence}
@@ -178,88 +182,56 @@ export default async function StatePage({
         )}
       </div>
 
-      {/* ------------------------------------------------------------------ */}
-      {/* Survey stats row                                                    */}
-      {/* ------------------------------------------------------------------ */}
-      <div className="flex flex-wrap gap-8 border-b border-border pb-10">
-        <div className="flex flex-col items-center gap-1 text-center">
-          <span className="font-mono tabular-nums text-4xl font-semibold text-foreground">
-            {summary.count}
-          </span>
-          <span className="font-mono text-xs uppercase tracking-widest text-muted-foreground">
-            Sites
-          </span>
-        </div>
-        <div className="flex flex-col items-center gap-1 text-center">
-          <span className="font-mono tabular-nums text-4xl font-semibold text-foreground">
-            {formatPower(summary.operationalMw)}
-          </span>
-          <span className="font-mono text-xs uppercase tracking-widest text-muted-foreground">
-            Operational
-          </span>
-        </div>
-        <div className="flex flex-col items-center gap-1 text-center">
-          <span className="font-mono tabular-nums text-4xl font-semibold text-foreground">
-            {formatPower(summary.plannedMw)}
-          </span>
-          <span className="font-mono text-xs uppercase tracking-widest text-muted-foreground">
-            Planned pipeline
-          </span>
-        </div>
-        <div className="flex flex-col items-center gap-1 text-center">
-          <span className="font-mono tabular-nums text-4xl font-semibold text-foreground">
-            {formatPower(summary.underConstructionMw)}
-          </span>
-          <span className="font-mono text-xs uppercase tracking-widest text-muted-foreground">
-            Under construction
-          </span>
-        </div>
+      <SurveyStatRow
+        stats={[
+          { value: summary.count, label: "Sites" },
+          { value: formatPower(summary.operationalMw), label: "Operational" },
+          { value: formatPower(summary.plannedMw), label: "Planned pipeline" },
+          {
+            value: formatPower(summary.underConstructionMw),
+            label: "Under construction",
+          },
+        ]}
+      />
+
+      <div className="print:hidden">
+        <WatchButton
+          targetType="state"
+          targetId={code}
+          label={`Watch ${stateName} — monthly digest`}
+          description={`Get a monthly email summarizing what changed for tracked facilities in ${stateName}. One click to unsubscribe, anytime.`}
+        />
       </div>
 
-      {/* ------------------------------------------------------------------ */}
-      {/* § By type                                                           */}
-      {/* ------------------------------------------------------------------ */}
+      <p className="text-sm leading-relaxed text-muted-foreground">
+        Capacity is disclosed for {summary.capacityReporting} of the{" "}
+        {summary.count} sites tracked in {stateName}. The megawatt figures
+        above sum those records only — read them as a floor, not a state
+        total.
+      </p>
+
       {summary.count > 0 && (
         <section
           aria-labelledby="facility-type-heading"
           className="space-y-6 border-t border-border pt-10"
         >
-          <p className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
-            § By type
-          </p>
-          <h2
-            id="facility-type-heading"
-            className="font-display text-2xl text-foreground"
-          >
-            Facility type
-          </h2>
+          <SectionHeading kicker="By type" id="facility-type-heading" title="Facility type" />
           <div className="space-y-4">
             {FACILITY_TYPE_ORDER.filter((key) => summary.byType[key] > 0).map(
               (key) => {
                 const count = summary.byType[key];
                 const pct = summary.count > 0 ? (count / summary.count) * 100 : 0;
                 return (
-                  <div key={key} className="space-y-1.5">
-                    <div className="flex items-baseline justify-between gap-2 text-sm">
-                      <span className="text-foreground">
-                        {FACILITY_TYPE_META[key].label}
-                      </span>
-                      <span className="font-mono tabular-nums text-muted-foreground">
+                  <PercentageBar
+                    key={key}
+                    label={FACILITY_TYPE_META[key].label}
+                    valueLabel={
+                      <>
                         {count} &middot; {pct.toFixed(0)}%
-                      </span>
-                    </div>
-                    <div className="h-1.5 w-full overflow-hidden rounded-full bg-muted">
-                      <div
-                        aria-hidden="true"
-                        className="h-full rounded-full"
-                        style={{
-                          width: `${pct.toFixed(2)}%`,
-                          backgroundColor: "var(--primary)",
-                          opacity: 0.7,
-                        }}
-                      />
-                    </div>
-                  </div>
+                      </>
+                    }
+                    pct={pct}
+                  />
                 );
               }
             )}
@@ -267,67 +239,41 @@ export default async function StatePage({
         </section>
       )}
 
-      {/* ------------------------------------------------------------------ */}
-      {/* § By status                                                         */}
-      {/* ------------------------------------------------------------------ */}
       <section
         aria-labelledby="status-heading"
         className="space-y-6 border-t border-border pt-10"
       >
-        <p className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
-          § By status
-        </p>
-        <h2 id="status-heading" className="font-display text-2xl text-foreground">
-          Lifecycle status
-        </h2>
+        <SectionHeading kicker="By status" id="status-heading" title="Lifecycle status" />
         <div className="space-y-4">
           {STATUS_ORDER.filter((status) => summary.byStatus[status] > 0).map(
             (status) => {
               const count = summary.byStatus[status];
               const pct = summary.count > 0 ? (count / summary.count) * 100 : 0;
               return (
-                <div key={status} className="space-y-1.5">
-                  <div className="flex items-baseline justify-between gap-2 text-sm">
-                    <span className="text-foreground">
-                      {STATUS_META[status].label}
-                    </span>
-                    <span className="font-mono tabular-nums text-muted-foreground">
+                <PercentageBar
+                  key={status}
+                  label={STATUS_META[status].label}
+                  valueLabel={
+                    <>
                       {count} &middot; {pct.toFixed(0)}%
-                    </span>
-                  </div>
-                  <div className="h-1.5 w-full overflow-hidden rounded-full bg-muted">
-                    <div
-                      aria-hidden="true"
-                      className="h-full rounded-full transition-all"
-                      style={{
-                        width: `${pct.toFixed(2)}%`,
-                        backgroundColor: getStatusColor(status),
-                      }}
-                    />
-                  </div>
-                </div>
+                    </>
+                  }
+                  pct={pct}
+                  color={getStatusColor(status)}
+                  opacity={1}
+                  transition
+                />
               );
             }
           )}
         </div>
       </section>
 
-      {/* ------------------------------------------------------------------ */}
-      {/* § Community reception                                               */}
-      {/* ------------------------------------------------------------------ */}
       <section
         aria-labelledby="community-heading"
         className="space-y-6 border-t border-border pt-10"
       >
-        <p className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
-          § Community reception
-        </p>
-        <h2
-          id="community-heading"
-          className="font-display text-2xl text-foreground"
-        >
-          Community reception
-        </h2>
+        <SectionHeading kicker="Community reception" id="community-heading" title="Community reception" />
 
         {summary.communityReporting > 0 ? (
           <>
@@ -356,7 +302,7 @@ export default async function StatePage({
             See the{" "}
             <Link
               href="/opposition"
-              className="underline underline-offset-2 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 rounded-sm"
+              className="underline underline-offset-2 hover:text-foreground focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring rounded-sm"
             >
               opposition tracker
             </Link>{" "}
@@ -366,7 +312,7 @@ export default async function StatePage({
                 , including{" "}
                 <Link
                   href={`/facilities/${stateOppositionCase.id}`}
-                  className="underline underline-offset-2 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 rounded-sm"
+                  className="underline underline-offset-2 hover:text-foreground focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring rounded-sm"
                 >
                   {stateOppositionCase.name}
                 </Link>
@@ -379,25 +325,15 @@ export default async function StatePage({
         )}
       </section>
 
-      {/* ------------------------------------------------------------------ */}
-      {/* § AI classification (SEO Task 6.3): cross-link callout, mirrors the */}
-      {/* Community-reception callout's conditional-render approach — renders */}
-      {/* nothing when this state has no AI-classified facilities.           */}
-      {/* ------------------------------------------------------------------ */}
+      {/* § AI classification: cross-link callout, mirrors the
+          Community-reception callout's conditional-render approach — renders
+          nothing when this state has no AI-classified facilities. */}
       {totalAiClassified > 0 && (
         <section
           aria-labelledby="ai-classification-heading"
           className="space-y-6 border-t border-border pt-10"
         >
-          <p className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
-            § AI classification
-          </p>
-          <h2
-            id="ai-classification-heading"
-            className="font-display text-2xl text-foreground"
-          >
-            AI-classified facilities
-          </h2>
+          <SectionHeading kicker="AI classification" id="ai-classification-heading" title="AI-classified facilities" />
           <div className="flex flex-col gap-1">
             <span className="font-mono tabular-nums text-4xl font-semibold text-foreground">
               {totalAiClassified}
@@ -424,14 +360,14 @@ export default async function StatePage({
             See the{" "}
             <Link
               href="/ai"
-              className="underline underline-offset-2 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 rounded-sm"
+              className="underline underline-offset-2 hover:text-foreground focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring rounded-sm"
             >
               AI data center hub
             </Link>{" "}
             for national context, or browse the{" "}
             <Link
               href="#facilities-heading"
-              className="underline underline-offset-2 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 rounded-sm"
+              className="underline underline-offset-2 hover:text-foreground focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring rounded-sm"
             >
               full facility list for {stateName}
             </Link>{" "}
@@ -440,22 +376,11 @@ export default async function StatePage({
         </section>
       )}
 
-      {/* ------------------------------------------------------------------ */}
-      {/* § Operators                                                         */}
-      {/* ------------------------------------------------------------------ */}
       <section
         aria-labelledby="operators-heading"
         className="space-y-4 border-t border-border pt-10"
       >
-        <p className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
-          § Operators
-        </p>
-        <h2
-          id="operators-heading"
-          className="font-display text-2xl text-foreground"
-        >
-          Operators
-        </h2>
+        <SectionHeading kicker="Operators" id="operators-heading" title="Operators" />
         <ul className="space-y-2 text-sm">
           {displayedOperators.map(({ operator, count }) => (
             <li key={operator} className="flex items-baseline justify-between gap-2">
@@ -475,47 +400,50 @@ export default async function StatePage({
         )}
       </section>
 
-      {/* ------------------------------------------------------------------ */}
-      {/* § Facilities                                                        */}
-      {/* ------------------------------------------------------------------ */}
       <section
         aria-labelledby="facilities-heading"
         className="space-y-4 border-t border-border pt-10"
       >
-        <p className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
-          § Facilities
-        </p>
-        <h2
-          id="facilities-heading"
-          className="font-display text-2xl text-foreground"
-        >
-          Facilities in {stateName}
-        </h2>
+        <SectionHeading kicker="Facilities" id="facilities-heading" title={<>Facilities in {stateName}</>} />
         <ul className="divide-y divide-border">
           {facilities.map((f) => (
             <li key={f.id}>
-              <Link
-                href={`/facilities/${f.id}`}
-                className="flex min-h-11 flex-col gap-1 py-3 sm:flex-row sm:items-center sm:justify-between sm:gap-4 transition-colors hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 rounded-sm"
-              >
-                <span className="flex flex-col gap-0.5 min-w-0">
-                  <span className="text-sm text-foreground truncate">
-                    {f.name}
-                  </span>
-                  <span className="text-xs text-muted-foreground truncate">
-                    {f.operator} &middot; {formatLocation(f)}
-                  </span>
-                </span>
-                <span className="flex shrink-0 items-center gap-3">
-                  <StatusBadge status={f.status} />
-                  <span className="font-mono tabular-nums text-xs text-muted-foreground">
-                    {formatCapacity(f)}
-                  </span>
-                </span>
-              </Link>
+              <FacilityListRow
+                facility={f}
+                secondary={<>{f.operator} &middot; {formatLocation(f)}</>}
+              />
             </li>
           ))}
         </ul>
+      </section>
+
+      <section
+        aria-labelledby="embed-heading"
+        className="space-y-4 border-t border-border pt-10"
+      >
+        <SectionHeading kicker="Embed" id="embed-heading" title="Embed this map" />
+        <p className="max-w-2xl text-base leading-relaxed text-muted-foreground">
+          This map can be embedded on another page as a live, chrome-free
+          iframe, pre-scoped to {stateName}. Every embed keeps a permanent
+          attribution link back to this page.
+        </p>
+        <StateEmbedSnippet snippet={embedSnippet} stateName={stateName} />
+      </section>
+
+      <section
+        aria-labelledby="cite-heading"
+        className="space-y-4 border-t border-border pt-10"
+      >
+        <SectionHeading kicker="Citation" id="cite-heading" title="Cite this page" />
+        <blockquote className="max-w-2xl border-l-2 border-border pl-4 font-mono text-sm text-muted-foreground">
+          Kubiak, E. (n.d.). Data centers in {stateName}. Compute Atlas.{" "}
+          <a
+            href={canonicalUrl}
+            className="underline underline-offset-2 hover:text-foreground focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring rounded-sm"
+          >
+            {canonicalUrl}
+          </a>
+        </blockquote>
       </section>
     </div>
   );

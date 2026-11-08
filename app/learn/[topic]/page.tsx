@@ -7,51 +7,25 @@ import {
   getWaterUsage,
   getCoolingTypeCounts,
   getStats,
+  getFacilityTypeCounts,
   getEnergySourceCounts,
   getAiClassificationCounts,
   getGenerationStats,
   getCommunityReceptionCounts,
-  type EnergySource,
-  type CoolingType,
+  getFacilitiesByIds,
 } from "@/lib/data";
+import { formatMgd, formatPower } from "@/lib/format";
+import { statesPhrase } from "@/lib/us-states";
+import { ENERGY_SOURCE_ENTRIES, COOLING_TYPE_ENTRIES } from "@/lib/energy";
+import { AI_CLASSIFICATION_ENTRIES } from "@/lib/ai-classification";
 import { COMMUNITY_RECEPTION_ORDER, COMMUNITY_RECEPTION_META } from "@/lib/community";
 import { Breadcrumb } from "@/components/breadcrumb";
+import { Explainer } from "@/components/learn/explainer";
+import { PageMasthead } from "@/components/page-masthead";
+import { SurveyStatRow } from "@/components/survey-stat-row";
 import { breadcrumbJsonLdString } from "@/lib/seo";
 
-export const revalidate = 3600;
-
-/** Formats a MW figure as GW (1 decimal) above 1000, else whole MW. Mirrors app/power/page.tsx's formatPower. */
-function formatPower(mw: number): string {
-  if (mw >= 1000) {
-    return `${(mw / 1000).toFixed(1)} GW`;
-  }
-  return `${Math.round(mw)} MW`;
-}
-
-/** Formats a reported daily water figure as MGD (1 decimal). Mirrors app/power/page.tsx's formatMgd. */
-function formatMgd(mgd: number): string {
-  return `${mgd.toFixed(1)} MGD`;
-}
-
-/** Display order + labels for `energy.source` — mirrors app/power/page.tsx's ENERGY_SOURCE_ENTRIES. */
-const ENERGY_SOURCE_ENTRIES: { key: EnergySource; label: string }[] = [
-  { key: "grid", label: "Grid" },
-  { key: "mixed", label: "Mixed" },
-  { key: "on_site_gas", label: "On-site gas" },
-  { key: "nuclear", label: "Nuclear" },
-  { key: "solar", label: "Solar" },
-  { key: "hydro", label: "Hydro" },
-  { key: "wind", label: "Wind" },
-  { key: "other", label: "Other" },
-];
-
-/** Display order + labels for `water.coolingType` — mirrors app/power/page.tsx's COOLING_TYPE_ENTRIES. */
-const COOLING_TYPE_ENTRIES: { key: CoolingType; label: string }[] = [
-  { key: "evaporative", label: "Evaporative (high water)" },
-  { key: "hybrid", label: "Hybrid" },
-  { key: "closed_loop", label: "Closed-loop (low water)" },
-  { key: "air", label: "Air-cooled (minimal)" },
-];
+export const revalidate = 86400;
 
 interface StatCell {
   value: string;
@@ -110,14 +84,15 @@ async function getTopicContent(slug: string): Promise<TopicContent | undefined> 
       };
     }
     case "data-center-power-draw": {
-      const [stats, energyCounts] = await Promise.all([
+      const [stats, typeCounts, energyCounts] = await Promise.all([
         getStats(),
+        getFacilityTypeCounts(),
         getEnergySourceCounts(),
       ]);
       const energyRows = ENERGY_SOURCE_ENTRIES.filter(({ key }) => energyCounts[key] > 0);
       const energyReporting = energyRows.reduce((sum, { key }) => sum + energyCounts[key], 0);
       return {
-        explainer: `Compute Atlas tracks ${stats.count} data centers across ${stats.states} states, with ${formatPower(stats.operationalMw)} of operational capacity today and ${formatPower(stats.plannedMw)} planned or under construction.`,
+        explainer: `Compute Atlas tracks ${typeCounts.data_center} data centers across ${statesPhrase(stats.stateCodes)}, alongside ${typeCounts.crypto_mining} crypto-mining sites and ${typeCounts.power_generation} dedicated generation projects, with ${formatPower(stats.operationalMw)} of operational capacity today and ${formatPower(stats.plannedMw)} planned or under construction.`,
         stats: [
           { value: formatPower(stats.operationalMw), label: "Operational" },
           { value: formatPower(stats.plannedMw), label: "Planned pipeline" },
@@ -128,7 +103,7 @@ async function getTopicContent(slug: string): Promise<TopicContent | undefined> 
           count: energyCounts[key],
           pct: energyReporting > 0 ? (energyCounts[key] / energyReporting) * 100 : 0,
         })),
-        breakdownLabel: "Power source",
+        breakdownLabel: "Power source, all tracked facilities",
       };
     }
     case "what-is-an-ai-data-center": {
@@ -139,11 +114,13 @@ async function getTopicContent(slug: string): Promise<TopicContent | undefined> 
           total > 0
             ? `${total} tracked data center${total === 1 ? " carries" : "s carry"} an AI classification today — confirmed, likely, or mixed use — out of the facilities in Compute Atlas's dataset.`
             : "No tracked data center carries an AI classification yet.",
-        stats: [
-          { value: String(aiCounts.confirmed), label: "Confirmed" },
-          { value: String(aiCounts.likely), label: "Likely" },
-          { value: String(aiCounts.mixed_use), label: "Mixed use" },
-        ],
+        // Labels and order come from lib/ai-classification.ts — the same source
+        // /about and /ai render from. Hand-writing them here was a fourth copy
+        // of three strings collapsed everywhere else.
+        stats: AI_CLASSIFICATION_ENTRIES.map(({ key, label }) => ({
+          value: String(aiCounts[key]),
+          label,
+        })),
         crossLink: { href: "/ai", label: "the AI data center hub" },
       };
     }
@@ -186,6 +163,21 @@ async function getTopicContent(slug: string): Promise<TopicContent | undefined> 
         breakdown: receptionRows,
         breakdownLabel: "Community reception",
         crossLink: { href: "/opposition", label: "the opposition tracker" },
+      };
+    }
+    case "why-connect-to-the-grid": {
+      const genStats = await getGenerationStats();
+      return {
+        explainer:
+          genStats.count > 0
+            ? `Compute Atlas tracks ${genStats.count} dedicated power-generation project${genStats.count === 1 ? "" : "s"} built to power a data center on-site, with ${formatPower(genStats.operationalMw)} operational and ${formatPower(genStats.plannedMw)} planned. This page explains how such projects relate to the grid connection that usually accompanies them, and who pays for the transmission it uses.`
+            : "No dedicated power-generation projects are tracked yet.",
+        stats: [
+          { value: String(genStats.count), label: "Projects" },
+          { value: formatPower(genStats.operationalMw), label: "Operational" },
+          { value: formatPower(genStats.plannedMw), label: "Planned" },
+        ],
+        crossLink: { href: "/power", label: "the power generation hub" },
       };
     }
     default:
@@ -243,6 +235,16 @@ export default async function LearnTopicPage({
     notFound();
   }
 
+  // Exemplar facilities for the cited explainer's sections (if this topic has
+  // one) — one getFacilitiesByIds call for every section's exemplarIds
+  // combined, never a call per section or per id.
+  const exemplarIds = topic.explainer
+    ? [...new Set(topic.explainer.sections.flatMap((s) => s.exemplarIds ?? []))]
+    : [];
+  const exemplarFacilities =
+    exemplarIds.length > 0 ? await getFacilitiesByIds(exemplarIds) : [];
+  const exemplars = new Map(exemplarFacilities.map((f) => [f.id, f]));
+
   const crumbs = [
     { label: "Explore", href: "/explore" },
     { label: "Learn", href: "/learn" },
@@ -265,23 +267,12 @@ export default async function LearnTopicPage({
 
       <Breadcrumb items={crumbs} />
 
-      {/* ------------------------------------------------------------------ */}
-      {/* Masthead                                                            */}
-      {/* ------------------------------------------------------------------ */}
-      <header className="space-y-4 pb-2">
-        <p className="font-mono text-xs uppercase tracking-widest text-primary">
-          Learn
-        </p>
-        <h1 className="font-display text-4xl leading-[1.05] text-foreground sm:text-5xl">
-          {topic.title}
-        </h1>
-        <p className="max-w-2xl text-base text-muted-foreground">{topic.dek}</p>
-        <div className="border-t border-border" />
-      </header>
+      <PageMasthead eyebrow="Learn" title={topic.title} dek={topic.dek} />
 
-      {/* ------------------------------------------------------------------ */}
-      {/* Explainer (dataset-grounded, no fabricated figures)                 */}
-      {/* ------------------------------------------------------------------ */}
+      {topic.explainer && (
+        <Explainer explainer={topic.explainer} exemplars={exemplars} />
+      )}
+
       <div className="max-w-2xl space-y-4">
         <p className="text-base leading-relaxed text-muted-foreground">
           {content.explainer}
@@ -291,7 +282,7 @@ export default async function LearnTopicPage({
             See{" "}
             <Link
               href={content.crossLink.href}
-              className="underline underline-offset-2 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 rounded-sm"
+              className="underline underline-offset-2 hover:text-foreground focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring rounded-sm"
             >
               {content.crossLink.label}
             </Link>{" "}
@@ -300,29 +291,9 @@ export default async function LearnTopicPage({
         )}
       </div>
 
-      {/* ------------------------------------------------------------------ */}
-      {/* Survey stats row                                                    */}
-      {/* ------------------------------------------------------------------ */}
       <h2 className="sr-only">Key statistics</h2>
-      <div className="flex flex-wrap gap-8 border-b border-border pb-10">
-        {content.stats.map((stat) => (
-          <div
-            key={stat.label}
-            className="flex flex-col items-center gap-1 text-center"
-          >
-            <span className="font-mono tabular-nums text-4xl font-semibold text-foreground">
-              {stat.value}
-            </span>
-            <span className="font-mono text-xs uppercase tracking-widest text-muted-foreground">
-              {stat.label}
-            </span>
-          </div>
-        ))}
-      </div>
+      <SurveyStatRow stats={content.stats} />
 
-      {/* ------------------------------------------------------------------ */}
-      {/* § Breakdown                                                         */}
-      {/* ------------------------------------------------------------------ */}
       {content.breakdown && content.breakdown.length > 0 && (
         <section
           aria-labelledby="breakdown-heading"

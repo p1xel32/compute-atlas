@@ -1,0 +1,182 @@
+import Link from "next/link";
+import {
+  BarChart3,
+  Bitcoin,
+  Building,
+  Building2,
+  Cpu,
+  Globe,
+  Landmark,
+  Megaphone,
+  MapPin,
+  Zap,
+  type LucideIcon,
+} from "lucide-react";
+
+import { statesPhrase } from "@/lib/us-states";
+import { SectionHeading } from "@/components/section-heading";
+
+export interface LensGatewayProps {
+  counts: {
+    sites: number;
+    states: number;
+    includesDc: boolean;
+    stateCodes: string[];
+    utilityLinked: number;
+    frictionCount: number;
+    aiClassified: number;
+    operators: number;
+    plannedGw: number;
+    cryptoCount: number;
+    metros: number;
+    counties: number;
+  };
+  className?: string;
+}
+
+interface Lens {
+  label: string;
+  href: string;
+  icon: LucideIcon;
+  stat: (counts: LensGatewayProps["counts"]) => string;
+  blurb: string;
+  lead?: boolean;
+}
+
+const LENSES: Lens[] = [
+  {
+    label: "Map",
+    href: "/map",
+    icon: Globe,
+    stat: (c) => `${c.sites.toLocaleString("en-US")} sites`,
+    blurb: "Every tracked site plotted on the interactive globe.",
+    lead: true,
+  },
+  {
+    label: "By state",
+    href: "/states",
+    icon: MapPin,
+    stat: (c) => statesPhrase(c.stateCodes),
+    blurb: "Every state, ranked by capacity, build status, and friction.",
+  },
+  {
+    label: "By metro",
+    href: "/metros",
+    icon: Building,
+    stat: (c) => `${c.metros} metros`,
+    blurb: "Curated metro clusters driving the buildout, each with a live count.",
+  },
+  {
+    label: "Counties",
+    href: "/counties",
+    icon: Landmark,
+    stat: (c) => `${c.counties.toLocaleString("en-US")} counties`,
+    blurb: "Where permits are filed and hearings are held — every county with a tracked site.",
+  },
+  {
+    label: "Power & energy",
+    href: "/power",
+    icon: Zap,
+    stat: (c) => `${c.utilityLinked} grid-linked`,
+    blurb: "Utilities, fuel mix, and the generation feeding the buildout.",
+  },
+  {
+    label: "Opposition",
+    href: "/opposition",
+    icon: Megaphone,
+    stat: (c) => `${c.frictionCount} in friction`,
+    blurb: "Sites facing documented community friction, each with sources.",
+  },
+  {
+    label: "AI data centers",
+    href: "/ai",
+    icon: Cpu,
+    stat: (c) => `${c.aiClassified} classified`,
+    blurb: "Data centers by AI-classification density per state.",
+  },
+  {
+    label: "Operators",
+    href: "/operators",
+    icon: Building2,
+    stat: (c) => `${c.operators} operators`,
+    blurb: "Every company running tracked capacity, ranked by build-out.",
+  },
+  {
+    label: "Rankings",
+    href: "/rankings",
+    icon: BarChart3,
+    stat: (c) => `${c.plannedGw} GW ranked`,
+    blurb: "The biggest projects, operators, and states by megawatt.",
+  },
+  {
+    label: "Crypto mining",
+    href: "/crypto",
+    icon: Bitcoin,
+    stat: (c) => `${c.cryptoCount} sites`,
+    blurb: "Bitcoin and altcoin sites, tracked apart from the AI buildout.",
+  },
+];
+
+export function LensGateway({ counts, className }: LensGatewayProps) {
+  return (
+    <section aria-labelledby="ways-in-heading" className={className}>
+      {/* space-y-1 wrapper: see contested-strip.tsx for why the kicker/h2 gap
+          lives here rather than inside SectionHeading. */}
+      <div className="space-y-1">
+        <SectionHeading
+          kicker="Explore the atlas"
+          id="ways-in-heading"
+          size="lg"
+          title="Find your way in"
+        />
+      </div>
+      {/* mt-3, not the mt-1 this carried at the old text-2xl step: mt-1 is the
+          same gap the wrapper above puts between the kicker and the h2, so at
+          size="lg" the h2 was bound as tightly to the line below it as to the
+          one above and read as sandwiched. 3 is the heading→prose step already
+          used by open-record.tsx and contested-strip.tsx. */}
+      <p className="mt-3 text-sm text-muted-foreground">
+        {LENSES.length} lenses on the same source-cited dataset.
+      </p>
+      <ul className="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+        {LENSES.map(({ label, href, icon: Icon, stat, blurb, lead }) => (
+          <li key={href}>
+            <Link
+              href={href}
+              className={`plate-hover group flex h-full min-h-11 flex-col gap-2 rounded-sm border border-border p-4 transition-colors motion-reduce:transition-none hover:bg-muted/50 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring${
+                lead ? " border-primary/40 bg-primary/5 hover:bg-primary/10" : ""
+              }`}
+            >
+              <span className="flex items-center justify-between gap-2">
+                <Icon aria-hidden="true" className="size-5 text-primary" />
+                <span className="font-mono text-xs text-muted-foreground">
+                  {stat(counts)}
+                </span>
+              </span>
+              <span className="font-display text-lg text-foreground transition-colors motion-reduce:transition-none group-hover:text-primary">
+                {label}
+              </span>
+              <span className="text-sm leading-relaxed text-muted-foreground">
+                {blurb}
+              </span>
+            </Link>
+          </li>
+        ))}
+      </ul>
+      <div className="mt-6 flex flex-wrap gap-x-6 gap-y-2">
+        <Link
+          href="/explore"
+          className="inline-flex min-h-11 items-center rounded-sm font-mono text-xs uppercase tracking-wider text-muted-foreground underline underline-offset-4 hover:text-foreground focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"
+        >
+          See every lens →
+        </Link>
+        <Link
+          href="/stats"
+          className="inline-flex min-h-11 items-center rounded-sm font-mono text-xs uppercase tracking-wider text-muted-foreground underline underline-offset-4 hover:text-foreground focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"
+        >
+          View full statistics →
+        </Link>
+      </div>
+    </section>
+  );
+}

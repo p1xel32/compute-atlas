@@ -1,13 +1,14 @@
-import type { Facility } from "@/lib/schema";
+import type { MapPoint } from "@/lib/facility-slim";
 
 const TILE = 256;
 
 /**
  * At or above this zoom, clustering is disabled entirely: every facility renders
  * as its own marker. Chosen so that by the time the viewport shows roughly a
- * single state (~600 mi across), all individual sites are visible for impact.
+ * multi-state / large-region view, all individual sites are visible sooner —
+ * surfacing the drama of the total site count earlier in the zoom-in.
  */
-export const UNCLUSTER_ZOOM = 5.5;
+export const UNCLUSTER_ZOOM = 4.3;
 
 /** Web-Mercator world-pixel X at a given zoom. */
 export function lonToX(lon: number, zoom: number): number {
@@ -26,7 +27,7 @@ export interface Cluster {
   /** Render position = anchor facility's coordinates. */
   lon: number;
   lat: number;
-  members: Facility[];
+  members: MapPoint[];
 }
 
 /**
@@ -36,7 +37,7 @@ export interface Cluster {
  * rendered markers overlap below the target-size threshold. Deterministic (sorted by id).
  */
 export function clusterFacilities(
-  facilities: Facility[],
+  facilities: MapPoint[],
   zoom: number,
   radiusPx = 44,
   unclusterZoom = UNCLUSTER_ZOOM
@@ -87,4 +88,71 @@ export function clusterFacilities(
     lat: c.lat,
     members: c.members,
   }));
+}
+
+/**
+ * Axis-aligned lon/lat viewport bounds — the shape produced from MapLibre's
+ * `Map#getBounds()` (via its `getWest`/`getSouth`/`getEast`/`getNorth`
+ * accessors). Kept as a plain interface here (rather than importing a
+ * maplibre-gl type) so this module has no dependency on the map library.
+ */
+export interface ViewportBounds {
+  west: number;
+  south: number;
+  east: number;
+  north: number;
+}
+
+/**
+ * Fraction of the viewport's own width/height added as a buffer on every
+ * side before culling. Without a buffer, a marker at the very edge of the
+ * visible viewport would mount/unmount abruptly as it crosses the boundary
+ * mid-drag — this keeps a band of markers just outside the visible box
+ * mounted, so they're already in place once a small pan brings them into
+ * view.
+ */
+export const VIEWPORT_CULL_BUFFER_RATIO = 0.25;
+
+/**
+ * Filters `clusters` down to those likely to be visible: the anchor point
+ * (the coordinate a cluster actually renders at — see `Cluster.lon`/`lat`)
+ * falls within `bounds`, expanded by `bufferRatio` on every side.
+ *
+ * `bounds === null` culls nothing (returns `clusters` unchanged) — that's
+ * the state before the map's first `load`/`moveend` has fired, when there's
+ * no real viewport box to test against yet. Failing open matches the
+ * pre-culling behavior for that brief window rather than hiding everything.
+ *
+ * `keepIds`, if given, force-keeps any cluster whose id it contains
+ * regardless of bounds. Used by facility-map.tsx to keep a marker that
+ * currently holds DOM focus (or has an open popup) mounted even if a pan
+ * has carried it outside the viewport — otherwise React would remove that
+ * DOM node out from under the user, and the browser would strand focus on
+ * `<body>` with no visible indicator.
+ *
+ * Deliberately does NOT unwrap the antimeridian (±180° longitude): the
+ * dataset and default view are US-only, so a viewport that crosses ±180°
+ * longitude is out of scope for this comparison — a documented limitation,
+ * not a silent bug.
+ */
+export function cullClustersToViewport(
+  clusters: Cluster[],
+  bounds: ViewportBounds | null,
+  keepIds?: ReadonlySet<string>,
+  bufferRatio: number = VIEWPORT_CULL_BUFFER_RATIO
+): Cluster[] {
+  if (!bounds) return clusters;
+
+  const lonPad = (bounds.east - bounds.west) * bufferRatio;
+  const latPad = (bounds.north - bounds.south) * bufferRatio;
+  const west = bounds.west - lonPad;
+  const east = bounds.east + lonPad;
+  const south = bounds.south - latPad;
+  const north = bounds.north + latPad;
+
+  return clusters.filter(
+    (c) =>
+      (c.lon >= west && c.lon <= east && c.lat >= south && c.lat <= north) ||
+      (keepIds?.has(c.id) ?? false)
+  );
 }

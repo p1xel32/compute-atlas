@@ -1,8 +1,16 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
+import { gzipSync, gunzipSync } from "node:zlib";
+import facilitiesRaw from "@/data/facilities.json";
+import { OFFTAKER_LABEL_PATTERN } from "@/lib/schema";
+import { canonicalCountyName } from "@/lib/counties";
+import { operatorOwnership, parseOperatorOwnership } from "@/lib/operator-ownership";
+import { findUnlinkedPowerPlant, findUnpoweredDataCenter } from "@/lib/test-fixtures/unpowered-facility";
 import {
   getAllFacilities,
   getFacilityById,
+  getFacilitiesByIds,
   getFacilityByIdCached,
+  withJsonFallback,
   getStates,
   getOperators,
   getStatusCounts,
@@ -19,6 +27,7 @@ import {
   getCoolingTypeCounts,
   getFacilityTypeCounts,
   getCommunityReceptionCounts,
+  getFrictionTotal,
   getEnergySourceCounts,
   getFacilitiesByState,
   getFacilitiesByStateCached,
@@ -28,25 +37,56 @@ import {
   getOperatorBySlug,
   getFacilitiesByOperator,
   getOperatorSummary,
+  countySlug,
+  buildCountyIndex,
+  getCounties,
+  getCountyBySlug,
+  getFacilitiesByCounty,
+  personSlug,
+  buildStakeholderIndex,
+  getStakeholders,
+  summarizeStakeholders,
+  getStakeholderBySlug,
+  getFacilitiesByStakeholder,
   getPowerGenerationFacilities,
   loadPowerGenerationCached,
   normalizeOfftaker,
   getGenerationByOfftaker,
   getGenerationStats,
+  getGenerationBuildoutStats,
+  computeGenerationBuildoutStats,
   getCryptoMiningFacilities,
   getCryptoMiningStats,
   getFacilitiesByCommunityStatus,
   getNotableOppositionCases,
+  getDefeatedProjects,
   getPoweredCampuses,
   getPoweredByGenerators,
   getRecentActivity,
+  getContributorCredits,
   getQuarterlyPipelineSummary,
+  GAP_DIMENSIONS,
+  getDatasetGaps,
+  computeDatasetGaps,
+  getGapExamples,
+  computeGapExamples,
+  computeStateSummary,
+  type GapDimension,
 } from "@/lib/data";
-import { facilitySchema, aiClassificationEnum, confidenceEnum } from "@/lib/schema";
+import {
+  facilitySchema,
+  facilitiesSchema,
+  aiClassificationEnum,
+  confidenceEnum,
+  type DataCenterFacility,
+  type PowerGenerationFacility,
+} from "@/lib/schema";
 import { FACILITY_TYPE_ORDER } from "@/lib/facility-type";
 import { COMMUNITY_RECEPTION_ORDER } from "@/lib/community";
 import { STATUS_ORDER } from "@/lib/status";
 import { getFacilityMaxMw } from "@/lib/format";
+import { metroCountyKey } from "@/lib/metros";
+import { getGenerationFuelClass } from "@/lib/generation";
 
 describe("getAllFacilities", () => {
   it("returns a non-empty array including known seed ids", async () => {
@@ -78,6 +118,56 @@ describe("getFacilityById", () => {
   });
 });
 
+describe("getFacilitiesByIds", () => {
+  it("returns facilities matching known ids", async () => {
+    const ids = ["meta-prineville-or", "xai-colossus-memphis-tn"];
+    const result = await getFacilitiesByIds(ids);
+    expect(result).toHaveLength(2);
+    expect(result[0]?.id).toBe("meta-prineville-or");
+    expect(result[0]?.operator).toBe("Meta");
+    expect(result[1]?.id).toBe("xai-colossus-memphis-tn");
+  });
+
+  it("preserves input order, not dataset order", async () => {
+    // xai-colossus (index 1113) and mara-granbury (index 651) appear in reverse
+    // dataset order. Requesting them as [xai, mara] must return them in that
+    // order, not dataset order [mara, xai] — this test fails if order-preservation
+    // is removed.
+    const ids = ["xai-colossus-memphis-tn", "mara-granbury-hood-tx"];
+    const result = await getFacilitiesByIds(ids);
+    expect(result).toHaveLength(2);
+    expect(result[0]?.id).toBe("xai-colossus-memphis-tn");
+    expect(result[1]?.id).toBe("mara-granbury-hood-tx");
+  });
+
+  it("omits unknown ids without throwing", async () => {
+    const ids = ["meta-prineville-or", "not-a-real-facility", "xai-colossus-memphis-tn"];
+    const result = await getFacilitiesByIds(ids);
+    expect(result).toHaveLength(2);
+    expect(result.map((f) => f.id)).toEqual([
+      "meta-prineville-or",
+      "xai-colossus-memphis-tn",
+    ]);
+  });
+
+  it("returns empty array for empty input", async () => {
+    const result = await getFacilitiesByIds([]);
+    expect(result).toEqual([]);
+  });
+
+  it("handles duplicate ids by returning duplicates", async () => {
+    // The implementation maps input ids to facilities, so duplicates in input
+    // produce duplicates in output (each mapped from byId.get).
+    const ids = ["meta-prineville-or", "meta-prineville-or"];
+    const result = await getFacilitiesByIds(ids);
+    expect(result).toHaveLength(2);
+    expect(result[0]?.id).toBe("meta-prineville-or");
+    expect(result[1]?.id).toBe("meta-prineville-or");
+    // Verify they are the same object (or at least equal).
+    expect(result[0]).toEqual(result[1]);
+  });
+});
+
 describe("getFacilityByIdCached", () => {
   // Runs under VITEST, so this exercises the scoped reader's JSON-fallback
   // path (fetchFacilityByIdUncached) — the tag-only unstable_cache wrapper
@@ -92,6 +182,138 @@ describe("getFacilityByIdCached", () => {
 
   it("returns undefined for an unknown id", async () => {
     expect(await getFacilityByIdCached("not-a-real-facility")).toBeUndefined();
+  });
+});
+
+describe("withJsonFallback", () => {
+  // Proves the build-time DB-read resilience fix: a Neon read that throws
+  // `fetch failed` (the observed build-time-concurrency failure mode) must
+  // degrade to the bundled JSON snapshot instead of propagating, after a
+  // short retry. This is the pre-deploy proof for lib/data.ts's readers —
+  // `withJsonFallback` is a pure function of `fn`/`fallback`, so it's
+  // testable directly without mocking the module-scoped `getDb()` singleton
+  // that the real Neon-reading callers (loadFacilitiesUncached, etc.) use.
+
+  it("returns the primary result without retrying when fn succeeds", async () => {
+    let calls = 0;
+    const result = await withJsonFallback(
+      async () => {
+        calls++;
+        return "primary";
+      },
+      () => "fallback"
+    );
+    expect(result).toBe("primary");
+    expect(calls).toBe(1);
+  });
+
+  it("retries a transient failure and returns the primary result once fn succeeds", async () => {
+    let calls = 0;
+    const result = await withJsonFallback(
+      async () => {
+        calls++;
+        if (calls < 2) throw new Error("fetch failed");
+        return "primary-after-retry";
+      },
+      () => "fallback"
+    );
+    expect(result).toBe("primary-after-retry");
+    expect(calls).toBe(2);
+  });
+
+  it("falls back to the JSON snapshot after exhausting retries, without throwing", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    let calls = 0;
+    const jsonSnapshot = await getAllFacilities();
+
+    const result = await withJsonFallback(
+      async () => {
+        calls++;
+        throw new Error("fetch failed");
+      },
+      () => jsonSnapshot,
+      3
+    );
+
+    expect(calls).toBe(3);
+    expect(result).toBe(jsonSnapshot);
+    expect(result.length).toBeGreaterThan(0);
+    const parsed = facilitiesSchema.safeParse(result);
+    expect(parsed.success).toBe(true);
+
+    warnSpy.mockRestore();
+  });
+
+  it("logs a visible warning on fallback, never silently", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    await withJsonFallback(
+      async () => {
+        throw new Error("fetch failed");
+      },
+      () => "fallback",
+      2
+    );
+
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    expect(warnSpy.mock.calls[0][0]).toContain(
+      "[data] Neon read failed, falling back to bundled JSON snapshot"
+    );
+
+    warnSpy.mockRestore();
+  });
+
+  // Security review, 2026-09-27: this log line used to pass `lastErr` as a
+  // second console.warn argument. It is the highest-VOLUME of the codebase's
+  // DB catch paths — it fires on every Neon read failure during prerender,
+  // which is precisely when `lastErr` holds a DrizzleQueryError whose own
+  // `.message` embeds the query's bound params. It also sits AFTER the retry
+  // loop rather than inside the `catch` (the loop only does `lastErr = err`),
+  // which is why it survived every catch-block scan and was found only by
+  // scripts/lint-no-raw-error-logs.mjs.
+  it("logs a redacted sqlstate on fallback, never the bound params drizzle embeds in the error", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const boundParam = "subscriber-secret@example.com";
+    // The fixture MUST carry a real `code`, or redactedErrorCode returns
+    // "unknown" and the sqlstate assertion below would pass no matter what —
+    // a false proxy. Drizzle's shape: params in the wrapper's own `.message`,
+    // the SQLSTATE one level down on `.cause`.
+    const drizzleError = new Error(
+      `Failed query: select "doc" from "facilities" where "email" = $1 params: ${boundParam}`,
+      { cause: Object.assign(new Error("fetch failed"), { code: "08006" }) }
+    );
+    expect(drizzleError.message).toContain(`params: ${boundParam}`);
+
+    const result = await withJsonFallback(
+      async () => {
+        throw drizzleError;
+      },
+      () => "fallback",
+      2
+    );
+
+    // Control flow is untouched by the redaction: the bundled-snapshot
+    // fallback still returns, and still never throws.
+    expect(result).toBe("fallback");
+
+    const logged = warnSpy.mock.calls.flat().map(String).join(" ");
+    expect(logged).toContain("[data] Neon read failed");
+    expect(logged).toContain("sqlstate: 08006");
+    expect(logged).not.toContain(boundParam);
+
+    warnSpy.mockRestore();
+  });
+
+  it("never invokes the fallback when fn succeeds", async () => {
+    let fallbackCalls = 0;
+    await withJsonFallback(
+      async () => "ok",
+      () => {
+        fallbackCalls++;
+        return "fallback";
+      }
+    );
+    expect(fallbackCalls).toBe(0);
   });
 });
 
@@ -145,20 +367,34 @@ describe("getStats", () => {
     expect(states).toBe(expectedStates);
   });
 
-  it("operationalMw excludes cancelled facilities", async () => {
+  it("includesDc is true — the live dataset has DC facilities", async () => {
+    const { includesDc } = await getStats();
+    const hasDc = (await getAllFacilities()).some((f) => f.location.state === "DC");
+    expect(hasDc).toBe(true); // sanity: the fixture this test relies on
+    expect(includesDc).toBe(true);
+  });
+
+  it("operationalMw excludes cancelled facilities and is rounded to 1 decimal", async () => {
     const { operationalMw } = await getStats();
     const manual = (await getAllFacilities())
       .filter((f) => f.status !== "cancelled")
       .reduce((sum, f) => sum + (f.capacityMw?.operational ?? 0), 0);
-    expect(operationalMw).toBe(manual);
+    expect(operationalMw).toBe(Math.round(manual * 10) / 10);
   });
 
-  it("plannedMw excludes cancelled facilities", async () => {
+  it("plannedMw excludes cancelled facilities and is rounded to 1 decimal", async () => {
     const { plannedMw } = await getStats();
     const manual = (await getAllFacilities())
       .filter((f) => f.status !== "cancelled")
       .reduce((sum, f) => sum + (f.capacityMw?.planned ?? 0), 0);
-    expect(plannedMw).toBe(manual);
+    expect(plannedMw).toBe(Math.round(manual * 10) / 10);
+  });
+
+  it("operationalMw, plannedMw, and underConstructionMw carry at most 1 decimal place", async () => {
+    const { operationalMw, plannedMw, underConstructionMw } = await getStats();
+    for (const value of [operationalMw, plannedMw, underConstructionMw]) {
+      expect(Math.round(value * 10) / 10).toBe(value);
+    }
   });
 
   it("operationalMw is non-negative", async () => {
@@ -183,12 +419,31 @@ describe("getStats", () => {
     expect(underConstructionMw).toBeGreaterThanOrEqual(0);
   });
 
-  it("underConstructionMw equals manual recomputation", async () => {
+  it("underConstructionMw equals manual recomputation, rounded to 1 decimal", async () => {
     const { underConstructionMw } = await getStats();
     const expected = (await getAllFacilities())
       .filter((f) => f.status === "under_construction")
       .reduce((sum, f) => sum + (f.capacityMw?.planned ?? 0), 0);
-    expect(underConstructionMw).toBe(expected);
+    expect(underConstructionMw).toBe(Math.round(expected * 10) / 10);
+  });
+
+  it("stateCodes is sorted and de-duplicated", async () => {
+    const { stateCodes } = await getStats();
+    expect(stateCodes).toEqual([...stateCodes].sort());
+    expect(stateCodes).toEqual([...new Set(stateCodes)]);
+  });
+
+  it("stateCodes is consistent with states and includesDc — the sibling fields cannot drift apart", async () => {
+    const { states, includesDc, stateCodes } = await getStats();
+    expect(stateCodes.length).toBe(states);
+    expect(stateCodes.includes("DC")).toBe(includesDc);
+  });
+
+  it("stateCodes contains known fixture jurisdictions (spot check)", async () => {
+    const { stateCodes } = await getStats();
+    // TX and DC are present in tests/fixtures/facilities.fixture.json; the
+    // live-dataset spot check (CA, TX, DC) is in data.dataset.test.ts.
+    expect(stateCodes).toEqual(expect.arrayContaining(["TX", "DC"]));
   });
 });
 
@@ -499,6 +754,33 @@ describe("getFacilitiesByWaterUsage", () => {
     }
   });
 
+  it("excludes a cancelled facility that reports a positive reportedMgd", async () => {
+    // No real record is both cancelled and positive-MGD, so the
+    // `status !== "cancelled"` clause of hasReportedWater is only reachable with a
+    // synthetic variant: clone a positive fixture record, cancel it, and feed the
+    // list to a fresh copy of the module (same doMock pattern as
+    // dataset-edition.test.ts).
+    const positive = (await getFacilitiesByWaterUsage(100))[0];
+    const cancelled = { ...positive, id: `${positive.id}-cancelled-clone`, status: "cancelled" };
+    vi.resetModules();
+    vi.doMock("@/data/facilities.json", () => ({
+      default: [...(facilitiesRaw as unknown[]), cancelled],
+    }));
+    try {
+      const fresh = await import("@/lib/data");
+      // Control: the mock applied, i.e. the cancelled clone IS in the loaded list.
+      // Without this, a doMock that silently missed would make the exclusion below
+      // pass vacuously.
+      expect((await fresh.getAllFacilities()).map((f) => f.id)).toContain(cancelled.id);
+      const ids = (await fresh.getFacilitiesByWaterUsage(100)).map((f) => f.id);
+      expect(ids).toContain(positive.id);
+      expect(ids).not.toContain(cancelled.id);
+    } finally {
+      vi.doUnmock("@/data/facilities.json");
+      vi.resetModules();
+    }
+  });
+
   it("sorts by reportedMgd desc, tie-broken by name A→Z", async () => {
     const results = await getFacilitiesByWaterUsage(100);
     for (let i = 1; i < results.length; i++) {
@@ -591,6 +873,41 @@ describe("getCommunityReceptionCounts", () => {
     const sum = Object.values(counts).reduce((a, b) => a + b, 0);
     const withStatus = (await getAllFacilities()).filter((f) => !!f.community?.status).length;
     expect(sum).toBe(withStatus);
+  });
+});
+
+describe("getFrictionTotal", () => {
+  it("sums contested + opposed + litigation", () => {
+    expect(
+      getFrictionTotal({
+        supported: 0,
+        mixed: 0,
+        contested: 185,
+        opposed: 119,
+        litigation: 53,
+        unknown: 0,
+      })
+    ).toBe(357);
+  });
+
+  it("returns 0 for an all-zero input", () => {
+    expect(
+      getFrictionTotal({
+        supported: 0,
+        mixed: 0,
+        contested: 0,
+        opposed: 0,
+        litigation: 0,
+        unknown: 0,
+      })
+    ).toBe(0);
+  });
+
+  it("matches the live getCommunityReceptionCounts sum", async () => {
+    const counts = await getCommunityReceptionCounts();
+    expect(getFrictionTotal(counts)).toBe(
+      (counts.contested ?? 0) + (counts.opposed ?? 0) + (counts.litigation ?? 0)
+    );
   });
 });
 
@@ -764,6 +1081,31 @@ describe("getStateSummaryCached", () => {
   });
 });
 
+describe("computeStateSummary — input order", () => {
+  // Id order a, b, c sums 0.05 + 0.3 + 0.7 = 1.0499999999999998, which roundMw
+  // takes to 1.0. The reverse order sums to exactly 1.05, which rounds to 1.1,
+  // so the id sort is what makes the result order-independent.
+  const make = (id: string, mw: number) =>
+    makeFacility({ id, capacityMw: { operational: mw, planned: mw } });
+  const a = make("a", 0.05);
+  const b = make("b", 0.3);
+  const c = make("c", 0.7);
+
+  it("yields identical MW sums whatever order the facilities arrive in", () => {
+    const forward = computeStateSummary("IL", [a, b, c]);
+    const reversed = computeStateSummary("IL", [c, b, a]);
+    // Catches removing the id sort: reversed input would round to 1.1.
+    expect(reversed).toEqual(forward);
+  });
+
+  it("rounds the sums to 0.1 MW, taking the id-sorted order's total", () => {
+    const summary = computeStateSummary("IL", [c, b, a]);
+    // Catches removing roundMw: the raw id-sorted sum is 1.0499999999999998.
+    expect(summary?.operationalMw).toBe(1);
+    expect(summary?.plannedMw).toBe(1);
+  });
+});
+
 describe("operatorSlug", () => {
   it("slugifies a multi-word operator name", () => {
     expect(operatorSlug("Amazon Web Services")).toBe("amazon-web-services");
@@ -782,6 +1124,261 @@ describe("operatorSlug", () => {
 describe("getOperatorBySlug", () => {
   it("returns undefined for an unknown slug", async () => {
     expect(await getOperatorBySlug("not-a-real-operator")).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Stakeholders — the `stakeholders` field is a brand-new, still-mostly-
+// unpopulated part of the schema (see lib/schema.ts), so the real bundled
+// dataset currently has zero facilities with a stakeholder on file. The
+// round-trip/empty-state tests below assert real, currently-true behavior
+// against the live dataset; `buildStakeholderIndex` is additionally
+// unit-tested directly against synthetic fixtures (it's a pure function of
+// its `facilities` argument, exported for exactly this reason — see its doc
+// comment) since there is no real multi-facility person yet to exercise the
+// grouping logic against.
+// ---------------------------------------------------------------------------
+
+function makeFacility(overrides: Partial<DataCenterFacility> = {}): DataCenterFacility {
+  return {
+    id: "test-facility",
+    name: "Test Facility",
+    operator: "Acme Corp",
+    status: "operational",
+    confidence: "confirmed",
+    facilityType: "data_center",
+    location: { lat: 40, lon: -90, state: "IL", precision: "exact" },
+    statusHistory: [],
+    sources: [
+      { url: "https://example.com", label: "Example source", retrievedAt: "2026-01-01", kind: "press" },
+    ],
+    lastUpdated: "2026-01-01",
+    ...overrides,
+  };
+}
+
+describe("personSlug", () => {
+  it("slugifies a multi-word person name", () => {
+    expect(personSlug("Jane Q. Doe")).toBe("jane-q-doe");
+  });
+});
+
+describe("buildStakeholderIndex", () => {
+  it("groups one person across multiple facilities, sorted by max MW desc", () => {
+    const small = makeFacility({
+      id: "site-a",
+      capacityMw: { operational: 50 },
+      stakeholders: [{ name: "Jane Doe", role: "founder", sourceIndex: 0, asOf: "2026-01-01" }],
+    });
+    const big = makeFacility({
+      id: "site-b",
+      capacityMw: { operational: 200 },
+      stakeholders: [{ name: "Jane Doe", role: "investor", sourceIndex: 0, asOf: "2026-01-01" }],
+    });
+
+    const { byPerson, slugToPerson } = buildStakeholderIndex([small, big], []);
+
+    expect(byPerson.get("Jane Doe")?.map((f) => f.id)).toEqual(["site-b", "site-a"]);
+    expect(slugToPerson.get(personSlug("Jane Doe"))).toBe("Jane Doe");
+  });
+
+  it("dedupes a person listed twice at the same facility (e.g. two roles)", () => {
+    const facility = makeFacility({
+      id: "site-a",
+      stakeholders: [
+        { name: "Jane Doe", role: "founder", sourceIndex: 0, asOf: "2026-01-01" },
+        { name: "Jane Doe", role: "executive", sourceIndex: 0, asOf: "2026-01-01" },
+      ],
+    });
+
+    const { byPerson } = buildStakeholderIndex([facility], []);
+
+    expect(byPerson.get("Jane Doe")).toHaveLength(1);
+  });
+});
+
+describe("summarizeStakeholders kind derivation", () => {
+  it("derives kind per name: organization if any entry for that name is one, else person", async () => {
+    const facilities = [
+      makeFacility({
+        id: "site-a",
+        stakeholders: [
+          { name: "Jane Doe", role: "founder", sourceIndex: 0, asOf: "2026-01-01" },
+          { name: "Example Fund", kind: "organization", role: "investor", sourceIndex: 0, asOf: "2026-01-01" },
+        ],
+      }),
+      makeFacility({
+        id: "site-b",
+        stakeholders: [
+          { name: "Example Fund", role: "lender", kind: "organization", sourceIndex: 0, asOf: "2026-01-01" },
+          { name: "Jane Doe", kind: "person", role: "investor", sourceIndex: 0, asOf: "2026-01-01" },
+        ],
+      }),
+    ];
+    const byName = new Map(
+      summarizeStakeholders(buildStakeholderIndex(facilities, [])).map((s) => [s.name, s])
+    );
+    expect(byName.get("Example Fund")?.kind).toBe("organization");
+    expect(byName.get("Example Fund")?.roles).toEqual(["investor", "lender"]);
+    expect(byName.get("Jane Doe")?.kind).toBe("person");
+  });
+});
+
+describe("getStakeholders", () => {
+  // Invariant-based rather than an exact array/count: `stakeholders` is a
+  // brand-new field that back-fills over time (see lib/schema.ts), so a
+  // hardcoded "returns []" assertion would go stale the moment real sourced
+  // entries land — and did, mid-development of this lens. Holds vacuously
+  // true (0 iterations) on a sparse dataset and becomes a real check once
+  // entries exist, in either case.
+  it("every summary reflects at least one facility, with de-duplicated roles and states", async () => {
+    for (const person of await getStakeholders()) {
+      // An operator-level owner may have no site-level facility.
+      expect(person.facilityCount + person.viaOperators.length).toBeGreaterThan(0);
+      expect(person.roles.length).toBeGreaterThan(0);
+      // `states` is site-level: non-empty exactly when the person has site-level facilities.
+      expect(person.states.length > 0).toBe(person.facilityCount > 0);
+      expect(person.slug).toBe(personSlug(person.name));
+      expect(new Set(person.roles).size).toBe(person.roles.length);
+      expect(new Set(person.states).size).toBe(person.states.length);
+    }
+  });
+});
+
+describe("operator-level owners in the stakeholder index", () => {
+  const source = { url: "https://example.com/own", label: "Ownership filing", retrievedAt: "2026-11-04", kind: "filing" as const };
+  const ownership = parseOperatorOwnership([
+    {
+      operator: "Acme Corp",
+      owners: [
+        { name: "Example Capital", kind: "organization", role: "controlling_owner", source, asOf: "2026-11-04" },
+        { name: "Jane Doe", kind: "person", role: "investor", source, asOf: "2026-11-04" },
+      ],
+    },
+    {
+      operator: "Beta Co",
+      owners: [{ name: "Example Capital", kind: "organization", role: "investor", source, asOf: "2026-11-04" }],
+    },
+    // Operator with no tracked facility: still listed, count 0.
+    { operator: "Ghost Operator", owners: [{ name: "Example Capital", kind: "organization", role: "investor", source, asOf: "2026-11-04" }] },
+  ]);
+  const facilities = [
+    makeFacility({ id: "acme-1", operator: "Acme Corp", location: { lat: 1, lon: 1, city: "A", state: "TX", precision: "exact" } }),
+    makeFacility({ id: "acme-2", operator: "Acme Corp", location: { lat: 1, lon: 1, city: "B", state: "VA", precision: "exact" } }),
+    makeFacility({
+      id: "beta-1",
+      operator: "Beta Co",
+      stakeholders: [{ name: "Jane Doe", role: "founder", sourceIndex: 0, asOf: "2026-01-01" }],
+      location: { lat: 1, lon: 1, city: "C", state: "OH", precision: "exact" },
+    }),
+  ];
+  const summaries = new Map(
+    summarizeStakeholders(buildStakeholderIndex(facilities, ownership)).map((s) => [s.name, s])
+  );
+
+  it("lists an owner with no site-level stake, with facilityCount 0 and its operator reach", () => {
+    const fund = summaries.get("Example Capital");
+    expect(fund).toBeDefined();
+    expect(fund?.facilityCount).toBe(0);
+    expect(fund?.operatorFacilityCount).toBe(3);
+    expect(fund?.kind).toBe("organization");
+    expect(fund?.roles).toEqual(["controlling_owner", "investor"]);
+    // `states` is site-level: an owner with no site-level facility has none.
+    expect(fund?.states).toEqual([]);
+    expect(fund?.viaOperators.map((v) => [v.operator, v.slug, v.facilityCount])).toEqual([
+      ["Acme Corp", "acme-corp", 2],
+      ["Beta Co", "beta-co", 1],
+      ["Ghost Operator", "ghost-operator", 0],
+    ]);
+  });
+
+  it("a name with BOTH a site-level stake and an operator stake keeps the two apart", () => {
+    const jane = summaries.get("Jane Doe");
+    expect(jane?.facilityCount).toBe(1);
+    expect(jane?.states).toEqual(["OH"]);
+    expect(jane?.viaOperators.map((v) => v.operator)).toEqual(["Acme Corp"]);
+    expect(jane?.operatorFacilityCount).toBe(2);
+    expect(jane?.roles).toEqual(["founder", "investor"]);
+    expect(jane?.kind).toBe("person");
+  });
+
+  it("keeps owners out of byPerson but resolves their slug", () => {
+    const index = buildStakeholderIndex(facilities, ownership);
+    expect(index.byPerson.has("Example Capital")).toBe(false);
+    expect(index.slugToPerson.get("example-capital")).toBe("Example Capital");
+  });
+
+  it("on a slug collision, the site-level stakeholder keeps the slug", () => {
+    const colliding = parseOperatorOwnership([
+      {
+        operator: "Acme Corp",
+        owners: [{ name: "Jane  Doe", kind: "person", role: "investor", source, asOf: "2026-11-04" }],
+      },
+    ]);
+    const index = buildStakeholderIndex(facilities, colliding);
+    expect(personSlug("Jane  Doe")).toBe(personSlug("Jane Doe"));
+    expect(index.slugToPerson.get("jane-doe")).toBe("Jane Doe");
+  });
+
+  it("records a slug collision once at index build, and summarizing drops the loser (twice, still one log)", () => {
+    const colliding = parseOperatorOwnership([
+      {
+        operator: "Acme Corp",
+        owners: [{ name: "Jane  Doe", kind: "person", role: "investor", source, asOf: "2026-11-04" }],
+      },
+    ]);
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const index = buildStakeholderIndex(facilities, colliding);
+      expect(index.collisions).toEqual([{ slug: "jane-doe", kept: "Jane Doe", dropped: "Jane  Doe" }]);
+
+      for (let i = 0; i < 2; i++) {
+        const summaries = summarizeStakeholders(index);
+        expect(summaries.filter((s) => s.slug === "jane-doe").map((s) => s.name)).toEqual(["Jane Doe"]);
+      }
+      expect(errorSpy).toHaveBeenCalledTimes(1);
+      expect(errorSpy.mock.calls[0][0]).toMatch(/Jane  Doe.*Jane Doe.*jane-doe/);
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
+  it("does not memoize an injected ownership array against the facilities list", () => {
+    const withOwners = buildStakeholderIndex(facilities, ownership);
+    const without = buildStakeholderIndex(facilities, []);
+    expect(withOwners.viaByOwner.size).toBe(2);
+    expect(without.viaByOwner.size).toBe(0);
+  });
+});
+
+describe("the real stakeholder index", () => {
+  // The loud CI gate: a collision arriving via db:sync or an ownership row
+  // degrades gracefully at runtime (see buildStakeholderIndex) but must fail here.
+  it("has no slug collisions (real facilities + real operator-ownership)", async () => {
+    const index = buildStakeholderIndex(await getAllFacilities(), operatorOwnership);
+    expect(index.collisions).toEqual([]);
+  });
+});
+
+describe("getStakeholderBySlug", () => {
+  it("returns undefined for an unknown slug", async () => {
+    expect(await getStakeholderBySlug("not-a-real-stakeholder")).toBeUndefined();
+  });
+
+  // Exercises the same round-trip contract as the operatorSlug describe block
+  // above. Currently a 0-iteration loop against the live dataset — it becomes
+  // a real, mutation-testable assertion the moment the first sourced
+  // stakeholder entry lands, rather than a vacuous placeholder.
+  it("round-trips through personSlug for every tracked stakeholder", async () => {
+    for (const person of await getStakeholders()) {
+      expect(await getStakeholderBySlug(personSlug(person.name))).toBe(person.name);
+    }
+  });
+});
+
+describe("getFacilitiesByStakeholder", () => {
+  it("returns [] for a name with zero facilities", async () => {
+    expect(await getFacilitiesByStakeholder("Not A Real Person")).toEqual([]);
   });
 });
 
@@ -851,6 +1448,387 @@ describe("getOperatorSummary", () => {
     ).size;
     expect(summary.stateCount).toBe(expected);
   });
+
+  it("includesDc is true for an operator with a DC facility (CoreSite)", async () => {
+    const summary = (await getOperatorSummary("CoreSite"))!;
+    const hasDc = (await getFacilitiesByOperator("CoreSite")).some(
+      (f) => f.location.state === "DC"
+    );
+    expect(hasDc).toBe(true); // sanity: the fixture this test relies on
+    expect(summary.includesDc).toBe(true);
+  });
+
+  it("includesDc is false for an operator with no DC facility (Google)", async () => {
+    const summary = (await getOperatorSummary("Google"))!;
+    const hasDc = (await getFacilitiesByOperator("Google")).some(
+      (f) => f.location.state === "DC"
+    );
+    expect(hasDc).toBe(false); // sanity: the fixture this test relies on
+    expect(summary.includesDc).toBe(false);
+  });
+
+  it("stateCodes contains exactly the expected codes for a multi-state operator", async () => {
+    // Derived independently from the data, not from the implementation's
+    // Set-building expression: looping into an object keyed by state, then
+    // Object.keys().sort(), so a data change moves both sides together. The
+    // fixture has CoreSite, but only one state of it; the live
+    // CoreSite/DC case is in data.dataset.test.ts. Pick whichever operator spans the most states.
+    const all = await getAllFacilities();
+    const statesByOperator = new Map<string, Set<string>>();
+    for (const f of all) {
+      const set = statesByOperator.get(f.operator) ?? new Set<string>();
+      set.add(f.location.state);
+      statesByOperator.set(f.operator, set);
+    }
+    const [operator] = [...statesByOperator].sort((x, y) => y[1].size - x[1].size)[0];
+
+    const facilities = await getFacilitiesByOperator(operator);
+    expect(facilities.length).toBeGreaterThan(0);
+    const stateMap: Record<string, true> = {};
+    for (const f of facilities) {
+      stateMap[f.location.state] = true;
+    }
+    const expected = Object.keys(stateMap).sort();
+    // Sanity: the operator must span 2+ states for this test to be meaningful
+    expect(expected.length).toBeGreaterThanOrEqual(2);
+
+    const summary = (await getOperatorSummary(operator))!;
+    expect(summary.stateCodes).toEqual(expected);
+  });
+
+  it("stateCodes contains exactly the expected codes for Google (no DC)", async () => {
+    // Derived independently from live data, not from the implementation's
+    // Set-building expression: looping into an object keyed by state, then
+    // Object.keys().sort(), so a data wave moves both sides together.
+    const facilities = await getFacilitiesByOperator("Google");
+    expect(facilities.length).toBeGreaterThan(0); // sanity: fixture must exist
+    const stateMap: Record<string, true> = {};
+    for (const f of facilities) {
+      stateMap[f.location.state] = true;
+    }
+    const expected = Object.keys(stateMap).sort();
+    // Sanity: Google must NOT have a DC facility for this test to be meaningful
+    expect(expected).not.toContain("DC");
+    expect(expected.length).toBeGreaterThanOrEqual(2);
+
+    const summary = (await getOperatorSummary("Google"))!;
+    expect(summary.stateCodes).toEqual(expected);
+  });
+
+  it("stateCodes is sorted and de-duplicated", async () => {
+    const summary = (await getOperatorSummary("CoreSite"))!;
+    expect(summary.stateCodes).toEqual([...summary.stateCodes].sort());
+    expect(summary.stateCodes).toEqual([...new Set(summary.stateCodes)]);
+  });
+
+  it("stateCodes is consistent with stateCount and includesDc — the sibling fields cannot drift apart", async () => {
+    for (const name of ["CoreSite", "Google"]) {
+      const summary = (await getOperatorSummary(name))!;
+      expect(summary.stateCodes.length).toBe(summary.stateCount);
+      expect(summary.stateCodes.includes("DC")).toBe(summary.includesDc);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Per-county lens. Asserted against the live bundled dataset (as the operator
+// and metro helpers are), but derived rather than hardcoded: every expectation
+// below is computed from getAllFacilities() so a data wave moves both sides
+// together. The pure slug/label rules are unit-tested in lib/counties.test.ts.
+// ---------------------------------------------------------------------------
+
+describe("buildCountyIndex", () => {
+  // Exercised against synthetic fixtures because the degenerate spellings the
+  // guards exist for have zero records in the live dataset — the async readers
+  // cannot be driven to them at all.
+  function inCounty(id: string, state: string, county?: string): DataCenterFacility {
+    const base = { lat: 38, lon: -77, state, precision: "exact" as const };
+    return makeFacility({
+      id,
+      location: county === undefined ? base : { ...base, county },
+    });
+  }
+
+  it("excludes a county that normalizes to an empty string", () => {
+    // normalizeCounty(" County") === "" — non-blank going in, empty coming
+    // out. Left ungated this mints a nameless county on a bare "-va" slug.
+    const index = buildCountyIndex([
+      inCounty("bare-county", "VA", " County"),
+      inCounty("bare-parish", "LA", " Parish"),
+      inCounty("bare-borough", "AK", " Borough"),
+      inCounty("loudoun", "VA", "Loudoun"),
+    ]);
+
+    expect([...index.bySlug.keys()]).toEqual(["loudoun-va"]);
+    expect(index.ordered).toHaveLength(1);
+    expect(index.ordered[0].name).toBe("Loudoun");
+  });
+
+  it("excludes null and whitespace-only counties", () => {
+    const index = buildCountyIndex([
+      inCounty("no-county", "VA"),
+      inCounty("blank-county", "VA", "   "),
+      inCounty("loudoun", "VA", "Loudoun"),
+    ]);
+
+    expect([...index.bySlug.keys()]).toEqual(["loudoun-va"]);
+    expect(index.facilitiesBySlug.get("loudoun-va")!.map((f) => f.id)).toEqual(["loudoun"]);
+  });
+
+  it("merges spellings into one bucket and labels it deterministically", () => {
+    const facilities = [
+      inCounty("a", "MO", "St. Louis City"),
+      inCounty("b", "MO", "St. Louis city"),
+      inCounty("c", "VA", "Loudoun County"),
+      inCounty("d", "VA", "Loudoun"),
+    ];
+    const index = buildCountyIndex(facilities);
+    const reversed = buildCountyIndex([...facilities].reverse());
+
+    expect(index.bySlug.get("st-louis-city-mo")).toEqual({
+      slug: "st-louis-city-mo",
+      name: "St. Louis city",
+      state: "MO",
+      count: 2,
+    });
+    expect(index.bySlug.get("loudoun-va")!.name).toBe("Loudoun");
+    // Same labels whichever order the records arrive in.
+    expect(reversed.bySlug.get("st-louis-city-mo")!.name).toBe("St. Louis city");
+  });
+});
+
+describe("getCounties", () => {
+  it("counts sum to exactly the facilities that have a county on record", async () => {
+    const counties = await getCounties();
+    const facilities = await getAllFacilities();
+    const withCounty = facilities.filter(
+      (f) => f.location.county != null && f.location.county.trim() !== ""
+    ).length;
+
+    expect(counties.length).toBeGreaterThan(0);
+    expect(counties.reduce((sum, c) => sum + c.count, 0)).toBe(withCounty);
+    // Facilities without a county belong to no county at all, so the sum must
+    // fall short of the full dataset rather than matching it.
+    expect(withCounty).toBeLessThan(facilities.length);
+  });
+
+  it("never produces an empty-named or empty-slugged bucket for countyless facilities", async () => {
+    const counties = await getCounties();
+    expect(counties.length).toBeGreaterThan(0);
+    for (const county of counties) {
+      expect(county.name).not.toBe("");
+      expect(county.state).toMatch(/^[A-Z]{2}$/);
+      expect(county.slug).toBe(countySlug(county.name, county.state));
+      expect(county.count).toBeGreaterThan(0);
+    }
+  });
+
+  it("sorts by count desc, then state A→Z, then name A→Z", async () => {
+    const counties = await getCounties();
+    expect(counties.length).toBeGreaterThan(0);
+    for (let i = 1; i < counties.length; i++) {
+      const prev = counties[i - 1];
+      const curr = counties[i];
+      const ordered =
+        prev.count > curr.count ||
+        (prev.count === curr.count && prev.state < curr.state) ||
+        (prev.count === curr.count &&
+          prev.state === curr.state &&
+          prev.name.localeCompare(curr.name) <= 0);
+      expect(ordered).toBe(true);
+    }
+  });
+
+  it("gives each slug exactly one entry", async () => {
+    const counties = await getCounties();
+    expect(counties.length).toBeGreaterThan(0);
+    expect(new Set(counties.map((c) => c.slug)).size).toBe(counties.length);
+  });
+
+  it("returns a copy — sorting or mutating the result cannot poison the memoized index", async () => {
+    const first = await getCounties();
+    const topSlug = first[0].slug;
+    const topCount = first[0].count;
+    // Both levels: the array itself, and the summary objects inside it.
+    first[0].count = 0;
+    first.sort((a, b) => a.count - b.count);
+
+    const second = await getCounties();
+    expect(second[0].slug).toBe(topSlug);
+    expect(second[0].count).toBe(topCount);
+  });
+});
+
+describe("getCountyBySlug", () => {
+  it("resolves a county with 2+ facilities and reports a count derived from the raw data", async () => {
+    const counties = await getCounties();
+    expect(counties.length).toBeGreaterThan(0);
+    const multi = counties.find((c) => c.count >= 2);
+    expect(multi).toBeDefined();
+
+    // Re-derived from getAllFacilities() through `metroCountyKey` — an
+    // independent normalization that uses neither slugify nor the apostrophe
+    // strip — so this expectation is not the index restating itself. If the
+    // two normalizations ever disagree on a real county, that SHOULD fail
+    // here rather than be silently absorbed.
+    const key = metroCountyKey(multi!.state, multi!.name);
+    const expected = (await getAllFacilities()).filter(
+      (f) =>
+        f.location.county != null &&
+        metroCountyKey(f.location.state, f.location.county) === key
+    );
+    expect(expected.length).toBeGreaterThanOrEqual(2);
+
+    const county = await getCountyBySlug(multi!.slug);
+    expect(county).toBeDefined();
+    expect(county!.count).toBe(expected.length);
+    expect(county!.name).toBe(multi!.name);
+    expect(county!.state).toBe(multi!.state);
+    expect(await getFacilitiesByCounty(multi!.slug)).toHaveLength(expected.length);
+  });
+
+  it("is case-insensitive on the slug", async () => {
+    const { slug } = (await getCounties())[0];
+    expect(await getCountyBySlug(slug.toUpperCase())).toEqual(await getCountyBySlug(slug));
+  });
+
+  it("returns a fresh object — mutating one lookup cannot poison the next", async () => {
+    const { slug } = (await getCounties())[0];
+    const first = (await getCountyBySlug(slug))!;
+    const originalCount = first.count;
+    first.count = 0;
+    expect((await getCountyBySlug(slug))!.count).toBe(originalCount);
+  });
+
+  it("returns undefined for an unknown slug", async () => {
+    expect(await getCountyBySlug("not-a-real-county-zz")).toBeUndefined();
+  });
+
+  it("round-trips through countySlug for every tracked county", async () => {
+    const counties = await getCounties();
+    expect(counties.length).toBeGreaterThan(0);
+    for (const county of counties) {
+      expect((await getCountyBySlug(countySlug(county.name, county.state)))?.slug).toBe(
+        county.slug
+      );
+    }
+  });
+
+  it("merges two spellings of one county into one slug", () => {
+    // ⚠️ This used to scan the LIVE dataset for a county carrying two
+    // spellings — MO's "St. Louis city" / "St. Louis City". Normalizing that
+    // pair in the data deleted the test's own subject, and the test failed.
+    // That is the right failure (its guard asserted the premise rather than
+    // assuming it), but the lesson is that a merge test must not depend on
+    // the data staying dirty: the moment the last duplicate is cleaned, a
+    // live-data version either fails like this or, worse, passes vacuously
+    // over a single spelling and proves nothing.
+    //
+    // Synthetic pair instead, so this keeps testing the merge for as long as
+    // the merge exists, whatever the dataset happens to contain.
+    expect(countySlug("St. Louis City", "MO")).toBe(countySlug("St. Louis city", "MO"));
+    expect(countySlug("Tulsa County", "OK")).toBe(countySlug("Tulsa", "OK"));
+    // Different counties must NOT collide — without this the assertion above
+    // is satisfied by a slug function that returns a constant.
+    expect(countySlug("St. Louis city", "MO")).not.toBe(countySlug("St. Louis", "MO"));
+  });
+
+  it("picks one label for a merged county, independent of input order", () => {
+    // canonicalCountyName is the tie-break that stops the rendered label
+    // depending on sort order elsewhere in the pipeline.
+    const spellings = ["St. Louis City", "St. Louis city"];
+    const forward = canonicalCountyName(spellings);
+    const reversed = canonicalCountyName([...spellings].reverse());
+
+    expect(forward).toBe(reversed);
+    // A 1-1 tie breaks by localeCompare ascending, which sorts the LOWERCASE
+    // spelling first — I predicted the opposite and the test caught me, which
+    // is the whole reason this is a typed-out literal rather than a
+    // re-derivation of the implementation.
+    expect(forward).toBe("St. Louis city");
+    // Frequency beats the tie-break: make the CAPITALIZED spelling the
+    // majority and it wins despite losing the alphabetical comparison. Chosen
+    // adversarially — a fixture where frequency and tie-break agree would pass
+    // with the frequency branch deleted.
+    expect(canonicalCountyName(["St. Louis City", "St. Louis City", "St. Louis city"])).toBe(
+      "St. Louis City"
+    );
+  });
+});
+
+describe("getFacilitiesByCounty", () => {
+  it("returns exactly the facilities whose (county, state) slugs to that county", async () => {
+    const multi = (await getCounties()).find((c) => c.count >= 2)!;
+    const facilities = await getAllFacilities();
+    const expected = facilities.filter(
+      (f) =>
+        f.location.county != null &&
+        f.location.county.trim() !== "" &&
+        countySlug(f.location.county, f.location.state) === multi.slug
+    );
+
+    const results = await getFacilitiesByCounty(multi.slug);
+    expect(results.map((f) => f.id).sort()).toEqual(expected.map((f) => f.id).sort());
+  });
+
+  it("sorts by max capacity desc, then name A→Z", async () => {
+    // Largest county in the data: >= 5 live, >= 2 in the fixture, which is all
+    // the sort needs to have something to order.
+    const multi = [...(await getCounties())].sort((a, b) => b.count - a.count)[0];
+    expect(multi.count).toBeGreaterThanOrEqual(2);
+    const results = await getFacilitiesByCounty(multi.slug);
+    expect(results.length).toBe(multi.count);
+    for (let i = 1; i < results.length; i++) {
+      const prev = getFacilityMaxMw(results[i - 1]) ?? -1;
+      const curr = getFacilityMaxMw(results[i]) ?? -1;
+      expect(prev).toBeGreaterThanOrEqual(curr);
+      if (prev === curr) {
+        expect(results[i - 1].name.localeCompare(results[i].name)).toBeLessThanOrEqual(0);
+      }
+    }
+  });
+
+  it("excludes every facility with no county on record", async () => {
+    const facilities = await getAllFacilities();
+    const countyless = new Set(
+      facilities
+        .filter((f) => f.location.county == null || f.location.county.trim() === "")
+        .map((f) => f.id)
+    );
+    // Sanity: the fixture must carry a countyless record or the exclusion below
+    // is never exercised.
+    expect(countyless.size).toBeGreaterThan(0);
+
+    const placed = new Set<string>();
+    for (const county of await getCounties()) {
+      for (const f of await getFacilitiesByCounty(county.slug)) {
+        placed.add(f.id);
+      }
+    }
+    for (const id of countyless) {
+      expect(placed.has(id)).toBe(false);
+    }
+    expect(placed.size).toBe(facilities.length - countyless.size);
+  });
+
+  it("is case-insensitive on the slug", async () => {
+    const { slug } = (await getCounties())[0];
+    expect((await getFacilitiesByCounty(slug.toUpperCase())).map((f) => f.id)).toEqual(
+      (await getFacilitiesByCounty(slug)).map((f) => f.id)
+    );
+  });
+
+  it("returns [] for an unknown slug", async () => {
+    expect(await getFacilitiesByCounty("not-a-real-county-zz")).toEqual([]);
+  });
+
+  it("returns a copy — mutating the result cannot poison the memoized index", async () => {
+    const { slug } = (await getCounties())[0];
+    const first = await getFacilitiesByCounty(slug);
+    const originalLength = first.length;
+    first.pop();
+    expect(await getFacilitiesByCounty(slug)).toHaveLength(originalLength);
+  });
 });
 
 describe("getPowerGenerationFacilities", () => {
@@ -886,6 +1864,16 @@ describe("getRecentActivity", () => {
   });
 });
 
+describe("getContributorCredits", () => {
+  // This suite runs with no DATABASE_URL configured (matches the rest of
+  // this file), so it exercises the no-DB degrade path. The DB-backed
+  // aggregation/filter logic is covered separately in
+  // getContributorCredits.db.test.ts with getDb/hasDatabaseUrl mocked.
+  it("returns an empty array when DATABASE_URL is unset", async () => {
+    expect(await getContributorCredits()).toEqual([]);
+  });
+});
+
 describe("getQuarterlyPipelineSummary", () => {
   // Same no-DB degrade path as getRecentActivity above. The DB-backed
   // quarter-scoping/diff-inspection logic is covered separately in
@@ -896,6 +1884,22 @@ describe("getQuarterlyPipelineSummary", () => {
       cancelledThisQuarter: 0,
       statusChangesThisQuarter: 0,
     });
+  });
+});
+
+describe("normalizeOfftaker — schema-accepted labels", () => {
+  it.each([
+    "Amazon (AWS)",
+    "Google (Project Tembo, via Jupiter Star Holdings)",
+    "Nine Mile Data, LLC",
+    "Meta (via Pacific Power)",
+    "Meta (renewable energy credits; energy sold to Central Electric Power Cooperative)",
+    "Meta",
+  ])("%j matches the pattern and normalizes to a non-empty name with no parenthetical", (label) => {
+    expect(OFFTAKER_LABEL_PATTERN.test(label)).toBe(true);
+    const n = normalizeOfftaker(label);
+    expect(n).not.toContain("(");
+    expect(n.length).toBeGreaterThan(0);
   });
 });
 
@@ -911,13 +1915,6 @@ describe("normalizeOfftaker", () => {
 });
 
 describe("getGenerationByOfftaker", () => {
-  it("merges the two Amazon spellings into one group", async () => {
-    const groups = await getGenerationByOfftaker();
-    const amazon = groups.find((g) => g.offtaker === "Amazon");
-    expect(amazon).toBeDefined();
-    expect(amazon!.facilities.length).toBeGreaterThanOrEqual(2);
-  });
-
   it("has no group label containing a parenthetical", async () => {
     const groups = await getGenerationByOfftaker();
     for (const g of groups) {
@@ -948,6 +1945,187 @@ describe("getGenerationStats", () => {
         .map(normalizeOfftaker)
     );
     expect((await getGenerationStats()).offtakerCount).toBe(distinct.size);
+  });
+});
+
+describe("getGenerationBuildoutStats", () => {
+  it("fossilPlannedMw equals an independently-computed sum over non-cancelled natural_gas planned MW", async () => {
+    const manual = (await getPowerGenerationFacilities())
+      .filter((f) => f.status !== "cancelled")
+      .filter((f) => f.generation?.technology === "natural_gas")
+      .reduce((sum, f) => sum + (f.capacityMw?.planned ?? 0), 0);
+    expect((await getGenerationBuildoutStats()).fossilPlannedMw).toBe(manual);
+  });
+
+  it("nonFossilPlannedMw equals an independently-computed sum over non-cancelled non-fossil planned MW", async () => {
+    const manual = (await getPowerGenerationFacilities())
+      .filter((f) => f.status !== "cancelled")
+      .filter(
+        (f) => getGenerationFuelClass(f.generation?.technology) === "non_fossil"
+      )
+      .reduce((sum, f) => sum + (f.capacityMw?.planned ?? 0), 0);
+    expect((await getGenerationBuildoutStats()).nonFossilPlannedMw).toBe(manual);
+  });
+
+  it("fossilPlants and nonFossilPlants match independently-filtered counts", async () => {
+    const active = (await getPowerGenerationFacilities()).filter(
+      (f) => f.status !== "cancelled"
+    );
+    const fossilPlants = active.filter(
+      (f) => getGenerationFuelClass(f.generation?.technology) === "fossil"
+    ).length;
+    const nonFossilPlants = active.filter(
+      (f) => getGenerationFuelClass(f.generation?.technology) === "non_fossil"
+    ).length;
+    const stats = await getGenerationBuildoutStats();
+    expect(stats.fossilPlants).toBe(fossilPlants);
+    expect(stats.nonFossilPlants).toBe(nonFossilPlants);
+  });
+
+  // NOTE ON NAMING: this mirrors the cancelled-exclusion computation, but it
+  // cannot currently prove exclusion — data/facilities.json has zero
+  // cancelled power_generation records today, so `cancelledGasPlannedMw`/
+  // `cancelledGasCount` are always 0 and this reduces to "matches the
+  // all-status total," which would pass whether or not the implementation
+  // actually filters cancelled plants. It's kept as a real-data regression
+  // check on the live async pipeline (getGenerationBuildoutStats →
+  // getPowerGenerationFacilities); the actual cancelled-exclusion proof is
+  // the synthetic-fixture test in the computeGenerationBuildoutStats
+  // describe block below.
+  it("fossilPlannedMw and gas.total match the real dataset's natural_gas totals (does not currently prove cancelled-exclusion — see the fixture test below)", async () => {
+    const generation = await getPowerGenerationFacilities();
+    const stats = await getGenerationBuildoutStats();
+
+    const allGasPlannedMw = generation
+      .filter((f) => f.generation?.technology === "natural_gas")
+      .reduce((sum, f) => sum + (f.capacityMw?.planned ?? 0), 0);
+    const cancelledGasPlannedMw = generation
+      .filter(
+        (f) =>
+          f.status === "cancelled" && f.generation?.technology === "natural_gas"
+      )
+      .reduce((sum, f) => sum + (f.capacityMw?.planned ?? 0), 0);
+    expect(stats.fossilPlannedMw).toBe(allGasPlannedMw - cancelledGasPlannedMw);
+
+    const allGasCount = generation.filter(
+      (f) => f.generation?.technology === "natural_gas"
+    ).length;
+    const cancelledGasCount = generation.filter(
+      (f) =>
+        f.status === "cancelled" && f.generation?.technology === "natural_gas"
+    ).length;
+    expect(stats.gas.total).toBe(allGasCount - cancelledGasCount);
+  });
+
+  it("unclassified technologies (battery, other, undisclosed) contribute to neither bucket", async () => {
+    const active = (await getPowerGenerationFacilities()).filter(
+      (f) => f.status !== "cancelled"
+    );
+    const totalPlannedMw = active.reduce(
+      (sum, f) => sum + (f.capacityMw?.planned ?? 0),
+      0
+    );
+    const stats = await getGenerationBuildoutStats();
+    expect(stats.fossilPlannedMw + stats.nonFossilPlannedMw).toBeLessThanOrEqual(
+      totalPlannedMw
+    );
+  });
+
+  it("the gas status split components each match an independent filter", async () => {
+    const gasPlants = (await getPowerGenerationFacilities()).filter(
+      (f) => f.status !== "cancelled" && f.generation?.technology === "natural_gas"
+    );
+    const stats = await getGenerationBuildoutStats();
+    expect(stats.gas.total).toBe(gasPlants.length);
+    expect(stats.gas.operational).toBe(
+      gasPlants.filter((f) => f.status === "operational").length
+    );
+    expect(stats.gas.proposed).toBe(
+      gasPlants.filter((f) => f.status === "proposed").length
+    );
+    expect(stats.gas.permitted).toBe(
+      gasPlants.filter((f) => f.status === "permitted").length
+    );
+    expect(stats.gas.underConstruction).toBe(
+      gasPlants.filter((f) => f.status === "under_construction").length
+    );
+  });
+});
+
+describe("computeGenerationBuildoutStats", () => {
+  /**
+   * Minimal valid PowerGenerationFacility fixture — only `status`,
+   * `capacityMw`, and `generation` vary per call site. Mirrors the
+   * makeFacility() pattern in lib/filters.test.ts (every required
+   * baseFacilityShape field supplied directly, no `as` cast).
+   */
+  function makeGenerationFacility(
+    overrides: Partial<PowerGenerationFacility> & {
+      status: PowerGenerationFacility["status"];
+    }
+  ): PowerGenerationFacility {
+    return {
+      id: "test-plant",
+      name: "Test Plant",
+      operator: "Test Operator",
+      confidence: "confirmed",
+      location: { lat: 35, lon: -90, state: "TX", precision: "exact" },
+      statusHistory: [],
+      sources: [
+        {
+          url: "https://example.com",
+          label: "Source",
+          retrievedAt: "2024-01-01",
+          kind: "press",
+        },
+      ],
+      lastUpdated: "2024-01-01",
+      facilityType: "power_generation",
+      ...overrides,
+    };
+  }
+
+  // data/facilities.json currently holds zero cancelled power_generation
+  // records, so this exclusion can't be proven against the real dataset —
+  // it would pass whether or not the implementation actually filters
+  // cancelled plants. A synthetic fixture is required to give the assertion
+  // real teeth.
+  it("excludes a cancelled natural_gas plant's planned MW and count from both the fossil bucket and the gas status split", () => {
+    const cancelledGas = makeGenerationFacility({
+      id: "cancelled-gas",
+      status: "cancelled",
+      capacityMw: { planned: 9999 },
+      generation: { technology: "natural_gas" },
+    });
+    const activeGas = makeGenerationFacility({
+      id: "active-gas",
+      status: "proposed",
+      capacityMw: { planned: 500 },
+      generation: { technology: "natural_gas" },
+    });
+    const activeNuclear = makeGenerationFacility({
+      id: "active-nuclear",
+      status: "operational",
+      capacityMw: { operational: 100, planned: 100 },
+      generation: { technology: "nuclear" },
+    });
+
+    const stats = computeGenerationBuildoutStats([cancelledGas, activeGas, activeNuclear]);
+
+    // The cancelled plant's distinctive 9999 MW and its count must not
+    // appear anywhere — if the cancelled-exclusion filter were removed,
+    // fossilPlannedMw would be 10499 and fossilPlants/gas.total would be 2.
+    expect(stats.fossilPlannedMw).toBe(500);
+    expect(stats.fossilPlants).toBe(1);
+    expect(stats.gas.total).toBe(1);
+    expect(stats.gas.proposed).toBe(1);
+    expect(stats.gas.operational).toBe(0);
+    expect(stats.gas.permitted).toBe(0);
+    expect(stats.gas.underConstruction).toBe(0);
+
+    // Sanity: the non-cancelled non-fossil plant is still counted normally.
+    expect(stats.nonFossilPlannedMw).toBe(100);
+    expect(stats.nonFossilPlants).toBe(1);
   });
 });
 
@@ -994,6 +2172,44 @@ describe("getCryptoMiningStats", () => {
       (await getCryptoMiningFacilities()).map((f) => f.location.state)
     );
     expect((await getCryptoMiningStats()).stateCount).toBe(distinct.size);
+  });
+
+  it("includesDc is false — no crypto_mining facility is sited in DC", async () => {
+    const hasDc = (await getCryptoMiningFacilities()).some(
+      (f) => f.location.state === "DC"
+    );
+    expect(hasDc).toBe(false); // sanity: the fixture this test relies on
+    expect((await getCryptoMiningStats()).includesDc).toBe(false);
+  });
+
+  it("stateCodes contains exactly the expected codes for the live crypto_mining fixture", async () => {
+    // Derived independently from live data, not from the implementation's
+    // Set-building expression: looping into an object keyed by state, then
+    // Object.keys().sort(), so a data wave moves both sides together.
+    const facilities = await getCryptoMiningFacilities();
+    expect(facilities.length).toBeGreaterThan(0); // sanity: fixture must exist
+    const stateMap: Record<string, true> = {};
+    for (const f of facilities) {
+      stateMap[f.location.state] = true;
+    }
+    const expected = Object.keys(stateMap).sort();
+    // Sanity: crypto fixture must span multiple states
+    expect(expected.length).toBeGreaterThanOrEqual(2);
+
+    const { stateCodes } = await getCryptoMiningStats();
+    expect(stateCodes).toEqual(expected);
+  });
+
+  it("stateCodes is sorted and de-duplicated", async () => {
+    const { stateCodes } = await getCryptoMiningStats();
+    expect(stateCodes).toEqual([...stateCodes].sort());
+    expect(stateCodes).toEqual([...new Set(stateCodes)]);
+  });
+
+  it("stateCodes is consistent with stateCount and includesDc — the sibling fields cannot drift apart", async () => {
+    const { stateCount, includesDc, stateCodes } = await getCryptoMiningStats();
+    expect(stateCodes.length).toBe(stateCount);
+    expect(stateCodes.includes("DC")).toBe(includesDc);
   });
 });
 
@@ -1071,25 +2287,115 @@ describe("getNotableOppositionCases", () => {
   });
 });
 
+describe("getDefeatedProjects", () => {
+  it("returns exactly the cancelled + friction-status subset", async () => {
+    const frictionStatuses = ["contested", "opposed", "litigation"];
+    const expected = (await getAllFacilities()).filter(
+      (f) =>
+        f.status === "cancelled" &&
+        !!f.community?.status &&
+        frictionStatuses.includes(f.community.status)
+    );
+    const results = await getDefeatedProjects();
+    expect(results.length).toBe(expected.length);
+    expect(new Set(results.map((f) => f.id))).toEqual(
+      new Set(expected.map((f) => f.id))
+    );
+    for (const f of results) {
+      expect(f.status).toBe("cancelled");
+      expect(frictionStatuses).toContain(f.community?.status);
+    }
+  });
+
+  it("excludes a cancelled facility whose community.status is not a friction status", async () => {
+    const nonFrictionCancelled = (await getAllFacilities()).find(
+      (f) =>
+        f.status === "cancelled" &&
+        !!f.community?.status &&
+        !["contested", "opposed", "litigation"].includes(f.community.status)
+    );
+    // Sanity-check the fixture assumption: the fixture carries at least
+    // one cancelled facility with a non-friction community.status (e.g.
+    // "supported" or "mixed") to exercise this exclusion.
+    expect(nonFrictionCancelled).toBeDefined();
+
+    const results = await getDefeatedProjects();
+    expect(results.map((f) => f.id)).not.toContain(nonFrictionCancelled?.id);
+  });
+
+  it("excludes a non-cancelled facility even if it has a friction community.status", async () => {
+    const nonCancelledFriction = (await getAllFacilities()).find(
+      (f) =>
+        f.status !== "cancelled" &&
+        !!f.community?.status &&
+        ["contested", "opposed", "litigation"].includes(f.community.status)
+    );
+    expect(nonCancelledFriction).toBeDefined();
+
+    const results = await getDefeatedProjects();
+    expect(results.map((f) => f.id)).not.toContain(nonCancelledFriction?.id);
+  });
+
+  it("sorts by max capacity desc then name A→Z", async () => {
+    const results = await getDefeatedProjects();
+    expect(results.length).toBeGreaterThan(1);
+    for (let i = 1; i < results.length; i++) {
+      const prevMw = getFacilityMaxMw(results[i - 1]) ?? -1;
+      const curMw = getFacilityMaxMw(results[i]) ?? -1;
+      expect(prevMw).toBeGreaterThanOrEqual(curMw);
+      if (prevMw === curMw) {
+        expect(
+          results[i - 1].name.localeCompare(results[i].name)
+        ).toBeLessThanOrEqual(0);
+      }
+    }
+  });
+});
+
+// Live data grows (a second plant can power the same campus), so these assert the
+// known edge is present plus relationship invariants, never an exact list.
+async function expectCampusesOf(generatorId: string, knownCampusId: string) {
+  const generator = await getFacilityById(generatorId);
+  expect(generator).toBeDefined();
+  expect(generator!.facilityType).toBe("power_generation");
+  const declared =
+    generator!.facilityType === "power_generation"
+      ? (generator!.generation?.poweredFacilityIds ?? [])
+      : [];
+  const ids = (await getPoweredCampuses(generator!)).map((f) => f.id);
+  expect(ids.length).toBeGreaterThan(0);
+  expect(ids).toContain(knownCampusId);
+  expect(new Set(ids).size).toBe(ids.length);
+  for (const id of ids) expect(declared).toContain(id);
+}
+
+async function expectGeneratorsOf(campusId: string, knownGeneratorId: string) {
+  const campus = await getFacilityById(campusId);
+  expect(campus).toBeDefined();
+  const generators = await getPoweredByGenerators(campus!);
+  const ids = generators.map((f) => f.id);
+  expect(ids.length).toBeGreaterThan(0);
+  expect(ids).toContain(knownGeneratorId);
+  expect(new Set(ids).size).toBe(ids.length);
+  for (const g of generators) {
+    expect(g.facilityType).toBe("power_generation");
+    expect(g.generation?.poweredFacilityIds ?? []).toContain(campusId);
+  }
+}
+
 describe("getPoweredCampuses", () => {
   it("resolves the Oklo Aurora -> Meta Prometheus link", async () => {
-    const oklo = await getFacilityById("oklo-aurora-pike-county-oh");
-    expect(oklo).toBeDefined();
-    const campuses = await getPoweredCampuses(oklo!);
-    expect(campuses.map((f) => f.id)).toEqual(["meta-prometheus-new-albany-oh"]);
+    await expectCampusesOf("oklo-aurora-pike-county-oh", "meta-prometheus-new-albany-oh");
   });
 
   it("resolves the Susquehanna -> AWS Cumulus link", async () => {
-    const susquehanna = await getFacilityById("talen-susquehanna-aws-pa");
-    expect(susquehanna).toBeDefined();
-    const campuses = await getPoweredCampuses(susquehanna!);
-    expect(campuses.map((f) => f.id)).toEqual(["aws-cumulus-salem-township-pa"]);
+    await expectCampusesOf("talen-susquehanna-aws-pa", "aws-cumulus-salem-township-pa");
   });
 
   it("returns [] for a power_generation facility with no poweredFacilityIds", async () => {
-    const crane = await getFacilityById("crane-clean-energy-center-tmi-pa");
-    expect(crane).toBeDefined();
-    expect(await getPoweredCampuses(crane!)).toEqual([]);
+    const plant = await findUnlinkedPowerPlant();
+    expect(plant).toBeDefined();
+    expect(await getPoweredCampuses(plant!)).toEqual([]);
   });
 
   it("returns [] for a non-power_generation facility (wrong branch)", async () => {
@@ -1101,22 +2407,298 @@ describe("getPoweredCampuses", () => {
 
 describe("getPoweredByGenerators", () => {
   it("resolves Meta Prometheus <- Oklo Aurora", async () => {
-    const meta = await getFacilityById("meta-prometheus-new-albany-oh");
-    expect(meta).toBeDefined();
-    const generators = await getPoweredByGenerators(meta!);
-    expect(generators.map((f) => f.id)).toEqual(["oklo-aurora-pike-county-oh"]);
+    await expectGeneratorsOf("meta-prometheus-new-albany-oh", "oklo-aurora-pike-county-oh");
   });
 
   it("resolves AWS Cumulus <- Susquehanna", async () => {
-    const aws = await getFacilityById("aws-cumulus-salem-township-pa");
-    expect(aws).toBeDefined();
-    const generators = await getPoweredByGenerators(aws!);
-    expect(generators.map((f) => f.id)).toEqual(["talen-susquehanna-aws-pa"]);
+    await expectGeneratorsOf("aws-cumulus-salem-township-pa", "talen-susquehanna-aws-pa");
   });
 
   it("returns [] for a facility no plant powers", async () => {
-    const facility = await getFacilityById("meta-prineville-or");
+    const facility = await findUnpoweredDataCenter();
     expect(facility).toBeDefined();
     expect(await getPoweredByGenerators(facility!)).toEqual([]);
+  });
+});
+
+// The facility cache is stored as gzip+base64 shards, so the 2MB `unstable_cache`
+// entry limit is guarded per shard in lib/data.cache-shards.test.ts, not here.
+// This checks the gzip/base64 round-trip is lossless. The unstable_cache/React
+// cache() wiring itself is bypassed under VITEST (see the `process.env.VITEST ?`
+// guards in lib/data.ts), so this test exercises the same compression transform
+// directly rather than the cache wrapper.
+describe("facilities cache payload compression", () => {
+  it("round-trips through gzip/base64 losslessly", () => {
+    const original = facilitiesRaw as unknown[];
+    const json = JSON.stringify(original);
+    const compressed = gzipSync(Buffer.from(json, "utf8")).toString("base64");
+    const roundTripped = JSON.parse(
+      gunzipSync(Buffer.from(compressed, "base64")).toString("utf8")
+    ) as unknown[];
+    expect(Array.isArray(roundTripped)).toBe(true);
+    expect(roundTripped.length).toBe(original.length);
+  });
+});
+
+describe("computeDatasetGaps", () => {
+  /**
+   * Minimal valid DataCenterFacility fixture — only `status`, the gap
+   * fields, and `sources` vary per call site. Mirrors the
+   * makeGenerationFacility() pattern above (every required
+   * baseFacilityShape field supplied directly, no `as` cast).
+   */
+  function makeGapFacility(
+    overrides: Partial<DataCenterFacility> & { status: DataCenterFacility["status"] }
+  ): DataCenterFacility {
+    return {
+      id: "test-facility",
+      name: "Test Facility",
+      operator: "Test Operator",
+      confidence: "confirmed",
+      location: { lat: 35, lon: -90, state: "TX", precision: "exact" },
+      statusHistory: [],
+      sources: [
+        {
+          url: "https://example.com",
+          label: "Source",
+          retrievedAt: "2024-01-01",
+          kind: "press",
+        },
+      ],
+      lastUpdated: "2024-01-01",
+      facilityType: "data_center",
+      ...overrides,
+    };
+  }
+
+  const ONE_SOURCE = [
+    { url: "https://example.com/1", label: "S1", retrievedAt: "2024-01-01", kind: "press" as const },
+  ];
+  const TWO_SOURCES = [
+    ...ONE_SOURCE,
+    { url: "https://example.com/2", label: "S2", retrievedAt: "2024-01-01", kind: "press" as const },
+  ];
+  const THREE_SOURCES = [
+    ...TWO_SOURCES,
+    { url: "https://example.com/3", label: "S3", retrievedAt: "2024-01-01", kind: "press" as const },
+  ];
+
+  // Missing every gap field, single source — the "everything is a gap" case.
+  const opMissing = makeGapFacility({
+    id: "op-missing",
+    name: "Bravo Site",
+    status: "operational",
+    sources: ONE_SOURCE,
+  });
+  // Missing every gap field but corroborated by 3 sources — proves
+  // singleSource is independent of the other 5 dimensions.
+  const ucMissingCorroborated = makeGapFacility({
+    id: "uc-missing",
+    name: "Alpha Site",
+    status: "under_construction",
+    sources: THREE_SOURCES,
+  });
+  // Every gap field filled, 2 sources — the "fully covered" fillable case;
+  // must not be counted as missing anything.
+  const opFilled = makeGapFacility({
+    id: "op-filled",
+    status: "operational",
+    capacityMw: { operational: 100 },
+    jobs: { permanent: 50 },
+    subsidies: [{ amountUsd: 1000, sourceIndex: 0 }],
+    water: { coolingType: "air" },
+    energy: { source: "grid" },
+    sources: TWO_SOURCES,
+  });
+  // Missing every gap field, single source, but NOT fillable (proposed) —
+  // real-dataset tests can't prove this exclusion exists (data/facilities.json
+  // always has some non-fillable facilities missing a field, whether or not
+  // an exclusion filter is applied), so a synthetic fixture is required to
+  // give the status-scoping assertions below real teeth.
+  const proposedMissing = makeGapFacility({
+    id: "proposed-missing",
+    status: "proposed",
+    sources: ONE_SOURCE,
+  });
+  const cancelledMissing = makeGapFacility({
+    id: "cancelled-missing",
+    status: "cancelled",
+    sources: ONE_SOURCE,
+  });
+  const permittedMissing = makeGapFacility({
+    id: "permitted-missing",
+    status: "permitted",
+    sources: ONE_SOURCE,
+  });
+
+  const fixture = [
+    opMissing,
+    ucMissingCorroborated,
+    opFilled,
+    proposedMissing,
+    cancelledMissing,
+    permittedMissing,
+  ];
+
+  it("returns all 6 GAP_DIMENSIONS keys", () => {
+    const gaps = computeDatasetGaps(fixture);
+    expect(Object.keys(gaps).sort()).toEqual([...GAP_DIMENSIONS].sort());
+  });
+
+  it("scopes fillableTotal to operational + under_construction only, excluding proposed/cancelled/permitted", () => {
+    const gaps = computeDatasetGaps(fixture);
+    // fillable population is opMissing, ucMissingCorroborated, opFilled = 3,
+    // NOT the full 6-facility fixture.
+    for (const dim of GAP_DIMENSIONS) {
+      expect(gaps[dim].fillableTotal).toBe(3);
+      expect(gaps[dim].allTotal).toBe(6);
+    }
+  });
+
+  it("counts capacity/jobs/subsidies/water/energy gaps only among the fillable population", () => {
+    const gaps = computeDatasetGaps(fixture);
+    for (const dim of ["capacity", "jobs", "subsidies", "water", "energy"] as GapDimension[]) {
+      // opMissing + ucMissingCorroborated are missing; opFilled is not.
+      expect(gaps[dim].fillableMissing).toBe(2);
+      // Same 2 plus the 3 non-fillable facilities, all of which are also
+      // missing every gap field — proposed/cancelled/permitted count toward
+      // `allMissing` even though they're excluded from `fillableMissing`.
+      expect(gaps[dim].allMissing).toBe(5);
+    }
+  });
+
+  it("counts singleSource independently — a 3-source fillable facility does not count even though it is missing every other field", () => {
+    const gaps = computeDatasetGaps(fixture);
+    // Only opMissing (1 source) counts among the fillable population;
+    // ucMissingCorroborated (3 sources) and opFilled (2 sources) do not.
+    expect(gaps.singleSource.fillableMissing).toBe(1);
+    // Across the whole dataset: opMissing + the 3 non-fillable single-source
+    // facilities = 4. opFilled (2 sources) and ucMissingCorroborated
+    // (3 sources) are excluded.
+    expect(gaps.singleSource.allMissing).toBe(4);
+  });
+
+  it("a fully-filled fillable facility is not counted as missing anything", () => {
+    const gaps = computeDatasetGaps([opFilled]);
+    for (const dim of GAP_DIMENSIONS) {
+      expect(gaps[dim].fillableMissing).toBe(0);
+    }
+  });
+});
+
+describe("computeGapExamples", () => {
+  function makeGapFacility(
+    overrides: Partial<DataCenterFacility> & { status: DataCenterFacility["status"] }
+  ): DataCenterFacility {
+    return {
+      id: "test-facility",
+      name: "Test Facility",
+      operator: "Test Operator",
+      confidence: "confirmed",
+      location: { lat: 35, lon: -90, state: "TX", precision: "exact" },
+      statusHistory: [],
+      sources: [
+        { url: "https://example.com", label: "Source", retrievedAt: "2024-01-01", kind: "press" },
+      ],
+      lastUpdated: "2024-01-01",
+      facilityType: "data_center",
+      ...overrides,
+    };
+  }
+
+  const opNoCapacity = makeGapFacility({ id: "a", name: "Bravo Site", status: "operational" });
+  const ucNoCapacity = makeGapFacility({ id: "b", name: "Alpha Site", status: "under_construction" });
+  const opWithCapacity = makeGapFacility({
+    id: "c",
+    name: "Charlie Site",
+    status: "operational",
+    capacityMw: { operational: 500 },
+  });
+  const proposedNoCapacity = makeGapFacility({
+    id: "d",
+    name: "Delta Site",
+    status: "proposed",
+  });
+
+  it("excludes a non-fillable facility missing the field, even though it matches the predicate", () => {
+    const examples = computeGapExamples(
+      [opNoCapacity, ucNoCapacity, opWithCapacity, proposedNoCapacity],
+      "capacity"
+    );
+    expect(examples.map((f) => f.id)).not.toContain("d");
+  });
+
+  it("excludes a fillable facility that does not have the gap", () => {
+    const examples = computeGapExamples(
+      [opNoCapacity, ucNoCapacity, opWithCapacity, proposedNoCapacity],
+      "capacity"
+    );
+    expect(examples.map((f) => f.id)).not.toContain("c");
+  });
+
+  it("sorts by max capacity desc, tie-broken by name A→Z when capacity is equally undisclosed", () => {
+    const examples = computeGapExamples(
+      [opNoCapacity, ucNoCapacity, opWithCapacity, proposedNoCapacity],
+      "capacity"
+    );
+    // Both remaining examples (a, b) have no capacity at all, so the tie
+    // resolves to name order: "Alpha Site" (b) before "Bravo Site" (a).
+    expect(examples.map((f) => f.id)).toEqual(["b", "a"]);
+  });
+
+  it("respects the n parameter", () => {
+    const examples = computeGapExamples(
+      [opNoCapacity, ucNoCapacity, opWithCapacity, proposedNoCapacity],
+      "capacity",
+      1
+    );
+    expect(examples).toHaveLength(1);
+  });
+
+  it("defaults n to 6", () => {
+    const many = Array.from({ length: 10 }, (_, i) =>
+      makeGapFacility({ id: `many-${i}`, name: `Site ${i}`, status: "operational" })
+    );
+    expect(computeGapExamples(many, "capacity")).toHaveLength(6);
+  });
+});
+
+describe("getDatasetGaps", () => {
+  it("returns all 6 GAP_DIMENSIONS keys against the live dataset", async () => {
+    const gaps = await getDatasetGaps();
+    expect(Object.keys(gaps).sort()).toEqual([...GAP_DIMENSIONS].sort());
+  });
+
+  it("each dimension's counts are internally consistent (missing <= total, all >= fillable)", async () => {
+    const gaps = await getDatasetGaps();
+    const allFacilities = await getAllFacilities();
+    for (const dim of GAP_DIMENSIONS) {
+      const g = gaps[dim];
+      expect(g.fillableMissing).toBeGreaterThanOrEqual(0);
+      expect(g.fillableMissing).toBeLessThanOrEqual(g.fillableTotal);
+      expect(g.allMissing).toBeGreaterThanOrEqual(g.fillableMissing);
+      expect(g.allTotal).toBe(allFacilities.length);
+      expect(g.fillableTotal).toBeLessThanOrEqual(g.allTotal);
+    }
+  });
+
+  it("fillableTotal matches the count of operational + under_construction facilities", async () => {
+    const gaps = await getDatasetGaps();
+    const allFacilities = await getAllFacilities();
+    const expected = allFacilities.filter(
+      (f) => f.status === "operational" || f.status === "under_construction"
+    ).length;
+    expect(gaps.capacity.fillableTotal).toBe(expected);
+  });
+});
+
+describe("getGapExamples", () => {
+  it("every example is operational or under_construction — never a structural-zero proposed site", async () => {
+    for (const dim of GAP_DIMENSIONS) {
+      const examples = await getGapExamples(dim, 20);
+      for (const f of examples) {
+        expect(["operational", "under_construction"]).toContain(f.status);
+      }
+    }
   });
 });
